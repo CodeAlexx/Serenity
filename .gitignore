@@ -1,0 +1,9 @@
+/.pixi/
+/target/
+/output/
+__pycache__/
+*.pyc
+*.safetensors
+*.bin
+*.pid
+*.log

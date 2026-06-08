@@ -1,0 +1,35 @@
+[workspace]
+authors = ["CodeAlexx <codealex@example.com>"]
+channels = ["https://conda.modular.com/max", "conda-forge"]
+name = "serenity-trainer"
+platforms = ["linux-64"]
+version = "0.0.1"
+
+# Pure-Mojo port of Serenity's training core (no Python runtime).
+# Reuses ONLY the numerical foundation from mojodiffusion's serenitymojo:
+#   serenitymojo/{autograd.mojo, tensor.mojo, ops/}
+# via the cross-repo include path  -I /home/alex/mojodiffusion  (no vendoring).
+# Dtype policy: BF16 in/out, F32 compute (flame-core convention).
+
+[tasks]
+build-mojoui = "make -C /home/alex/MojoUI/c_floor"
+ideogram4-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion src/serenity_trainer/trainer/Ideogram4LiveTrainer.mojo -o target/serenity_ideogram4_live_trainer"
+trainer-ui-build = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm src/serenity_trainer/ui/TrainUI.mojo -o target/serenity_trainer_ui", depends-on = ["build-mojoui", "ideogram4-live-trainer-build"] }
+trainer-ui = { cmd = "LD_LIBRARY_PATH=/home/alex/MojoUI target/serenity_trainer_ui", depends-on = ["trainer-ui-build"] }
+trainer-ui-runtime-test = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm tests/ui/test_trainer_runtime_bridge.mojo -o /tmp/serenity_trainer_runtime_test && LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_trainer_runtime_test", depends-on = ["build-mojoui"] }
+trainer-ui-callbacks-test = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm tests/ui/test_train_callbacks_commands.mojo -o /tmp/serenity_trainer_callbacks_test && LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_trainer_callbacks_test", depends-on = ["build-mojoui"] }
+trainer-ui-progress-bridge-test = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -I /home/alex/mojodiffusion -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm tests/ui/test_trainer_progress_bridge.mojo -o /tmp/serenity_trainer_progress_bridge_test && LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_trainer_progress_bridge_test", depends-on = ["build-mojoui"] }
+trainer-ui-aux-test = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm tests/ui/test_aux_screens_compile.mojo -o /tmp/serenity_trainer_aux_test && LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_trainer_aux_test", depends-on = ["build-mojoui"] }
+ideogram4-port-test = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion tests/ui/test_ideogram4_port_contract.mojo -o /tmp/serenity_ideogram4_port_test && /tmp/serenity_ideogram4_port_test"
+ideogram4-train-core-test = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion tests/trainer/test_ideogram4_train_core.mojo -o /tmp/serenity_ideogram4_train_core_test && /tmp/serenity_ideogram4_train_core_test"
+ideogram4-lora-block-test = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion tests/trainer/test_ideogram4_lora_block.mojo -o /tmp/serenity_ideogram4_lora_block_test && /tmp/serenity_ideogram4_lora_block_test"
+ideogram4-lora-block-10step = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion tests/trainer/test_ideogram4_lora_block_10step.mojo -o /tmp/serenity_ideogram4_lora_block_10step && /tmp/serenity_ideogram4_lora_block_10step"
+ideogram4-predict-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_predict_gate.mojo"
+ideogram4-lora-b0-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_lora_b0_gate.mojo"
+ideogram4-lora-train-step-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_lora_train_step_gate.mojo"
+ideogram4-real-lora-file-parity = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_real_lora_file_parity.mojo"
+ideogram4-lora-stream-train-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_lora_stream_train_save_resume_gate.mojo"
+
+[dependencies]
+max = ">=26.3.0,<27"
+max-pipelines = ">=26.3.0,<27"
