@@ -153,7 +153,9 @@ def _nav(mut s: TrainUIAppState, section: Int32, text: String):
     s.ctx.layout_row(row3(m.pad, content_w, m.pad), m.row_h)
     label(s.ctx, String(""))
     if nav_row(s.ctx, String("nav_") + text.copy(), text, s.cfg.section_index == section):
-        s.cfg.section_index = section
+        if s.cfg.section_index != section:
+            s.cfg.section_index = section
+            s.main_scroll_y = 0.0
     label(s.ctx, String(""))
 
 
