@@ -11,7 +11,7 @@ from mojoui.widgets.form import (
     select_string_row,
     toggle_row,
 )
-from serenity_trainer.ui.TrainerConfigModel import TrainerUIConfig
+from serenity_trainer.ui.TrainerConfigModel import TrainerUIConfig, trainer_ui_apply_model_preset
 from serenity_trainer.ui.UITabCommon import row2, two_col_w, value_w
 
 
@@ -53,8 +53,10 @@ def render_model_tab(
     ctx.layout_row(row2(cw, cw), _panel_h(ctx, 7))
     begin_form_panel(ctx, String("BASE MODEL"), String("Method, architecture, and checkpoint"), ctx.theme.padding)
     _ = select_index_row(ctx, label_w, val_w, String("Train Method"), String("training_method"), cfg.training_method_options, cfg.training_method_index, cfg.select_open_id)
-    _ = select_index_row(ctx, label_w, val_w, String("Model Type"), String("model_type"), cfg.model_type_options, cfg.model_type_index, cfg.select_open_id)
-    _ = select_index_row(ctx, label_w, val_w, String("Architecture"), String("architecture"), cfg.architecture_options, cfg.architecture_index, cfg.select_open_id)
+    var model_changed = select_index_row(ctx, label_w, val_w, String("Model Type"), String("model_type"), cfg.model_type_options, cfg.model_type_index, cfg.select_open_id)
+    var arch_changed = select_index_row(ctx, label_w, val_w, String("Architecture"), String("architecture"), cfg.architecture_options, cfg.architecture_index, cfg.select_open_id)
+    if model_changed or arch_changed:
+        trainer_ui_apply_model_preset(cfg, model_changed)
     _ = edit_row(ctx, label_w, val_w, String("Base Model"), String("base_model_name"), cfg.base_model_name, base_model_edit)
     field_row(ctx, label_w, val_w, String("VAE"), cfg.vae_override.copy())
     _ = toggle_row(ctx, label_w, val_w, String("Transformer"), String("Train transformer"), cfg.train_transformer)
@@ -66,6 +68,6 @@ def render_model_tab(
     _ = select_string_row(ctx, label_w, val_w, String("Format"), String("output_model_format"), cfg.output_format_options, cfg.output_model_format, cfg.select_open_id)
     _ = select_string_row(ctx, label_w, val_w, String("Output DType"), String("output_dtype"), cfg.precision_options, cfg.output_dtype, cfg.select_open_id)
     field_row(ctx, label_w, val_w, String("Backend"), cfg.backend_target.copy())
-    field_row(ctx, label_w, val_w, String("Checkpoint"), String("flux-2-klein-base-9b"))
+    field_row(ctx, label_w, val_w, String("Checkpoint"), cfg.base_model_name.copy())
     _ = toggle_row(ctx, label_w, val_w, String("Bundle Embeds"), String("Enabled"), cfg.bundle_additional_embeddings)
     end_form_panel(ctx)

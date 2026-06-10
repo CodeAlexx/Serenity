@@ -14,7 +14,17 @@ version = "0.0.1"
 [tasks]
 build-mojoui = "make -C /home/alex/MojoUI/c_floor"
 ideogram4-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion src/serenity_trainer/trainer/Ideogram4LiveTrainer.mojo -o target/serenity_ideogram4_live_trainer"
-trainer-ui-build = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm src/serenity_trainer/ui/TrainUI.mojo -o target/serenity_trainer_ui", depends-on = ["build-mojoui", "ideogram4-live-trainer-build"] }
+klein-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm src/serenity_trainer/trainer/KleinLiveTrainer.mojo -o target/serenity_klein_live_trainer"
+# Config-driven runners reused from the campaign-verified serenitymojo trainers
+# (argv: <train_config.json> <steps>; stdout = shared progress-line stream).
+# Build ONE at a time — concurrent mojo builds race on serenitymojo.mojopkg.
+chroma-live-trainer-build = "mkdir -p target && mojo build --target-accelerator sm_86 -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda /home/alex/mojodiffusion/serenitymojo/training/train_chroma_real.mojo -o target/serenity_chroma_live_trainer"
+ernie-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_ernie_real.mojo -o target/serenity_ernie_live_trainer"
+anima-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_anima_real.mojo -o target/serenity_anima_live_trainer"
+sdxl-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_sdxl_real.mojo -o target/serenity_sdxl_live_trainer"
+zimage-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_zimage_real.mojo -o target/serenity_zimage_live_trainer"
+l2p-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_l2p_real.mojo -o target/serenity_l2p_live_trainer"
+trainer-ui-build = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm src/serenity_trainer/ui/TrainUI.mojo -o target/serenity_trainer_ui", depends-on = ["build-mojoui", "ideogram4-live-trainer-build", "klein-live-trainer-build"] }
 trainer-ui = { cmd = "LD_LIBRARY_PATH=/home/alex/MojoUI target/serenity_trainer_ui", depends-on = ["trainer-ui-build"] }
 trainer-ui-runtime-test = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm tests/ui/test_trainer_runtime_bridge.mojo -o /tmp/serenity_trainer_runtime_test && LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_trainer_runtime_test", depends-on = ["build-mojoui"] }
 trainer-ui-callbacks-test = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm tests/ui/test_train_callbacks_commands.mojo -o /tmp/serenity_trainer_callbacks_test && LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_trainer_callbacks_test", depends-on = ["build-mojoui"] }
@@ -29,6 +39,8 @@ ideogram4-lora-b0-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideo
 ideogram4-lora-train-step-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_lora_train_step_gate.mojo"
 ideogram4-real-lora-file-parity = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_real_lora_file_parity.mojo"
 ideogram4-lora-stream-train-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_lora_stream_train_save_resume_gate.mojo"
+klein-lora-cached-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm src/serenity_trainer/trainer/KleinLiveTrainer.mojo -o /tmp/serenity_klein_live_trainer_build_gate"
+klein-train-ref-grad-update-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/klein_train_ref_grad_update_replay.mojo"
 
 [dependencies]
 max = ">=26.3.0,<27"

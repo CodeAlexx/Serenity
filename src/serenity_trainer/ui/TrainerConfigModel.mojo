@@ -14,6 +14,41 @@ comptime UI_SECTION_RUNS: Int32 = 9
 comptime UI_SECTION_LOGS: Int32 = 10
 comptime UI_SECTION_CAPTIONER: Int32 = 11
 comptime SERENITY_TRAINER_OUTPUT_DIR = "/home/alex/mojodiffusion/output"
+comptime SERENITY_BOXJANA_DATASET_DIR = "/home/alex/1/datasets/boxjana"
+comptime SERENITY_BOXJANA_KLEIN_CACHE = "/home/alex/1/datasets/boxjana/_klein_cache/boxjana_klein512.safetensors"
+comptime SERENITY_KLEIN9B_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
+comptime SERENITY_IDEOGRAM4_BASE = "/home/alex/.serenity/models/ideogram-4-fp8"
+comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/ideogram4_fx_predict.safetensors"
+
+# Campaign-verified trainable verticals (serenitymojo train_<m>_real.mojo runners).
+# Checkpoints / caches mirror /home/alex/mojodiffusion/serenitymojo/configs/<m>.json
+# and the trainers' default cache dirs (verified on disk 2026-06-09).
+comptime SERENITY_CHROMA_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/chroma1_hd_bf16.safetensors"
+comptime SERENITY_CHROMA_CACHE = "/home/alex/datasets/boxjana_chroma_edv2_512"
+comptime SERENITY_CHROMA_VAE = "/home/alex/.cache/huggingface/hub/models--lodestones--Chroma1-HD/snapshots/0e0c60ece1e82b17cb7f77342d765ba5024c40c0/vae/diffusion_pytorch_model.safetensors"
+comptime SERENITY_ERNIE_CHECKPOINT = "/home/alex/models/ERNIE-Image/transformer"
+comptime SERENITY_ERNIE_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/boxjana_ernie_512_FIXED"
+comptime SERENITY_ERNIE_VAE = "/home/alex/models/ERNIE-Image/vae/diffusion_pytorch_model.safetensors"
+comptime SERENITY_ANIMA_CHECKPOINT = "/home/alex/.serenity/models/anima/split_files/diffusion_models/anima-base-v1.0.safetensors"
+comptime SERENITY_ANIMA_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_synth_smoke"
+comptime SERENITY_ANIMA_VAE = "/home/alex/.serenity/models/anima/split_files/vae/qwen_image_vae.safetensors"
+comptime SERENITY_SDXL_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/sdxl_unet_bf16.safetensors"
+comptime SERENITY_SDXL_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_sdxl_512_smoke"
+comptime SERENITY_SDXL_VAE = "/home/alex/madebyollin_sdxl-vae-fp16-fix/sdxl_vae.safetensors"
+comptime SERENITY_ZIMAGE_CHECKPOINT = "/home/alex/.serenity/models/zimage_base/transformer"
+# train_zimage_real is comptime-shaped on production buckets 72x56/88x48
+# (cap 224/256). The EriDiffusion 64x64/seq-512 caches raise "unsupported
+# Z-Image production bucket" (measured 2026-06-09); this is the trainer's own
+# prepare-output location — fails loud ("does not exist") until prepared.
+comptime SERENITY_ZIMAGE_CACHE = "/home/alex/mojodiffusion/output/alina_zimage_cache"
+comptime SERENITY_L2P_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors"
+# No prepared L2P pixel cache exists yet (2026-06-09); trainer preflight fails
+# loud until one is built at this path.
+comptime SERENITY_L2P_CACHE = "/home/alex/mojodiffusion/output/alina_l2p_cache"
+comptime SERENITY_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json"
+comptime SERENITY_ZIMAGE_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/zimage_alina_samples.json"
+comptime SERENITY_ANIMA_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/anima_alina_samples.json"
+comptime SERENITY_ERNIE_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/ernie_image_samples.json"
 
 
 struct TrainerUIConcept(Copyable, Movable):
@@ -266,8 +301,8 @@ struct TrainerUIConfig(Movable):
 
     def __init__(out self):
         self.section_index = UI_SECTION_MODEL
-        self.backend_target = String("ideogram4")
-        self.run_name = String("gigerver3_ideogram4_lora_v1")
+        self.backend_target = String("klein")
+        self.run_name = String("boxjana_klein9b_lora_v1")
 
         self.training_method_options = List[String]()
         self.training_method_options.append(String("LoRA"))
@@ -281,7 +316,14 @@ struct TrainerUIConfig(Movable):
         self.model_type_options.append(String("FLUX_2"))
         self.model_type_options.append(String("STABLE_DIFFUSION_XL_10_BASE"))
         self.model_type_options.append(String("STABLE_DIFFUSION_35"))
-        self.model_type_index = 0
+        self.model_type_options.append(String("CHROMA_1"))
+        self.model_type_options.append(String("ERNIE_IMAGE"))
+        self.model_type_options.append(String("ANIMA"))
+        self.model_type_options.append(String("Z_IMAGE"))
+        self.model_type_options.append(String("Z_IMAGE_L2P"))
+        self.model_type_options.append(String("LTX_2_VIDEO"))
+        self.model_type_options.append(String("WAN_22_VIDEO"))
+        self.model_type_index = 1
         self.model_type_open = False
 
         self.architecture_options = List[String]()
@@ -289,7 +331,14 @@ struct TrainerUIConfig(Movable):
         self.architecture_options.append(String("Klein 9B"))
         self.architecture_options.append(String("Flux2 Dev"))
         self.architecture_options.append(String("SDXL 1.0"))
-        self.architecture_index = 0
+        self.architecture_options.append(String("Chroma1 HD"))
+        self.architecture_options.append(String("Ernie Image"))
+        self.architecture_options.append(String("Anima"))
+        self.architecture_options.append(String("Z-Image"))
+        self.architecture_options.append(String("Z-Image L2P"))
+        self.architecture_options.append(String("LTX-2 AV"))
+        self.architecture_options.append(String("Wan2.2 T2V 14B"))
+        self.architecture_index = 1
         self.architecture_open = False
 
         self.optimizer_options = List[String]()
@@ -418,7 +467,7 @@ struct TrainerUIConfig(Movable):
         self.captioner_resolution_options.append(String("high"))
         self.captioner_resolution_index = 0
 
-        self.captioner_folder_path = String("/home/alex/1_giger/gigerver3")
+        self.captioner_folder_path = String(SERENITY_BOXJANA_DATASET_DIR)
         self.captioner_prompt = String("Describe this media.")
         self.captioner_skip_existing = True
         self.captioner_summary_mode = False
@@ -428,8 +477,8 @@ struct TrainerUIConfig(Movable):
 
         self.debug_mode = False
         self.debug_dir = String("debug")
-        self.workspace_dir = String("/home/alex/trainings/gigerver3_ideogram4_lora_v1")
-        self.cache_dir = String("/home/alex/mojodiffusion/serenitymojo/models/dit/parity/ideogram4_fx_predict.safetensors")
+        self.workspace_dir = String("/home/alex/trainings/boxjana_klein9b_lora_v1")
+        self.cache_dir = String(SERENITY_BOXJANA_KLEIN_CACHE)
         self.tensorboard = True
         self.tensorboard_expose = False
         self.tensorboard_always_on = False
@@ -446,12 +495,12 @@ struct TrainerUIConfig(Movable):
         self.fused_gradient_reduce = False
         self.async_gradient_reduce = False
 
-        self.base_model_name = String("/home/alex/.serenity/models/ideogram-4-fp8")
+        self.base_model_name = String(SERENITY_KLEIN9B_CHECKPOINT)
         self.vae_override = String("")
         self.output_model_destination = String(SERENITY_TRAINER_OUTPUT_DIR)
         self.output_model_format = String("SAFETENSORS")
         self.output_dtype = String("FLOAT_16")
-        self.model_arch = String("ideogram4")
+        self.model_arch = String("klein9b")
         self.model_quantize = True
         self.model_quantize_text_encoder = True
         self.model_low_vram = True
@@ -462,17 +511,17 @@ struct TrainerUIConfig(Movable):
         self.activation_offloading = False
         self.layer_offload_fraction = 0.0
 
-        self.dataset_path = String("/home/alex/1/datasets/gigerver3_json")
+        self.dataset_path = String(SERENITY_BOXJANA_DATASET_DIR)
         self.sample_output_dir = String(SERENITY_TRAINER_OUTPUT_DIR)
         self.concept_file_name = String("concepts.json")
         self.concepts = List[TrainerUIConcept]()
-        self.concepts.append(TrainerUIConcept(String("gigerver3"), String("/home/alex/1/datasets/gigerver3_json"), String("gigerver3"), 70, 1, String("STANDARD"), True))
+        self.concepts.append(TrainerUIConcept(String("boxjana"), String(SERENITY_BOXJANA_DATASET_DIR), String("box1jana"), 22, 1, String("STANDARD"), True))
         self.aspect_ratio_bucketing = True
         self.latent_caching = True
         self.cache_text_embeddings = True
         self.clear_cache_before_training = False
         self.resolution = String("512")
-        self.caption_extension = String("json")
+        self.caption_extension = String("txt")
         self.caption_dropout = 0.05
 
         self.learning_rate = 0.0004
@@ -533,7 +582,7 @@ struct TrainerUIConfig(Movable):
         self.layer_filter_regex = False
 
         self.peft_type = String("LORA")
-        self.lora_model_name = String("gigerver3_ideogram4_lora_v1")
+        self.lora_model_name = String("boxjana_klein9b_lora_v1")
         self.lora_rank = 16.0
         self.lora_alpha = 16.0
         self.lora_dropout = 0.0
@@ -543,14 +592,14 @@ struct TrainerUIConfig(Movable):
         self.oft_coft = False
 
         self.samples = List[TrainerUISample]()
-        self.samples.append(TrainerUISample(String("gigerver3 style. A square 1024x1024 close-up of a symmetrical biomechanical alien mask with a gaping fanged maw, ribbed metal tubes radiating outward, glossy bone-white plates, black void background, harsh monochrome chiaroscuro."), String(""), 42))
-        self.samples.append(TrainerUISample(String("gigerver3 style. A 1024x1024 surreal blue-white dream scene with a skull-faced creature wearing a fan-like ribbed crest beside floating pale faces, misty radiant light, fused organic bone and metal textures."), String(""), 43))
+        self.samples.append(TrainerUISample(String("box1jana, 512x512 portrait photo, confident smile, dark hair, sleek modern styling, simple studio background, natural skin detail, sharp focus."), String(""), 42))
+        self.samples.append(TrainerUISample(String("box1jana, 512x512 seated portrait on an ornate chair, dark turtleneck, playful expression, soft studio light, clean white background."), String(""), 43))
         self.sample_after = 500.0
         self.sample_skip_first = 0.0
         self.sample_cfg = 7.0
         self.sample_steps = 20.0
-        self.sample_sampler = String("Ideogram4 FlowMatch")
-        self.sampler_preset = String("V4_DEFAULT_20")
+        self.sample_sampler = String("FlowMatch Euler")
+        self.sampler_preset = String("KLEIN_20")
         self.samples_to_tensorboard = True
         self.non_ema_sampling = False
 
@@ -561,7 +610,7 @@ struct TrainerUIConfig(Movable):
         self.save_every = 500.0
         self.save_skip_first = 0.0
         self.save_max_keep = 4.0
-        self.save_filename_prefix = String("gigerver3_ideogram4_lora_v1")
+        self.save_filename_prefix = String("boxjana_klein9b_lora_v1")
 
         self.cloud_host = String("")
         self.cloud_port = String("22")
@@ -628,6 +677,210 @@ struct TrainerUIConfig(Movable):
         return self.captioner_resolution_options[Int(self.captioner_resolution_index)].copy()
 
 
+def _arch_index_for_model_type(model_type_index: Int32) -> Int32:
+    # model_type option index -> canonical architecture option index
+    if model_type_index == 0:  # IDEOGRAM_4
+        return 0
+    if model_type_index == 1:  # FLUX_2
+        return 1  # Klein 9B is the trainable FLUX_2 default
+    if model_type_index == 2:  # STABLE_DIFFUSION_XL_10_BASE
+        return 3
+    if model_type_index == 4:  # CHROMA_1
+        return 4
+    if model_type_index == 5:  # ERNIE_IMAGE
+        return 5
+    if model_type_index == 6:  # ANIMA
+        return 6
+    if model_type_index == 7:  # Z_IMAGE
+        return 7
+    if model_type_index == 8:  # Z_IMAGE_L2P
+        return 8
+    if model_type_index == 9:  # LTX_2_VIDEO
+        return 9
+    if model_type_index == 10:  # WAN_22_VIDEO
+        return 10
+    return -1  # STABLE_DIFFUSION_35: no trainable runner yet
+
+
+def _model_type_for_arch_index(architecture_index: Int32) -> Int32:
+    # architecture option index -> model_type option index
+    if architecture_index == 0:  # Ideogram4 FP8
+        return 0
+    if architecture_index == 1 or architecture_index == 2:  # Klein 9B / Flux2 Dev
+        return 1
+    if architecture_index == 3:  # SDXL 1.0
+        return 2
+    if architecture_index == 4:  # Chroma1 HD
+        return 4
+    if architecture_index == 5:  # Ernie Image
+        return 5
+    if architecture_index == 6:  # Anima
+        return 6
+    if architecture_index == 7:  # Z-Image
+        return 7
+    if architecture_index == 8:  # Z-Image L2P
+        return 8
+    if architecture_index == 9:  # LTX-2 AV
+        return 9
+    if architecture_index == 10:  # Wan2.2 T2V 14B
+        return 10
+    return -1
+
+
+def trainer_ui_apply_model_preset(mut cfg: TrainerUIConfig, prefer_model_type: Bool = True):
+    # Resolve the canonical architecture from whichever selector the user changed.
+    var arch = cfg.architecture_index
+    if prefer_model_type:
+        arch = _arch_index_for_model_type(cfg.model_type_index)
+        if arch < 0:
+            # STABLE_DIFFUSION_35 has no trainable runner (blocked refs).
+            # Route to an unwired backend so launch fails loudly instead of
+            # silently training the previously selected model.
+            cfg.backend_target = String("sd35")
+            cfg.model_arch = String("sd35")
+            return
+    else:
+        var mt = _model_type_for_arch_index(cfg.architecture_index)
+        if mt >= 0:
+            cfg.model_type_index = mt
+
+    if arch == 1 or arch == 2:
+        cfg.backend_target = String("klein")
+        cfg.model_type_index = 1
+        cfg.architecture_index = 1
+        cfg.base_model_name = String(SERENITY_KLEIN9B_CHECKPOINT)
+        cfg.cache_dir = String(SERENITY_BOXJANA_KLEIN_CACHE)
+        cfg.model_arch = String("klein9b")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.sampler_preset = String("KLEIN_20")
+    elif arch == 0:
+        cfg.backend_target = String("ideogram4")
+        cfg.model_type_index = 0
+        cfg.architecture_index = 0
+        cfg.base_model_name = String(SERENITY_IDEOGRAM4_BASE)
+        cfg.cache_dir = String(SERENITY_IDEOGRAM4_CACHE)
+        cfg.model_arch = String("ideogram4")
+        cfg.sample_sampler = String("Ideogram4 FlowMatch")
+        cfg.sampler_preset = String("V4_DEFAULT_20")
+    elif arch == 3:
+        # SDXL — serenitymojo train_sdxl_real (eps-pred conv-UNet LoRA).
+        # Recipe defaults mirror serenitymojo/configs/sdxl.json.
+        cfg.backend_target = String("sdxl")
+        cfg.model_type_index = 2
+        cfg.architecture_index = 3
+        cfg.base_model_name = String(SERENITY_SDXL_CHECKPOINT)
+        cfg.cache_dir = String(SERENITY_SDXL_CACHE)
+        cfg.model_arch = String("sdxl10")
+        cfg.sample_sampler = String("Euler")
+        cfg.sampler_preset = String("SDXL_20")
+        cfg.learning_rate = 0.0001
+        # train_sdxl_real is compiled for rank 16 (fails loud on any other).
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 16.0
+        cfg.timestep_shift = 1.0
+    elif arch == 4:
+        # Chroma1-HD — serenitymojo train_chroma_real (flow-match, block-swap).
+        # Recipe defaults mirror serenitymojo/configs/chroma.json.
+        cfg.backend_target = String("chroma")
+        cfg.model_type_index = 4
+        cfg.architecture_index = 4
+        cfg.base_model_name = String(SERENITY_CHROMA_CHECKPOINT)
+        cfg.cache_dir = String(SERENITY_CHROMA_CACHE)
+        cfg.model_arch = String("chroma1hd")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.sampler_preset = String("CHROMA_20")
+        cfg.learning_rate = 0.0001
+        # train_chroma_real is compiled for rank 16 (fails loud on any other).
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 16.0
+        cfg.timestep_shift = 1.15
+    elif arch == 5:
+        # Ernie Image — serenitymojo train_ernie_real.
+        # Recipe defaults mirror serenitymojo/configs/ernie_image.json
+        # (NOTE canonical lora_alpha is 1.0, not rank).
+        cfg.backend_target = String("ernie")
+        cfg.model_type_index = 5
+        cfg.architecture_index = 5
+        cfg.base_model_name = String(SERENITY_ERNIE_CHECKPOINT)
+        cfg.cache_dir = String(SERENITY_ERNIE_CACHE)
+        cfg.model_arch = String("ernie_image")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.sampler_preset = String("ERNIE_20")
+        cfg.learning_rate = 0.0003
+        cfg.lora_alpha = 1.0
+        cfg.timestep_shift = 1.0
+    elif arch == 6:
+        # Anima — serenitymojo train_anima_real.
+        # Recipe defaults mirror serenitymojo/configs/anima.json.
+        cfg.backend_target = String("anima")
+        cfg.model_type_index = 6
+        cfg.architecture_index = 6
+        cfg.base_model_name = String(SERENITY_ANIMA_CHECKPOINT)
+        cfg.cache_dir = String(SERENITY_ANIMA_CACHE)
+        cfg.model_arch = String("anima")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.sampler_preset = String("ANIMA_20")
+        cfg.learning_rate = 0.0001
+        cfg.lora_alpha = 16.0
+        cfg.timestep_shift = 1.0
+    elif arch == 7:
+        # Z-Image — serenitymojo train_zimage_real.
+        # train_zimage_real is compiled for rank=16, alpha=1.0, lr=3e-4
+        # (fails loud on any other). Mirrors serenitymojo/configs/zimage.json.
+        cfg.backend_target = String("zimage")
+        cfg.model_type_index = 7
+        cfg.architecture_index = 7
+        cfg.base_model_name = String(SERENITY_ZIMAGE_CHECKPOINT)
+        cfg.cache_dir = String(SERENITY_ZIMAGE_CACHE)
+        cfg.model_arch = String("zimage")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.sampler_preset = String("ZIMAGE_20")
+        cfg.learning_rate = 0.0003
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 1.0
+        cfg.timestep_shift = 1.0
+    elif arch == 8:
+        # Z-Image L2P (pixel-space, VAE-less; Z-Image DiT body verbatim) —
+        # serenitymojo train_l2p_real. Compiled for rank=16, alpha=16,
+        # lr=3e-4, shift=3.0 (fails loud on any other). NOTE: no prepared
+        # pixel cache exists yet — trainer preflight fails loud until
+        # SERENITY_L2P_CACHE is built.
+        cfg.backend_target = String("l2p")
+        cfg.model_type_index = 8
+        cfg.architecture_index = 8
+        cfg.base_model_name = String(SERENITY_L2P_CHECKPOINT)
+        cfg.cache_dir = String(SERENITY_L2P_CACHE)
+        cfg.model_arch = String("zimage_l2p")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.sampler_preset = String("L2P_20")
+        cfg.learning_rate = 0.0003
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 16.0
+        cfg.timestep_shift = 3.0
+    elif arch == 9:
+        # LTX-2 AV (video+audio) — NO production trainer yet. The legacy
+        # video-only train_ltx2_real is fail-closed by design; train_ltx2_av is
+        # a readiness contract. Routed to an unwired backend so launch fails
+        # loudly instead of silently running a legacy/unfaithful path.
+        cfg.backend_target = String("ltx2")
+        cfg.model_type_index = 9
+        cfg.architecture_index = 9
+        cfg.base_model_name = String("")
+        cfg.model_arch = String("ltx2_av")
+        cfg.frames = String("25")
+    elif arch == 10:
+        # Wan2.2-T2V 14B — train_wan22_real exists but its RoPE tables are
+        # placeholders ("TODO: replace with wan22_build_rope for real
+        # training") and it is config-less smoke-mode. Unwired backend:
+        # fail-loud until the trainer is made faithful.
+        cfg.backend_target = String("wan22")
+        cfg.model_type_index = 10
+        cfg.architecture_index = 10
+        cfg.base_model_name = String("/home/alex/.serenity/models/checkpoints/wan2.2_t2v_low_noise_14b_fp16.safetensors")
+        cfg.model_arch = String("wan22_t2v_14b")
+        cfg.frames = String("1")
+
+
 def trainer_ui_total_steps(cfg: TrainerUIConfig) -> Int32:
     if cfg.max_train_steps > 0.0:
         return Int32(cfg.max_train_steps)
@@ -647,6 +900,147 @@ def trainer_ui_validate(cfg: TrainerUIConfig) -> String:
     if cfg.learning_rate <= 0.0:
         return String("Learning rate must be > 0")
     return String("Ready")
+
+
+def _runner_recipe_json(cfg: TrainerUIConfig) -> String:
+    # Shared recipe tail for the serenitymojo TrainConfig JSON schema
+    # (io/train_config_reader.mojo read_model_config keys).
+    var steps = Int(trainer_ui_total_steps(cfg))
+    var save_every = Int(cfg.save_every)
+    if save_every < 0:
+        save_every = 0
+    var rank = Int(cfg.lora_rank)
+    if rank < 1:
+        rank = 1
+    return (
+        String("  \"learning_rate\": ") + String(cfg.learning_rate) + String(",\n")
+        + String("  \"lora_rank\": ") + String(rank) + String(",\n")
+        + String("  \"lora_alpha\": ") + String(cfg.lora_alpha) + String(",\n")
+        + String("  \"timestep_shift\": ") + String(cfg.timestep_shift) + String(",\n")
+        + String("  \"max_grad_norm\": ") + String(cfg.clip_grad_norm) + String(",\n")
+        + String("  \"max_steps\": ") + String(steps) + String(",\n")
+        + String("  \"save_every\": ") + String(save_every) + String(",\n")
+        + String("  \"sample_every\": ") + String(Int(cfg.sample_after)) + String(",\n")
+        + String("  \"seed\": ") + String(Int(cfg.seed)) + String(",\n")
+        + String("  \"frames\": \"") + cfg.frames.copy() + String("\",\n")
+        + String("  \"cache_dir\": \"") + cfg.cache_dir.copy() + String("\",\n")
+        + String("  \"optimizer\": { \"eps\": 1e-8, \"weight_decay\": ")
+        + String(cfg.weight_decay)
+        + String(", \"beta1\": 0.9, \"beta2\": 0.999 }\n")
+    )
+
+
+def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
+    """TrainConfig-schema JSON for the serenitymojo train_<model>_real runners.
+
+    Architecture dims are verbatim from the canonical
+    /home/alex/mojodiffusion/serenitymojo/configs/<model>.json; the runner
+    re-validates every dim against its comptime contract, so drift fails loud.
+    Only the recipe (lr/rank/alpha/steps/save/cache/ckpt) comes from the UI.
+    """
+    var t = cfg.backend_target.copy()
+    if t == String("chroma"):
+        return (
+            String("{\n  \"model_type\": \"chroma\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"vae\": \"") + String(SERENITY_CHROMA_VAE) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"inner_dim\": 3072,\n  \"in_channels\": 64,\n")
+            + String("  \"joint_attention_dim\": 4096,\n  \"out_channels\": 64,\n")
+            + String("  \"num_double\": 19,\n  \"num_single\": 38,\n")
+            + String("  \"num_heads\": 24,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 12288,\n  \"timestep_dim\": 256,\n")
+            + String("  \"rope_theta\": 10000,\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("ernie"):
+        return (
+            String("{\n  \"model_type\": \"ernie_image\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"vae\": \"") + String(SERENITY_ERNIE_VAE) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_ERNIE_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"inner_dim\": 4096,\n  \"in_channels\": 128,\n")
+            + String("  \"joint_attention_dim\": 3072,\n  \"out_channels\": 128,\n")
+            + String("  \"num_double\": 0,\n  \"num_single\": 36,\n")
+            + String("  \"num_heads\": 32,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 12288,\n  \"timestep_dim\": 4096,\n")
+            + String("  \"rope_theta\": 256,\n  \"rope_axes_dim\": [32, 48, 48],\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("anima"):
+        return (
+            String("{\n  \"model_type\": \"anima\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"vae\": \"") + String(SERENITY_ANIMA_VAE) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_ANIMA_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"inner_dim\": 2048,\n  \"in_channels\": 68,\n")
+            + String("  \"joint_attention_dim\": 1024,\n  \"out_channels\": 64,\n")
+            + String("  \"num_double\": 0,\n  \"num_single\": 28,\n")
+            + String("  \"num_heads\": 16,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 8192,\n  \"timestep_dim\": 2048,\n")
+            + String("  \"rope_theta\": 10000,\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("zimage"):
+        return (
+            String("{\n  \"model_type\": \"zimage\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_ZIMAGE_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"inner_dim\": 3840,\n  \"in_channels\": 16,\n")
+            + String("  \"joint_attention_dim\": 2560,\n  \"out_channels\": 16,\n")
+            + String("  \"num_double\": 0,\n  \"num_single\": 30,\n")
+            + String("  \"num_noise_refiner\": 2,\n  \"num_context_refiner\": 2,\n")
+            + String("  \"num_heads\": 30,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 10240,\n  \"patch_size\": 2,\n")
+            + String("  \"timestep_dim\": 1024,\n  \"min_mod\": 256,\n")
+            + String("  \"rope_theta\": 256,\n  \"rope_axes_dim\": [32, 48, 48],\n")
+            + String("  \"time_scale\": 1000.0,\n  \"pad_tokens_multiple\": 32,\n")
+            + String("  \"norm_eps\": 1e-5,\n  \"final_norm_eps\": 1e-6,\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("l2p"):
+        return (
+            String("{\n  \"model_type\": \"l2p\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_ZIMAGE_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"inner_dim\": 3840,\n  \"in_channels\": 3,\n")
+            + String("  \"joint_attention_dim\": 2560,\n  \"out_channels\": 3,\n")
+            + String("  \"num_double\": 0,\n  \"num_single\": 30,\n")
+            + String("  \"num_noise_refiner\": 2,\n  \"num_context_refiner\": 2,\n")
+            + String("  \"num_heads\": 30,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 10240,\n  \"patch_size\": 16,\n")
+            + String("  \"timestep_dim\": 1024,\n  \"min_mod\": 256,\n")
+            + String("  \"rope_theta\": 256,\n  \"rope_axes_dim\": [32, 48, 48],\n")
+            + String("  \"time_scale\": 1000.0,\n  \"pad_tokens_multiple\": 32,\n")
+            + String("  \"norm_eps\": 1e-5,\n  \"final_norm_eps\": 1e-6,\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("sdxl"):
+        return (
+            String("{\n  \"model_type\": \"sdxl\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"vae\": \"") + String(SERENITY_SDXL_VAE) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"in_channels\": 4,\n  \"out_channels\": 4,\n")
+            + String("  \"model_channels\": 320,\n  \"channel_mult\": [1, 2, 4],\n")
+            + String("  \"num_res_blocks\": 2,\n  \"context_dim\": 2048,\n")
+            + String("  \"head_dim\": 64,\n  \"adm_in_channels\": 2816,\n")
+            + String("  \"num_groups\": 32,\n")
+            + String("  \"transformer_depth_input\": [0, 0, 2, 2, 10, 10],\n")
+            + String("  \"transformer_depth_middle\": 10,\n")
+            + String("  \"transformer_depth_output\": [10, 10, 10, 2, 2, 2, 0, 0, 0],\n")
+            + String("  \"time_embed_dim\": 1280,\n")
+            + String("  \"beta_start\": 0.00085,\n  \"beta_end\": 0.012,\n")
+            + String("  \"num_train_timesteps\": 1000,\n  \"prediction_type\": \"epsilon\",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    raise Error(String("no runner train config template for backend ") + t)
 
 
 def trainer_ui_config_json_snapshot(cfg: TrainerUIConfig) -> String:

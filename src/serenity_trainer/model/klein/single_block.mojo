@@ -71,6 +71,7 @@ from std.collections import List, Optional
 from std.math import sqrt
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
+from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.scratch_ring import ScratchRingAllocator
 
@@ -1324,6 +1325,7 @@ def single_block_lora_backward_device_resident_scratch[
     compute_aux_grads: Bool = True,
     drop_qkv: LoraDropout = LoraDropout(),
     drop_out: LoraDropout = LoraDropout(),
+    dump_path: String = "",
 ) raises -> SingleBlockLoraDeviceGrads:
     var scratch_mark = scratch.mark()
     var scale = Float32(1.0) / sqrt(Float32(Dh))
@@ -1383,6 +1385,51 @@ def single_block_lora_backward_device_resident_scratch[
     var d_q_pre_flat = reshape_owned(d_q_pre_t^, [S, D])
     var d_k_pre_flat = reshape_owned(d_k_pre_t^, [S, D])
     reshape_in_place(sb.d_v, [S, D])
+    # OP-ISOLATION dump: d_att = grad at attention OUTPUT (sdpa INPUT, post to_out/ff/
+    # gate bwd); sb.d_v = sdpa OUTPUT for v (no rope/rms). vs OT proj_out-input band
+    # [0:D] and to_qkv_mlp_proj-output band [2D:3D] -> splits sdpa_backward vs ff/gate.
+    if len(dump_path) > 0:
+        var datt_c = d_att.clone(ctx)            # [1,S,H,Dh]
+        reshape_in_place(datt_c, [S, D])
+        var dn = List[String]()
+        var dt = List[ArcPointer[Tensor]]()
+        dn.append("d_att")
+        dt.append(ArcPointer(datt_c^))
+        dn.append("sb_d_v")
+        dt.append(ArcPointer(sb.d_v.clone(ctx)))
+        # d_q_pre/d_k_pre = grad at q/k projection output (post rope+rms bwd) ==
+        # OT to_qkv_mlp_proj-output bands [0:D]/[D:2D]. Splits sdpa-V vs rope/rms Q/K.
+        dn.append("d_q_pre")
+        dt.append(ArcPointer(d_q_pre_flat.clone(ctx)))
+        dn.append("d_k_pre")
+        dt.append(ArcPointer(d_k_pre_flat.clone(ctx)))
+        # rms-backward inputs (for torch isolation of rms_norm_backward_dx vs rope/sdpa)
+        dn.append("d_q_rms"); dt.append(ArcPointer(d_q_rms.clone(ctx)))
+        dn.append("d_k_rms"); dt.append(ArcPointer(d_k_rms.clone(ctx)))
+        # rope-backward inputs (sb.d_q/sb.d_k = sdpa outputs) + cos/sin tables, to
+        # replicate rope_backward arithmetic in numpy: exonerate rope -> sdpa d_q/d_k.
+        dn.append("sb_d_q"); dt.append(ArcPointer(sb.d_q.clone(ctx)))
+        dn.append("sb_d_k"); dt.append(ArcPointer(sb.d_k.clone(ctx)))
+        dn.append("rope_cos"); dt.append(ArcPointer(cos.clone(ctx)))
+        dn.append("rope_sin"); dt.append(ArcPointer(sin.clone(ctx)))
+        # sdpa fwd activations + d_att, to torch-verify sdpa_backward in isolation.
+        dn.append("q_rope"); dt.append(ArcPointer(saved.q_rope[].clone(ctx)))
+        dn.append("k_rope"); dt.append(ArcPointer(saved.k_rope[].clone(ctx)))
+        dn.append("v_sv");   dt.append(ArcPointer(saved.v[].clone(ctx)))
+        # FORWARD params (modulate+qkv-proj) to torch-verify the single-block FORWARD
+        # in isolation and test if Mojo(OT-input)->OT q_pre (single-block-fwd vs doubles).
+        dn.append("fwd_x");    dt.append(ArcPointer(saved.x[].clone(ctx)))
+        dn.append("fwd_ln");   dt.append(ArcPointer(saved.ln[].clone(ctx)))
+        dn.append("fwd_norm"); dt.append(ArcPointer(saved.norm[].clone(ctx)))
+        dn.append("mod_shift");dt.append(ArcPointer(mv.shift[].clone(ctx)))
+        dn.append("mod_scale");dt.append(ArcPointer(mv.scale[].clone(ctx)))
+        dn.append("w1");       dt.append(ArcPointer(w.w1[].clone(ctx)))
+        dn.append("q_pre");   dt.append(ArcPointer(saved.q_pre[].clone(ctx)))
+        dn.append("k_pre");   dt.append(ArcPointer(saved.k_pre[].clone(ctx)))
+        dn.append("q_norm");  dt.append(ArcPointer(w.q_norm[].clone(ctx)))
+        dn.append("k_norm");  dt.append(ArcPointer(w.k_norm[].clone(ctx)))
+        save_safetensors(dn, dt, dump_path, ctx)
+        print("[klein-dy-dump] single-block sdpa in/out (d_att/sb_d_v/d_q_pre/d_k_pre) -> ", dump_path)
     var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, sb.d_v, True)
 
     var d_norm_t = linear_backward_dx_split_scratch(
@@ -1399,6 +1446,15 @@ def single_block_lora_backward_device_resident_scratch[
         d_norm_t = add(d_norm_t, lg.d_x, ctx)
         qkv_d_a = lg.d_a.copy()
         qkv_d_b = lg.d_b.copy()
+
+    # DELTA-BISECTION: dump d_norm (grad at qkv-proj INPUT == modulated norm) ==
+    # OT to_qkv_mlp_proj input-grad. Brackets the sdpa/rope/rms/w1 segment.
+    if len(dump_path) > 0:
+        var nn = List[String]()
+        nn.append("d_norm")
+        var nt = List[ArcPointer[Tensor]]()
+        nt.append(ArcPointer(d_norm_t.clone(ctx)))
+        save_safetensors(nn, nt, dump_path + String(".dnorm"), ctx)
 
     var mb = modulate_backward(d_norm_t, saved.ln[], mv.scale[], ctx, compute_aux_grads)
     var d_scale = List[Float32]()

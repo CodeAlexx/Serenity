@@ -61,7 +61,10 @@ def render_dataset_tab(
     field_row(ctx, label_w, val_w, String("Buckets"), String("704x1024, 1024x1024, 1024x704"))
     field_row(ctx, label_w, val_w, String("Caption Source"), String("sidecar text files"))
     _ = slider_row(ctx, label_w, val_w, String("Caption Dropout"), String("caption_dropout"), cfg.caption_dropout, 0.0, 0.5)
-    field_row(ctx, label_w, val_w, String("Trigger"), String("gigerver3"))
+    var trigger = String("")
+    if len(cfg.concepts) > 0:
+        trigger = cfg.concepts[0].trigger.copy()
+    field_row(ctx, label_w, val_w, String("Trigger"), trigger)
     field_row(ctx, label_w, val_w, String("Cache Format"), String("safetensors latent/cap"))
     end_form_panel(ctx)
 

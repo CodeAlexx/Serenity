@@ -2,7 +2,7 @@
 
 Rust-snapshot layout: fixed left nav, compact top action bar, dense center
     panels, and a persistent right live-status rail. Serenity tab/config names are
-    the source of truth; the runtime bridge targets the Ideogram4 live trainer.
+    the source of truth; the runtime bridge targets the selected live trainer.
 """
 
 from std.memory import UnsafePointer
@@ -168,7 +168,7 @@ def _sidebar(mut s: TrainUIAppState):
     label(s.ctx, String(""))
     s.ctx.layout_row(row3(m.pad, content_w, m.pad), 22)
     label(s.ctx, String(""))
-    label(s.ctx, String("Ideogram4 trainer UI"))
+    label(s.ctx, String("Native trainer UI"))
     label(s.ctx, String(""))
     s.ctx.layout_row(row3(m.pad, content_w, m.pad), 16)
     label(s.ctx, String(""))
@@ -273,7 +273,7 @@ def _logs_tab(mut s: TrainUIAppState, content_w: Int32):
     if s.runtime.using_callback_progress:
         field_row(s.ctx, label_w, val_w, String("Stats Source"), String("Serenity callbacks"))
     elif s.runtime.using_live_progress:
-        field_row(s.ctx, label_w, val_w, String("Stats Source"), String("Ideogram4 progress file"))
+        field_row(s.ctx, label_w, val_w, String("Stats Source"), String("Trainer progress file"))
     else:
         field_row(s.ctx, label_w, val_w, String("Stats Source"), String("Waiting for bridge"))
     field_row(s.ctx, label_w, val_w, String("Samples"), String(len(s.runtime.samples)))
@@ -455,7 +455,7 @@ def _status_rail(mut s: TrainUIAppState):
     if s.runtime.using_callback_progress:
         field_row(s.ctx, label_w, val_w, String("Source"), String("Serenity callbacks"))
     elif s.runtime.using_live_progress:
-        field_row(s.ctx, label_w, val_w, String("Source"), String("Ideogram4 progress file"))
+        field_row(s.ctx, label_w, val_w, String("Source"), String("Trainer progress file"))
     else:
         field_row(s.ctx, label_w, val_w, String("Source"), String("Waiting"))
     s.ctx.end_column()
@@ -558,12 +558,12 @@ def main() raises:
     var rc = Backend.init(
         Int32(Int(initial.x)),
         Int32(Int(initial.y)),
-        String("Serenity - Ideogram4 Trainer"),
+        String("Serenity Trainer"),
     )
     if rc != 0:
         print("FAIL: Backend.init returned", rc)
         raise Error("init failed")
 
-    print("Opening Serenity trainer UI. Backend target: Ideogram4 trainer.")
+    print("Opening Serenity trainer UI.")
     Backend.run_blocking(_frame)
     print("PASS: Serenity trainer UI exited. runs=", len(state.runtime.runs))

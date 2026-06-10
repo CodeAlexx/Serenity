@@ -84,6 +84,7 @@ from std.math import sqrt
 from std.memory import ArcPointer
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.scratch_ring import ScratchRingAllocator
 
 # ── forward ops (GPU) ────────────────────────────────────────────────────────
@@ -1397,6 +1398,7 @@ def double_block_lora_forward_device_resident_scratch[
     ctx: DeviceContext,
     mut scratch: ScratchRingAllocator,
     drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
+    dump_path: String = "",
 ) raises -> DoubleBlockDeviceForward:
     var scale = Float32(1.0) / sqrt(Float32(Dh))
 
@@ -1419,6 +1421,30 @@ def double_block_lora_forward_device_resident_scratch[
     var img_att_4d = slice(att, 1, N_TXT, N_IMG, ctx)
     var txt_att = TArc(reshape_owned(txt_att_4d^, [N_TXT, D]))
     var img_att = TArc(reshape_owned(img_att_4d^, [N_IMG, D]))
+
+    # FORWARD-BISECTION (block 0): dump modulate1 out (norm) + sdpa out (att) + q_pre
+    # per stream to localize the double-block forward op vs OT sub-module hooks.
+    if len(dump_path) > 0:
+        var dfn = List[String]()
+        var dft = List[ArcPointer[Tensor]]()
+        dfn.append("img_norm")
+        dft.append(ArcPointer(ip.norm[].clone(ctx)))
+        dfn.append("txt_norm")
+        dft.append(ArcPointer(tp.norm[].clone(ctx)))
+        dfn.append("img_att")
+        dft.append(ArcPointer(img_att[].clone(ctx)))
+        dfn.append("txt_att")
+        dft.append(ArcPointer(txt_att[].clone(ctx)))
+        dfn.append("img_qpre")
+        dft.append(ArcPointer(ip.q_pre[].clone(ctx)))
+        dfn.append("img_ln1")
+        dft.append(ArcPointer(ip.ln1[].clone(ctx)))
+        dfn.append("img_scale1")
+        dft.append(ArcPointer(img_mod.scale1[].clone(ctx)))
+        dfn.append("img_shift1")
+        dft.append(ArcPointer(img_mod.shift1[].clone(ctx)))
+        save_safetensors(dfn, dft, dump_path, ctx)
+        print("[klein-dbl-fwd] dumped block-0 norm/att/qpre -> ", dump_path)
 
     var ipost = _stream_post_lora_resident(
         img_x, img_att, w.img, img_mod, lora.img, N_IMG, D, F, eps, norm_ones, norm_zeros, ctx, drop.img)
@@ -2009,6 +2035,7 @@ def _stream_pre_backward_lora_resident_scratch[
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
     drop: StreamLoraDropout = StreamLoraDropout(),
+    dump_path: String = "",
 ) raises -> _StreamPreBackLora:
     var scratch_mark = scratch.mark()
     var d_q_pre = rms_norm_backward_dx(d_q_rms, sv.q_pre[], w.q_norm[], eps, ctx)
@@ -2018,6 +2045,20 @@ def _stream_pre_backward_lora_resident_scratch[
 
     var d_q_pre_flat = reshape_owned(d_q_pre^, [N, D])
     var d_k_pre_flat = reshape_owned(d_k_pre^, [N, D])
+    # DECISIVE-TEST instrumentation (Klein d_B bug): dump the per-projection d_y
+    # (grad at to_q/to_k/to_v MODULE OUTPUT, == what the q/k/v LoRA consumes).
+    # Inert unless dump_path is set (gate passes it only for block 0, image stream).
+    if len(dump_path) > 0:
+        var dnames = List[String]()
+        dnames.append("d_q_pre_flat")
+        dnames.append("d_k_pre_flat")
+        dnames.append("d_v_flat")
+        var dtens = List[ArcPointer[Tensor]]()
+        dtens.append(ArcPointer(d_q_pre_flat.clone(ctx)))
+        dtens.append(ArcPointer(d_k_pre_flat.clone(ctx)))
+        dtens.append(ArcPointer(d_v_flat.clone(ctx)))
+        save_safetensors(dnames, dtens, dump_path, ctx)
+        print("[klein-dy-dump] wrote d_q/d_k/d_v_pre_flat [N=", N, ",D=", D, "] -> ", dump_path)
     var d_qkv = concat3_scratch(1, ctx, scratch, d_q_pre_flat, d_k_pre_flat, d_v_flat, True)
 
     var d_norm_t = linear_backward_dx_scratch(
@@ -2224,6 +2265,7 @@ def double_block_lora_backward_device_resident_scratch[
     mut scratch: ScratchRingAllocator,
     compute_aux_grads: Bool = True,
     drop: DoubleBlockLoraDropout = DoubleBlockLoraDropout(),
+    dump_path: String = "",
 ) raises -> DoubleBlockLoraDeviceGrads:
     var scratch_mark = scratch.mark()
     var scale = Float32(1.0) / sqrt(Float32(Dh))
@@ -2236,6 +2278,19 @@ def double_block_lora_backward_device_resident_scratch[
         d_to_t, saved.txt.x, saved.txt.att, w.txt, txt_mod, lora.txt, saved.txt,
         N_TXT, D, F, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.txt,
     )
+
+    # DECISIVE-TEST localization: dump the per-stream d_att (grad at the attention
+    # OUTPUT == INPUT to sdpa_backward). Comparing this to OT's to_out/to_add_out
+    # input-grad splits "_stream_post_backward path" vs "sdpa_backward math".
+    if len(dump_path) > 0:
+        var an = List[String]()
+        an.append("d_iatt")
+        an.append("d_tatt")
+        var at = List[ArcPointer[Tensor]]()
+        at.append(ArcPointer(ipb.d_att[].clone(ctx)))
+        at.append(ArcPointer(tpb.d_att[].clone(ctx)))
+        save_safetensors(an, at, dump_path + String(".datt"), ctx)
+        print("[klein-dy-dump] wrote d_iatt/d_tatt -> ", dump_path, ".datt")
 
     var d_tatt_4d = reshape(tpb.d_att[], [1, N_TXT, H, Dh], ctx)
     var d_iatt_4d = reshape(ipb.d_att[], [1, N_IMG, H, Dh], ctx)
@@ -2260,6 +2315,7 @@ def double_block_lora_backward_device_resident_scratch[
     var iprb = _stream_pre_backward_lora_resident_scratch[H, Dh](
         d_img_q, d_img_k, d_img_v, w.img, img_mod, lora.img, saved.img,
         N_IMG, D, eps, norm_ones, ctx, scratch, compute_aux_grads, drop.img,
+        dump_path,
     )
     var tprb = _stream_pre_backward_lora_resident_scratch[H, Dh](
         d_txt_q, d_txt_k, d_txt_v, w.txt, txt_mod, lora.txt, saved.txt,

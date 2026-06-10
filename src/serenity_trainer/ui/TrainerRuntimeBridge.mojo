@@ -10,6 +10,7 @@ from serenity_trainer.ui.TrainerConfigModel import (
     SERENITY_TRAINER_OUTPUT_DIR,
     TrainerUIConfig,
     trainer_ui_config_json_snapshot,
+    trainer_ui_runner_train_config_json,
     trainer_ui_total_steps,
     trainer_ui_validate,
 )
@@ -17,9 +18,13 @@ from serenity_trainer.ui.TrainerConfigModel import (
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 comptime IDEOGRAM4_LIVE_RUNNER = "target/serenity_ideogram4_live_trainer"
-comptime IDEOGRAM4_TERMINAL_LAUNCHER = "scripts/serenity_ideogram4_terminal_launcher.sh"
+comptime KLEIN_LIVE_RUNNER = "target/serenity_klein_live_trainer"
+comptime TERMINAL_LAUNCHER = "scripts/serenity_terminal_launcher.sh"
 comptime IDEOGRAM4_LIVE_LOG = "/tmp/serenity_ideogram4_live_trainer.log"
 comptime IDEOGRAM4_LIVE_PID = "target/serenity_ideogram4_live_trainer.pid"
+comptime KLEIN_LIVE_LOG = "/tmp/serenity_klein_live_trainer.log"
+comptime KLEIN_LIVE_PID = "target/serenity_klein_live_trainer.pid"
+comptime KLEIN_VAE_PATH = "/home/alex/.serenity/models/vaes/flux2-vae.safetensors"
 
 
 struct TrainerUILiveStats(Copyable, Movable):
@@ -91,8 +96,8 @@ struct TrainerUIRuntime(Movable):
     var logs: List[String]
 
     def __init__(out self):
-        self.backend_label = String("Ideogram4")
-        self.backend_target = String("ideogram4")
+        self.backend_label = String("Klein 9B")
+        self.backend_target = String("klein")
         self.has_running = False
         self.paused = False
         self.frame_counter = 59
@@ -171,6 +176,71 @@ def _ideogram4_transformer_path(cfg: TrainerUIConfig) -> String:
     )
 
 
+def _is_config_runner_target(target: String) -> Bool:
+    # Config-driven runners (serenitymojo train_<m>_real.mojo built into
+    # target/serenity_<m>_live_trainer). They take `<train_config.json> <steps>`
+    # and stream the shared print_trainer_progress line shape on stdout.
+    return (
+        target == String("chroma")
+        or target == String("ernie")
+        or target == String("anima")
+        or target == String("sdxl")
+        or target == String("zimage")
+        or target == String("l2p")
+    )
+
+
+def _backend_label(target: String) -> String:
+    if target == String("klein"):
+        return String("Klein 9B")
+    if target == String("ideogram4"):
+        return String("Ideogram4")
+    if target == String("chroma"):
+        return String("Chroma1 HD")
+    if target == String("ernie"):
+        return String("Ernie Image")
+    if target == String("anima"):
+        return String("Anima")
+    if target == String("sdxl"):
+        return String("SDXL 1.0")
+    if target == String("zimage"):
+        return String("Z-Image")
+    if target == String("l2p"):
+        return String("Z-Image L2P")
+    return target.copy()
+
+
+def _runner_path(target: String) -> String:
+    if target == String("klein"):
+        return String(KLEIN_LIVE_RUNNER)
+    if _is_config_runner_target(target):
+        return String("target/serenity_") + target.copy() + String("_live_trainer")
+    return String(IDEOGRAM4_LIVE_RUNNER)
+
+
+def _pid_path(target: String) -> String:
+    if target == String("klein"):
+        return String(KLEIN_LIVE_PID)
+    if _is_config_runner_target(target):
+        return String("target/serenity_") + target.copy() + String("_live_trainer.pid")
+    return String(IDEOGRAM4_LIVE_PID)
+
+
+def _log_path(target: String) -> String:
+    if target == String("klein"):
+        return String(KLEIN_LIVE_LOG)
+    if _is_config_runner_target(target):
+        # Config-driven runners stream progress on stdout only; tee their
+        # stdout straight into the polled progress file so the legacy
+        # progress-line bridge picks it up live.
+        return String("target/serenity_trainer_progress.log")
+    return String(IDEOGRAM4_LIVE_LOG)
+
+
+def _runner_train_config_path(target: String) -> String:
+    return String("target/serenity_") + target.copy() + String("_train_config.json")
+
+
 def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
     var steps = Int(cfg.max_train_steps)
     if steps < 1:
@@ -184,54 +254,116 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
     var save_every = Int(cfg.save_every)
     if save_every < 0:
         save_every = 0
+    var target = cfg.backend_target.copy()
+    var args: String
+    if _is_config_runner_target(target):
+        # serenitymojo train_<m>_real runners: `<train_config.json> <steps>`.
+        # The recipe (lr/rank/alpha/steps/save/cache/ckpt) is in the config
+        # JSON written at launch by trainer_ui_launch_live_runner.
+        args = (
+            _shell_quote(_runner_train_config_path(target.copy()))
+            + String(" ")
+            + String(steps)
+        )
+    elif target == String("klein"):
+        args = (
+            _shell_quote(rt.progress_file_path.copy())
+            + String(" ")
+            + _shell_quote(cfg.base_model_name.copy())
+            + String(" ")
+            + _shell_quote(cfg.cache_dir.copy())
+            + String(" ")
+            + _shell_quote(cfg.dataset_path.copy())
+            + String(" ")
+            + _shell_quote(String(SERENITY_TRAINER_OUTPUT_DIR))
+            + String(" ")
+            + String(steps)
+            + String(" ")
+            + String(rank)
+            + String(" ")
+            + String(alpha)
+            + String(" ")
+            + String(cfg.learning_rate)
+            + String(" ")
+            + String(save_every)
+            + String(" ")
+            + _shell_quote(String(KLEIN_VAE_PATH))
+        )
+    else:
+        args = (
+            _shell_quote(rt.progress_file_path.copy())
+            + String(" ")
+            + _shell_quote(_ideogram4_transformer_path(cfg))
+            + String(" ")
+            + _shell_quote(cfg.cache_dir.copy())
+            + String(" ")
+            + _shell_quote(String(SERENITY_TRAINER_OUTPUT_DIR))
+            + String(" ")
+            + String(steps)
+            + String(" ")
+            + String(rank)
+            + String(" ")
+            + String(alpha)
+            + String(" ")
+            + String(cfg.learning_rate)
+            + String(" ")
+            + String(save_every)
+        )
+    var mkdirs = String("")
+    if _is_config_runner_target(target.copy()):
+        # The config-driven runners save to fixed per-model output dirs and do
+        # not create them (Chroma raised "failed to open for write" on a
+        # missing dir after an otherwise-good step). Self-heal at launch.
+        mkdirs = String(
+            "mkdir -p /home/alex/mojodiffusion/output/chroma_boxjana"
+            " /home/alex/mojodiffusion/output/alina_sdxl"
+            " /home/alex/mojodiffusion/output/alina_zimage"
+            " /home/alex/mojodiffusion/output/alina_l2p"
+            " /home/alex/mojodiffusion/serenitymojo/output"
+            " /home/alex/mojodiffusion/output && "
+        )
     return (
-        String("cd /home/alex/serenity-trainer && rm -f ")
-        + _shell_quote(String(IDEOGRAM4_LIVE_PID))
+        String("cd /home/alex/serenity-trainer && ")
+        + mkdirs
+        + String("rm -f ")
+        + _shell_quote(_pid_path(target.copy()))
         + String(" && bash ")
-        + String(IDEOGRAM4_TERMINAL_LAUNCHER)
+        + String(TERMINAL_LAUNCHER)
         + String(" ")
-        + _shell_quote(rt.progress_file_path.copy())
+        + _shell_quote(_backend_label(target.copy()))
         + String(" ")
-        + _shell_quote(_ideogram4_transformer_path(cfg))
+        + _shell_quote(_runner_path(target.copy()))
         + String(" ")
-        + _shell_quote(cfg.cache_dir.copy())
+        + _shell_quote(_pid_path(target.copy()))
         + String(" ")
-        + _shell_quote(String(SERENITY_TRAINER_OUTPUT_DIR))
+        + _shell_quote(_log_path(target.copy()))
         + String(" ")
-        + String(steps)
-        + String(" ")
-        + String(rank)
-        + String(" ")
-        + String(alpha)
-        + String(" ")
-        + String(cfg.learning_rate)
-        + String(" ")
-        + String(save_every)
+        + args
     )
 
 
 def _any_live_runner_active() -> Bool:
-    var rc = _sys_system(String("pgrep -f '^(/home/alex/serenity-trainer/)?target/[s]erenity_ideogram4_live_trainer( |$)' > /dev/null 2>&1"))
+    var rc = _sys_system(String("pgrep -f '^(/home/alex/serenity-trainer/)?target/[s]erenity_(ideogram4|klein|chroma|ernie|anima|sdxl)_live_trainer( |$)' > /dev/null 2>&1"))
     return rc == 0
 
 
-def _owned_live_runner_active() -> Bool:
+def _owned_live_runner_active(target: String) -> Bool:
     var rc = _sys_system(
         String("pid=$(cat ")
-        + _shell_quote(String(IDEOGRAM4_LIVE_PID))
+        + _shell_quote(_pid_path(target.copy()))
         + String(" 2>/dev/null); [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null")
     )
     return rc == 0
 
 
-def _stop_live_runner() -> Bool:
+def _stop_live_runner(target: String) -> Bool:
     var rc = _sys_system(
         String("pid=$(cat ")
-        + _shell_quote(String(IDEOGRAM4_LIVE_PID))
+        + _shell_quote(_pid_path(target.copy()))
         + String(" 2>/dev/null); if [ -n \"$pid\" ]; then ")
         + String("kill -TERM -- -\"$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null; ")
         + String("rm -f ")
-        + _shell_quote(String(IDEOGRAM4_LIVE_PID))
+        + _shell_quote(_pid_path(target.copy()))
         + String("; else exit 1; fi")
     )
     return rc == 0
@@ -240,37 +372,65 @@ def _stop_live_runner() -> Bool:
 def _record_live_runner_exit(mut rt: TrainerUIRuntime):
     _append_runtime_log(
         rt,
-        String("Ideogram4 live trainer process exited; stdout log: ")
-        + String(IDEOGRAM4_LIVE_LOG),
+        rt.backend_label.copy()
+        + String(" live trainer process exited; stdout log: ")
+        + _log_path(rt.backend_target.copy()),
     )
     try:
-        var text = _read_file_text(String(IDEOGRAM4_LIVE_LOG))
+        var text = _read_file_text(_log_path(rt.backend_target.copy()))
         _ = _apply_progress_text_from(rt, text.copy(), 0)
     except:
         pass
-    _ = _sys_system(String("rm -f ") + _shell_quote(String(IDEOGRAM4_LIVE_PID)))
+    _ = _sys_system(String("rm -f ") + _shell_quote(_pid_path(rt.backend_target.copy())))
+
+
+def _write_runner_train_config(cfg: TrainerUIConfig) raises -> String:
+    var path = _runner_train_config_path(cfg.backend_target.copy())
+    var f = open(path.copy(), "w")
+    f.write(trainer_ui_runner_train_config_json(cfg))
+    f.close()
+    return path^
 
 
 def trainer_ui_launch_live_runner(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime) -> Bool:
-    if cfg.backend_target != String("ideogram4"):
+    if (
+        cfg.backend_target != String("ideogram4")
+        and cfg.backend_target != String("klein")
+        and not _is_config_runner_target(cfg.backend_target.copy())
+    ):
+        _append_runtime_log(
+            rt,
+            String("no live trainer runner wired for backend: ") + cfg.backend_target.copy(),
+        )
+        rt.status_text = String("No trainer wired for ") + cfg.backend_target.copy()
         return False
+    rt.backend_target = cfg.backend_target.copy()
+    rt.backend_label = _backend_label(cfg.backend_target.copy())
     if not rt.live_launch_enabled:
         _append_runtime_log(rt, String("live trainer launch disabled for this runtime"))
         return False
-    if _owned_live_runner_active():
-        _append_runtime_log(rt, String("live trainer launch skipped: existing Ideogram4 runner is active"))
+    if _owned_live_runner_active(rt.backend_target.copy()):
+        _append_runtime_log(rt, String("live trainer launch skipped: existing ") + rt.backend_label.copy() + String(" runner is active"))
         rt.status_text = String("Trainer already running")
         return False
     if _any_live_runner_active():
-        _append_runtime_log(rt, String("live trainer launch skipped: another Ideogram4 runner is active"))
+        _append_runtime_log(rt, String("live trainer launch skipped: another Serenity runner is active"))
         rt.status_text = String("Another trainer is running")
         return False
+    if _is_config_runner_target(rt.backend_target.copy()):
+        try:
+            var cfg_path = _write_runner_train_config(cfg)
+            _append_runtime_log(rt, String("wrote runner train config: ") + cfg_path.copy())
+        except e:
+            _append_runtime_log(rt, String("runner train config write failed: ") + String(e))
+            rt.status_text = String("Runner config write failed")
+            return False
     var rc = _sys_system(_live_runner_command(cfg, rt))
     if rc == 0:
-        _append_runtime_log(rt, String("launched Ideogram4 live trainer: ") + String(IDEOGRAM4_LIVE_LOG))
-        rt.status_text = String("Launching Ideogram4 trainer")
+        _append_runtime_log(rt, String("launched ") + rt.backend_label.copy() + String(" live trainer: ") + _log_path(rt.backend_target.copy()))
+        rt.status_text = String("Launching ") + rt.backend_label.copy() + String(" trainer")
         return True
-    _append_runtime_log(rt, String("Ideogram4 live trainer launch failed rc=") + String(rc))
+    _append_runtime_log(rt, rt.backend_label.copy() + String(" live trainer launch failed rc=") + String(rc))
     rt.status_text = String("Live trainer launch failed")
     return False
 
@@ -278,6 +438,10 @@ def trainer_ui_launch_live_runner(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime
 def trainer_ui_progress_fraction(rt: TrainerUIRuntime) -> Float32:
     if rt.live.total_steps <= 0:
         return 0.0
+    if rt.live.total_epochs > 0:
+        var total = rt.live.total_steps * rt.live.total_epochs
+        if total > 0:
+            return Float32(rt.live.global_step) / Float32(total)
     return Float32(rt.live.step) / Float32(rt.live.total_steps)
 
 
@@ -357,7 +521,10 @@ def trainer_ui_on_update_train_progress(
     rt.live.step = epoch_step
     rt.live.total_steps = max_step
     rt.live.total_epochs = max_epoch
-    rt.live.global_step = epoch * max_step + epoch_step
+    var completed_epochs = epoch - 1
+    if completed_epochs < 0:
+        completed_epochs = 0
+    rt.live.global_step = completed_epochs * max_step + epoch_step
     rt.using_live_progress = True
     rt.using_callback_progress = True
     _update_eta_like_serenity(rt)
@@ -380,6 +547,10 @@ def trainer_ui_on_optimizer_step(
 def _live_progress_complete(rt: TrainerUIRuntime) -> Bool:
     if rt.live.total_steps <= 0:
         return False
+    if rt.live.total_epochs > 0:
+        var total = rt.live.total_steps * rt.live.total_epochs
+        if total > 0 and rt.live.global_step >= total:
+            return True
     if rt.live.step < rt.live.total_steps:
         return False
     if rt.live.total_epochs <= 0:
@@ -407,6 +578,7 @@ def trainer_ui_refresh_system_metrics(mut rt: TrainerUIRuntime):
 
 def trainer_ui_submit_current(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime) -> UInt64:
     rt.backend_target = cfg.backend_target.copy()
+    rt.backend_label = _backend_label(cfg.backend_target.copy())
     if rt.has_running:
         _append_runtime_log(rt, String("submit ignored: run already active"))
         rt.last_command = String("submit ignored")
@@ -493,11 +665,11 @@ def trainer_ui_resume(mut rt: TrainerUIRuntime) -> Bool:
 def trainer_ui_cancel(mut rt: TrainerUIRuntime):
     if rt.has_running:
         _append_runtime_log(rt, String("cancelled #") + String(rt.run_id))
-    if rt.live_launch_enabled and _owned_live_runner_active():
-        if _stop_live_runner():
-            _append_runtime_log(rt, String("stopped Ideogram4 live trainer process"))
+    if rt.live_launch_enabled and _owned_live_runner_active(rt.backend_target.copy()):
+        if _stop_live_runner(rt.backend_target.copy()):
+            _append_runtime_log(rt, String("stopped ") + rt.backend_label.copy() + String(" live trainer process"))
         else:
-            _append_runtime_log(rt, String("Ideogram4 live trainer stop signal failed"))
+            _append_runtime_log(rt, rt.backend_label.copy() + String(" live trainer stop signal failed"))
     rt.has_running = False
     rt.paused = False
     rt.frame_counter = 0
@@ -547,9 +719,15 @@ def trainer_ui_save_checkpoint_now(cfg: TrainerUIConfig, mut rt: TrainerUIRuntim
     return True
 
 
+# NOTE: these helpers scan RAW BYTES. Trainer stdout can contain multi-byte
+# UTF-8 (e.g. "—" in banner lines); String codepoint indexing at an arbitrary
+# byte offset asserts on a mid-codepoint boundary, so never use
+# `String(line[byte=i])` to scan — byte compares are boundary-safe.
 def _find_token(line: String, token: String, start: Int = 0) -> Int:
-    var line_len = line.byte_length()
-    var token_len = token.byte_length()
+    var lb = line.as_bytes()
+    var tb = token.as_bytes()
+    var line_len = len(lb)
+    var token_len = len(tb)
     if token_len <= 0 or line_len < token_len:
         return -1
     var i = start
@@ -557,28 +735,39 @@ def _find_token(line: String, token: String, start: Int = 0) -> Int:
         i = 0
     var last = line_len - token_len
     while i <= last:
-        if String(line[byte=i:i + token_len]) == token:
+        var match_here = True
+        for j in range(token_len):
+            if lb[i + j] != tb[j]:
+                match_here = False
+                break
+        if match_here:
             return i
         i = i + 1
     return -1
 
 
 def _find_char(line: String, needle: String, start: Int) -> Int:
+    var lb = line.as_bytes()
+    var nb = needle.as_bytes()
+    if len(nb) != 1:
+        return -1
     var i = start
-    var line_len = line.byte_length()
-    while i < line_len:
-        if String(line[byte=i]) == needle:
+    if i < 0:
+        i = 0
+    while i < len(lb):
+        if lb[i] == nb[0]:
             return i
         i = i + 1
     return -1
 
 
 def _token_end(line: String, start: Int) -> Int:
+    var lb = line.as_bytes()
     var i = start
-    var line_len = line.byte_length()
-    while i < line_len:
-        var ch = String(line[byte=i])
-        if ch == String(" ") or ch == String("|"):
+    if i < 0:
+        i = 0
+    while i < len(lb):
+        if lb[i] == 0x20 or lb[i] == 0x7C:  # ' ' or '|'
             return i
         i = i + 1
     return i
@@ -726,10 +915,11 @@ def trainer_ui_apply_progress_line(mut rt: TrainerUIRuntime, line: String) -> Bo
 
         var speed_marker = _find_token(line.copy(), String("s/step"))
         if speed_marker >= 0:
+            var lb = line.as_bytes()
             var speed_start = speed_marker - 1
             while speed_start > 0:
-                var ch = String(line[byte=speed_start - 1])
-                if ch == String(" ") or ch == String("|"):
+                var ch = lb[speed_start - 1]
+                if ch == 0x20 or ch == 0x7C:  # ' ' or '|'
                     break
                 speed_start = speed_start - 1
             rt.live.speed_it_s = _read_float_between(line.copy(), speed_start, speed_marker)
@@ -740,7 +930,10 @@ def trainer_ui_apply_progress_line(mut rt: TrainerUIRuntime, line: String) -> Bo
             var eta_end = _token_end(line.copy(), eta_start)
             rt.live.eta_secs = _parse_seconds(String(line[byte=eta_start:eta_end]))
 
-        rt.live.global_step = rt.live.epoch * rt.live.total_steps + rt.live.step
+        var completed_epochs = rt.live.epoch - 1
+        if completed_epochs < 0:
+            completed_epochs = 0
+        rt.live.global_step = completed_epochs * rt.live.total_steps + rt.live.step
         rt.has_running = not _live_progress_complete(rt)
         rt.paused = False
         rt.last_command = String("stream")
@@ -822,7 +1015,7 @@ def trainer_ui_tick_and_apply(mut rt: TrainerUIRuntime):
         return
     if rt.live_launch_enabled and rt.start_time > 0.0:
         var elapsed = perf_counter() - rt.start_time
-        if elapsed > 3.0 and not _owned_live_runner_active():
+        if elapsed > 3.0 and not _owned_live_runner_active(rt.backend_target.copy()):
             _record_live_runner_exit(rt)
             rt.has_running = False
             rt.status_text = String("Trainer process exited")

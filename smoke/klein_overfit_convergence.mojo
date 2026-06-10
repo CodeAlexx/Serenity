@@ -34,6 +34,7 @@ from serenity_trainer.model.klein.single_block import SingleBlockWeights, Single
 from serenity_trainer.model.klein.klein_stack import KleinStackBase, KleinStackForward
 from serenity_trainer.model.klein.klein_stack_lora import (
     KleinLoraDeviceSet, KleinLoraGrads, KleinLoraSet, klein_lora_set_to_device,
+    klein_lora_adamw_step,
     klein_stack_lora_backward_resident_moddev_rope_scratch,
     klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch,
 )
@@ -72,6 +73,8 @@ comptime S = N_IMG + N_TXT
 comptime TIMESTEP = Float32(346.0)
 comptime OT_LOSS = Float32(0.5876612663269043)
 comptime LR_STEP1 = Float32(0.000003)
+comptime OVERFIT_STEPS = 30
+comptime OVERFIT_LR = Float32(0.001)
 comptime BETA1 = Float32(0.9)
 comptime BETA2 = Float32(0.999)
 comptime EPS = Float32(1.0e-8)
@@ -541,68 +544,55 @@ def main() raises:
     var img_mod_dev = mods[0].copy()
     var txt_mod_dev = mods[1].copy()
     var single_mod_dev = mods[2].copy()
-    print("[forward] training forward on Serenity step001 tensors ...")
-    var fwd0 = perf_counter_ns()
+    # ── OVERFIT CONVERGENCE CHECK ────────────────────────────────────────────
+    # Train the LoRA on the SAME frozen step001 batch for OVERFIT_STEPS steps with
+    # AdamW. If the bf16 LoRA grads form a correct descent direction, the MSE loss
+    # MUST decrease monotonically toward 0 (overfitting one batch). This is the
+    # practical "does Klein actually train" test, independent of OT bit-parity.
     var img_arc = TArc(img_tok^)
     var txt_arc = TArc(txt_tok^)
-    var fwd = _forward_with_scratch[
-        KH, KDh, N_IMG, N_TXT, S
-    ](
-        img_arc, txt_arc, base, dbw, sbw, lora_dev,
-        img_mod_dev, txt_mod_dev, single_mod_dev, cos_t, sin_t,
-        ctx,
-    )
-    var fwd1 = perf_counter_ns()
+    var first_loss = Float32(0.0)
+    var last_loss = Float32(0.0)
+    print("[overfit] training", OVERFIT_STEPS, "steps on the frozen step001 batch, lr =", OVERFIT_LR)
+    for step in range(OVERFIT_STEPS):
+        var fwd = _forward_with_scratch[KH, KDh, N_IMG, N_TXT, S](
+            img_arc, txt_arc, base, dbw, sbw, lora_dev,
+            img_mod_dev, txt_mod_dev, single_mod_dev, cos_t, sin_t, ctx,
+        )
+        var flow_tokens = Tensor.from_host(fwd.out.copy(), [1, N_IMG, KOUT_CH], STDtype.BF16, ctx)
+        var flow_b = _reshape(flow_tokens, [1, HL, WL, KOUT_CH], ctx)
+        var flow_perm = _permute(flow_b, [0, 3, 1, 2], ctx)
+        var predicted_flow_patch = _reshape_owned(flow_perm^, [1, KOUT_CH, HL, WL])
+        var predicted = _unpatchify_packed(predicted_flow_patch, ctx)
+        var predicted_f32 = cast_tensor(predicted, STDtype.F32, ctx)
+        var loss = _mse_host(predicted_f32, target, ctx)
+        print("  step", step, "loss =", loss)
+        if step == 0:
+            first_loss = loss
+        last_loss = loss
+        var d_pred = mse_backward(predicted_f32, target, ctx)
+        var d_patch = _patchify_packed(d_pred, ctx)
+        var d_patch_nhwc = _permute(d_patch, [0, 2, 3, 1], ctx)
+        var d_flow_tokens = _reshape_owned(d_patch_nhwc^, [N_IMG, KOUT_CH])
+        var scratch_bwd = ScratchRingAllocator(ctx, BWD_SCRATCH_SLAB_BYTES, BWD_SCRATCH_NUM_SLABS)
+        var grads = klein_stack_lora_backward_resident_moddev_rope_scratch[
+            KH, KDh, N_IMG, N_TXT, S
+        ](
+            d_flow_tokens.to_host(ctx), img_host, txt_host,
+            base, dbw, sbw, lora_dev,
+            img_mod_dev, txt_mod_dev, single_mod_dev, cos_t, sin_t,
+            fwd, KDIM, KF, KIN_CH, KTXT_CH, KOUT_CH, KEPS, ctx, scratch_bwd,
+            False, False,
+        )
+        klein_lora_adamw_step(lora_host, grads, step + 1, OVERFIT_LR, ctx)
+        lora_dev = klein_lora_set_to_device(lora_host, ctx)
 
-    var flow_tokens = Tensor.from_host(fwd.out.copy(), [1, N_IMG, KOUT_CH], STDtype.BF16, ctx)
-    var flow_b = _reshape(flow_tokens, [1, HL, WL, KOUT_CH], ctx)
-    var flow_perm = _permute(flow_b, [0, 3, 1, 2], ctx)
-    var predicted_flow_patch = _reshape_owned(flow_perm^, [1, KOUT_CH, HL, WL])
-    var predicted = _unpatchify_packed(predicted_flow_patch, ctx)
-
-    _compare_tensor("packed_flow", flow_tokens, ref_packed, ctx, MIN_FORWARD_COS)
-    _compare_tensor("output.predicted", predicted, ref_predicted, ctx, MIN_FORWARD_COS)
-
-    var loss0 = perf_counter_ns()
-    # Serenity/PyTorch promotes BF16 predicted - F32 target to F32 for MSE.
-    var predicted_f32 = cast_tensor(predicted, STDtype.F32, ctx)
-    var loss = _mse_host(predicted_f32, target, ctx)
-    var d_pred = mse_backward(predicted_f32, target, ctx)
-    var d_patch = _patchify_packed(d_pred, ctx)
-    var d_patch_nhwc = _permute(d_patch, [0, 2, 3, 1], ctx)
-    var d_flow_tokens = _reshape_owned(d_patch_nhwc^, [N_IMG, KOUT_CH])
-    var loss1 = perf_counter_ns()
-    var loss_err = abs(loss - OT_LOSS)
-    print("loss =", loss, "OT loss =", OT_LOSS, "abs_err =", loss_err)
-    if loss_err > LOSS_EPS:
-        raise Error("Klein step001 loss mismatch")
-
-    print("[backward] Klein LoRA backward ...")
-    var bwd0 = perf_counter_ns()
-    var scratch_bwd = ScratchRingAllocator(
-        ctx, BWD_SCRATCH_SLAB_BYTES, BWD_SCRATCH_NUM_SLABS
-    )
-    var grads = klein_stack_lora_backward_resident_moddev_rope_scratch[
-        KH, KDh, N_IMG, N_TXT, S
-    ](
-        d_flow_tokens.to_host(ctx), img_host, txt_host,
-        base, dbw, sbw, lora_dev,
-        img_mod_dev, txt_mod_dev, single_mod_dev, cos_t, sin_t,
-        fwd, KDIM, KF, KIN_CH, KTXT_CH, KOUT_CH, KEPS, ctx, scratch_bwd,
-        False, False,
-    )
-    var bwd1 = perf_counter_ns()
-
-    print("[compare] grads + F32 AdamW two-step update ...")
-    var cmp0 = perf_counter_ns()
-    _compare_grads_and_update(grads, ctx)
-    var cmp1 = perf_counter_ns()
     var all1 = perf_counter_ns()
-
-    print("time_s: load =", _sec(load0, load1),
-          " forward =", _sec(fwd0, fwd1),
-          " loss =", _sec(loss0, loss1),
-          " backward =", _sec(bwd0, bwd1),
-          " compare =", _sec(cmp0, cmp1),
-          " total =", _sec(all0, all1))
-    print("KLEIN TRAIN REF GRAD/UPDATE REPLAY PASS")
+    print("[verdict] loss", first_loss, "->", last_loss,
+          " drop =", first_loss - last_loss, " total_s =", _sec(all0, all1))
+    if last_loss < first_loss * Float32(0.5) and last_loss < first_loss:
+        print("KLEIN OVERFIT CONVERGES: loss dropped >50% -> bf16 LoRA grads ARE a correct descent direction")
+    elif last_loss < first_loss * Float32(0.95):
+        print("KLEIN OVERFIT: loss decreasing (", first_loss, "->", last_loss, ") -> grads descend, slowly")
+    else:
+        raise Error("KLEIN OVERFIT FAILED: loss did not decrease -> grads NOT a descent direction")

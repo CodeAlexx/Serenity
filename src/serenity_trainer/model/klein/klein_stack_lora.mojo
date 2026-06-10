@@ -24,10 +24,13 @@
 
 from std.gpu.host import DeviceContext, HostBuffer
 from std.collections import List, Optional
+from os import getenv
 from std.memory import ArcPointer
 from std.math import sqrt
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.safetensors_writer import save_safetensors
+from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.scratch_ring import ScratchRingAllocator
 from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.ops.linear import linear
@@ -50,6 +53,7 @@ from serenity_trainer.model.klein.single_block import (
     SingleBlockWeights, SingleModVecs, SingleModVecsDevice, single_modvecs_to_device,
     SingleBlockSaved, SingleBlockGrads,
     SingleBlockLora, SingleBlockLoraDevice, SingleBlockLoraGrads,
+    SingleBlockLoraDeviceGrads,
     single_block_lora_forward, single_block_lora_backward,
     single_block_lora_forward_device, single_block_lora_backward_device,
     single_block_lora_to_device,
@@ -453,6 +457,41 @@ def _grad_arc_f32(t: TArc, ctx: DeviceContext) raises -> TArc:
     return TArc(t32^)
 
 
+# F32-FIX EXPERIMENT (KLEIN_F32_BWD): build F32 copies of a single block's weights/
+# saved-activations/mod-vecs so single_block_lora_backward runs the WHOLE chain in
+# F32 storage (bf16->F32 is exact). Tests whether the text-grad divergence is a
+# bf16-accumulation/conditioning artifact (Mojo-F32 vs Mojo-bf16 decorrelates) or a
+# real discrete bug (they agree). LoRA skipped: B=0 => LoRA contributes 0 to d_x.
+def _sbw_f32(w: SingleBlockWeights, ctx: DeviceContext) raises -> SingleBlockWeights:
+    # SingleBlockWeights ctor builds from host data; copy then overwrite TArc fields.
+    var o = w.copy()
+    o.w1 = _grad_arc_f32(w.w1, ctx)
+    o.w2 = _grad_arc_f32(w.w2, ctx)
+    o.w2_att = _grad_arc_f32(w.w2_att, ctx)
+    o.w2_mlp = _grad_arc_f32(w.w2_mlp, ctx)
+    o.q_norm = _grad_arc_f32(w.q_norm, ctx)
+    o.k_norm = _grad_arc_f32(w.k_norm, ctx)
+    return o^
+
+
+def _sbsaved_f32(s: SingleBlockSaved, ctx: DeviceContext) raises -> SingleBlockSaved:
+    return SingleBlockSaved(
+        _grad_arc_f32(s.x, ctx), _grad_arc_f32(s.ln, ctx), _grad_arc_f32(s.norm, ctx),
+        _grad_arc_f32(s.q_pre, ctx), _grad_arc_f32(s.k_pre, ctx),
+        _grad_arc_f32(s.q_rms, ctx), _grad_arc_f32(s.k_rms, ctx), _grad_arc_f32(s.v, ctx),
+        _grad_arc_f32(s.q_rope, ctx), _grad_arc_f32(s.k_rope, ctx),
+        _grad_arc_f32(s.att_flat, ctx),
+        _grad_arc_f32(s.mlp_gate, ctx), _grad_arc_f32(s.mlp_up, ctx), _grad_arc_f32(s.mlp, ctx),
+        _grad_arc_f32(s.out_in, ctx),
+    )
+
+
+def _smv_f32(mv: SingleModVecsDevice, ctx: DeviceContext) raises -> SingleModVecsDevice:
+    return SingleModVecsDevice(
+        _grad_arc_f32(mv.shift, ctx), _grad_arc_f32(mv.scale, ctx), _grad_arc_f32(mv.gate, ctx),
+    )
+
+
 def _host_grad_group_to_lists(
     host: HostBuffer[DType.uint8],
     offsets: List[Int],
@@ -655,16 +694,36 @@ def klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch[
     var dbl_img_in = List[TArc]()
     var dbl_txt_in = List[TArc]()
     var dbl_saved = List[DoubleBlockSaved]()
+    # FORWARD-BISECTION: dump each double block's txt/img OUTPUT vs OT per-double-block
+    # output hooks -> find where the structured ~0.5% txt forward diff is born.
+    var _dbn = List[String]()
+    var _dbt = List[ArcPointer[Tensor]]()
+    var _db_dump = getenv("KLEIN_DBL_DUMP")
+    if _db_dump != String(""):
+        _dbn.append(String("din_txt")); _dbt.append(ArcPointer(txt[].clone(ctx)))
+        _dbn.append(String("din_img")); _dbt.append(ArcPointer(img[].clone(ctx)))
     for bi in range(num_double):
         dbl_img_in.append(img.copy())
         dbl_txt_in.append(txt.copy())
         var bl = _dbl_lora_dev_for(lora, bi)
+        var _dblf = String("")
+        if bi == 0 and _db_dump != String(""):
+            _dblf = _db_dump + String(".dblfwd")
         var fwd = double_block_lora_forward_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
             img, txt, dbw[bi], img_mod_dev, txt_mod_dev, bl,
             cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+            dump_path=_dblf,
         )
         img = fwd.img_out.copy()
         txt = fwd.txt_out.copy()
+        if _db_dump != String(""):
+            _dbn.append(String("dtxt_") + String(bi))
+            _dbt.append(ArcPointer(txt[].clone(ctx)))
+            _dbn.append(String("dimg_") + String(bi))
+            _dbt.append(ArcPointer(img[].clone(ctx)))
+    if _db_dump != String(""):
+        save_safetensors(_dbn, _dbt, _db_dump + String(".dbl"), ctx)
+        print("[klein-dbl-dump] wrote per-double-block txt/img out (", num_double, "blocks)")
 
     var x = TArc(concat(0, ctx, txt[], img[]))
 
@@ -1014,6 +1073,13 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
     var d_single_mod = _zeros(3 * D)
     var bi = num_single - 1
     var saved_single_start = num_single - len(saved.sgl_saved)
+    # PER-BLOCK localization: collect running d_x AFTER each single block backward
+    # (== grad at that block's INPUT). vs OT per-block input-grad hooks -> finds the
+    # block index where txt grad first diverges.
+    var _dxn = List[String]()
+    var _dxt = List[ArcPointer[Tensor]]()
+    var _dx_dump = getenv("KLEIN_DY_DUMP")
+    var norm_ones_f32 = TArc(_t_dtype(_ones(D), [D], STDtype.F32, ctx))
     while bi >= 0:
         var sl = _sgl_lora_dev_for(lora, bi)
         var block_saved: SingleBlockSaved
@@ -1024,12 +1090,74 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
                 saved.sgl_x_in[bi], sbw[bi], single_mod_dev, sl,
                 cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
             )
-        var bg = single_block_lora_backward_device_resident_scratch[H, Dh, S](
-            d_x, sbw[bi], single_mod_dev, sl, block_saved, cos_t, sin_t,
-            D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
-        )
+        # LOCALIZATION self-check: on the LAST single block (a SAVED block), feed its
+        # own saved input x back through the RECOMPUTE path and dump both. If saved vs
+        # recompute diverge, the saved/recompute activations the backward consumes are
+        # corrupted (loss stays exact) — the documented scratch-lifetime footgun.
+        if bi == num_single - 1 and getenv("KLEIN_DY_DUMP") != String(""):
+            var rc = single_block_lora_recompute_saved_device_resident_scratch[H, Dh, S](
+                block_saved.x, sbw[bi], single_mod_dev, sl,
+                cos_t, sin_t, D, F, eps, norm_ones[], norm_zeros[], ctx, scratch,
+            )
+            var sn = List[String]()
+            var st = List[ArcPointer[Tensor]]()
+            sn.append("saved_q_pre");  st.append(ArcPointer(block_saved.q_pre[].clone(ctx)))
+            sn.append("recomp_q_pre"); st.append(ArcPointer(rc.q_pre[].clone(ctx)))
+            sn.append("saved_v");      st.append(ArcPointer(block_saved.v[].clone(ctx)))
+            sn.append("recomp_v");     st.append(ArcPointer(rc.v[].clone(ctx)))
+            sn.append("saved_q_rope"); st.append(ArcPointer(block_saved.q_rope[].clone(ctx)))
+            sn.append("recomp_q_rope");st.append(ArcPointer(rc.q_rope[].clone(ctx)))
+            sn.append("saved_norm");   st.append(ArcPointer(block_saved.norm[].clone(ctx)))
+            sn.append("recomp_norm");  st.append(ArcPointer(rc.norm[].clone(ctx)))
+            sn.append("saved_out_in"); st.append(ArcPointer(block_saved.out_in[].clone(ctx)))
+            sn.append("recomp_out_in");st.append(ArcPointer(rc.out_in[].clone(ctx)))
+            save_safetensors(sn, st, getenv("KLEIN_DY_DUMP") + String(".sblk"), ctx)
+            print("[klein-dy-dump] wrote saved-vs-recompute single-block activations (block", bi, ")")
+        var _sdpa_dump = String("")
+        var _probe_blk = 0
+        if getenv("KLEIN_INJECT_BLK") != String(""):
+            _probe_blk = atol(getenv("KLEIN_INJECT_BLK"))
+        if bi == _probe_blk and getenv("KLEIN_DY_DUMP") != String(""):
+            _sdpa_dump = getenv("KLEIN_DY_DUMP") + String(".sdpa")
+        # DELTA-BISECTION inject: replace this block's INPUT grad with OT's correct
+        # grad-at-block-output (matched input), so dx_{bi} measures THIS block's
+        # backward in isolation vs OT sdx_{bi}. Isolates the per-block deterministic
+        # delta. Env KLEIN_INJECT_BLK=<idx>, KLEIN_INJECT=<path to {"inj":[S,D]}>.
+        if getenv("KLEIN_INJECT_BLK") != String("") and bi == atol(getenv("KLEIN_INJECT_BLK")):
+            var inj_st = ShardedSafeTensors.open(getenv("KLEIN_INJECT"))
+            var inj_dev = Tensor.from_view(inj_st.tensor_view(String("inj")), ctx)
+            d_x = TArc(cast_tensor(inj_dev, d_x[].dtype(), ctx))
+            print("[klein-inject] block", bi, "d_x <- OT grad-at-block-output")
+        var _f32_bwd = getenv("KLEIN_F32_BWD") != String("")
+        var bg: SingleBlockLoraDeviceGrads
+        if _f32_bwd:
+            # F32-FIX EXPERIMENT: run this block's backward fully in F32 (no LoRA;
+            # B=0 so LoRA adds nothing to d_x). d_x carrier stays F32 across blocks.
+            var w32 = _sbw_f32(sbw[bi], ctx)
+            var s32 = _sbsaved_f32(block_saved, ctx)
+            var m32 = _smv_f32(single_mod_dev, ctx)
+            var dx32 = _grad_arc_f32(d_x, ctx)
+            var no_lora = SingleBlockLoraDevice(None, None)
+            bg = single_block_lora_backward_device_resident_scratch[H, Dh, S](
+                dx32, w32, m32, no_lora, s32, cos_t, sin_t,
+                D, F, eps, norm_ones_f32[], ctx, scratch, False,
+                dump_path=_sdpa_dump,
+            )
+        else:
+            bg = single_block_lora_backward_device_resident_scratch[H, Dh, S](
+                d_x, sbw[bi], single_mod_dev, sl, block_saved, cos_t, sin_t,
+                D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
+                dump_path=_sdpa_dump,
+            )
         d_x = bg.d_x.copy()
-        if compute_aux_grads:
+        if _dx_dump != String(""):
+            _dxn.append(String("dx_") + String(bi))
+            _dxt.append(ArcPointer(d_x[].clone(ctx)))
+            # FORWARD-DIVERGENCE: also dump each block's FORWARD INPUT (block_saved.x)
+            # vs OT sfx_{bi} -> finds where forward text activations first diverge.
+            _dxn.append(String("xfwd_") + String(bi))
+            _dxt.append(ArcPointer(block_saved.x[].clone(ctx)))
+        if compute_aux_grads and not _f32_bwd:
             d_single_mod = _add_lists(
                 d_single_mod,
                 _concat3(bg.d_shift, bg.d_scale, bg.d_gate),
@@ -1041,8 +1169,26 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
         sgl_d_b[sbase + 1] = bg.out_d_b.copy()
         bi -= 1
 
+    if _dx_dump != String(""):
+        save_safetensors(_dxn, _dxt, _dx_dump + String(".dxall"), ctx)
+        print("[klein-dy-dump] wrote per-block running d_x (", len(_dxn), "blocks)")
+
     var d_txt_out = TArc(slice(d_x[], 0, 0, N_TXT, ctx))
     var d_img_out2 = TArc(slice(d_x[], 0, N_TXT, N_IMG, ctx))
+
+    # LOCALIZATION: dump the single<->double boundary grad (joint stream grad AFTER
+    # all single-block backward, BEFORE any double-block backward). vs OT grad at
+    # single_transformer_blocks[0] input: match => error is in DOUBLE blocks; differ
+    # => error is in head/output or SINGLE blocks.
+    if getenv("KLEIN_DY_DUMP") != String(""):
+        var bn = List[String]()
+        bn.append("d_img_bnd")
+        bn.append("d_txt_bnd")
+        var bt = List[ArcPointer[Tensor]]()
+        bt.append(ArcPointer(d_img_out2[].clone(ctx)))
+        bt.append(ArcPointer(d_txt_out[].clone(ctx)))
+        save_safetensors(bn, bt, getenv("KLEIN_DY_DUMP") + String(".bnd"), ctx)
+        print("[klein-dy-dump] wrote single<->double boundary d_img_bnd/d_txt_bnd")
 
     var dbl_d_a = List[List[Float32]]()
     var dbl_d_b = List[List[Float32]]()
@@ -1062,9 +1208,27 @@ def klein_stack_lora_backward_resident_moddev_rope_scratch[
             dbw[di], img_mod_dev, txt_mod_dev, bl, cos_t, sin_t, D, F, eps,
             norm_ones[], norm_zeros[], ctx, scratch,
         )
+        # DECISIVE-TEST (Klein d_B bug): dump block-0 image-stream per-projection
+        # d_y so it can be diffed vs OneTrainer's to_q/k/v module-output grads.
+        # Inert unless KLEIN_DY_DUMP is set in the env.
+        var _dy_dump = String("")
+        if di == 0 and getenv("KLEIN_DY_DUMP") != String(""):
+            _dy_dump = getenv("KLEIN_DY_DUMP")
+            # LOCALIZATION: dump d_io/d_to ENTERING block-0 backward (== grad at
+            # block-0 OUTPUT). If already wrong vs OT, error is UPSTREAM (singles /
+            # doubles 1..N); if correct, error is born inside block-0 backward.
+            var dion = List[String]()
+            dion.append("d_io")
+            dion.append("d_to")
+            var diot = List[ArcPointer[Tensor]]()
+            diot.append(ArcPointer(d_io[].clone(ctx)))
+            diot.append(ArcPointer(d_to[].clone(ctx)))
+            save_safetensors(dion, diot, _dy_dump + String(".dio"), ctx)
+            print("[klein-dy-dump] wrote d_io/d_to -> ", _dy_dump, ".dio")
         var bg = double_block_lora_backward_device_resident_scratch[H, Dh, N_IMG, N_TXT, S](
             d_io, d_to, dbw[di], img_mod_dev, txt_mod_dev, bl, fwd.saved,
             cos_t, sin_t, D, F, eps, norm_ones[], ctx, scratch, compute_aux_grads,
+            dump_path=_dy_dump,
         )
         d_io = bg.img.d_x.copy()
         d_to = bg.txt.d_x.copy()

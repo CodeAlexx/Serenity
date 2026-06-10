@@ -256,7 +256,8 @@ struct Flux2LoRASpec[HL: Int, WL: Int, NTXT: Int](Movable):
         var a = _mul_scalar(scaled_latent, Float32(1.0) - sigma, ctx)
         var b = _mul_scalar(noise, sigma, ctx)
         var scaled_noisy = _add(a, b, ctx)
-        var target = _sub(noise, scaled_latent, ctx)   # flow target (loss_type 'target')
+        var target_patch = _sub(noise, scaled_latent, ctx)   # flow target (loss_type 'target')
+        var target = _unpatchify_packed(target_patch, ctx)
 
         # 6) LoRA-overlaid Klein forward → predicted flow (the borrowed forward).
         #    transformer t-input = timestep/1000 (BaseFlux2Setup.py:144), but the
