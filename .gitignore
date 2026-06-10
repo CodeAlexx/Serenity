@@ -8,3 +8,7 @@ __pycache__/
 *.pid
 *.log
 *.safetensors.*
+# internal pickup docs stay local (deleted from public repo upstream)
+/HANDOFF.md
+/TENETS.md
+/TRACEABILITY.md
