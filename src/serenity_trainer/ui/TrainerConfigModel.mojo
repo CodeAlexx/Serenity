@@ -15,7 +15,7 @@ comptime UI_SECTION_LOGS: Int32 = 10
 comptime UI_SECTION_CAPTIONER: Int32 = 11
 comptime SERENITY_TRAINER_OUTPUT_DIR = "/home/alex/mojodiffusion/output"
 comptime SERENITY_BOXJANA_DATASET_DIR = "/home/alex/1/datasets/boxjana"
-comptime SERENITY_BOXJANA_KLEIN_CACHE = "/home/alex/1/datasets/boxjana/_klein_cache/boxjana_klein512.safetensors"
+comptime SERENITY_BOXJANA_KLEIN_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/alina_klein9b"  # was boxjana single-file (MISSING, 06-11 audit); alina = the engine-verified cache
 comptime SERENITY_KLEIN9B_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
 comptime SERENITY_IDEOGRAM4_BASE = "/home/alex/.serenity/models/ideogram-4-fp8"
 comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/trainings/ideogram4_giger_cache/cache.safetensors"
@@ -44,7 +44,7 @@ comptime SERENITY_ZIMAGE_CACHE = "/home/alex/mojodiffusion/output/alina_zimage_c
 comptime SERENITY_L2P_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors"
 # No prepared L2P pixel cache exists yet (2026-06-09); trainer preflight fails
 # loud until one is built at this path.
-comptime SERENITY_L2P_CACHE = "/home/alex/mojodiffusion/output/alina_l2p_cache"
+comptime SERENITY_L2P_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/boxjana_l2p_512"  # was alina_l2p_cache (MISSING, 06-11 audit)
 comptime SERENITY_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json"
 comptime SERENITY_ZIMAGE_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/zimage_alina_samples.json"
 comptime SERENITY_ANIMA_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/anima_alina_samples.json"
