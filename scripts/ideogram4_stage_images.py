@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+# ideogram4_stage_images.py — stage A of the Ideogram-4 cache prepare.
+# (Stage B = smoke/ideogram4_prepare_cache.mojo: VAE + Qwen3-VL encoders.)
+#
+# No JPEG decoder exists in the Mojo stack yet (the same gap that
+# cache-blocks zimage/l2p prepare), so this one-shot stager does the
+# image decode + caption templating in Python and hands Mojo a single
+# safetensors of f32 image tensors + a rendered-prompts JSON.
+#
+# Per sample (dataset: <dir>/N.jpg + N.txt):
+#   image: center-crop to square, resize SIZExSIZE, RGB f32 [-1,1], CHW
+#          -> image.<i> [1,3,SIZE,SIZE] f32
+#   caption: .txt wrapped in the minimal Ideogram-4 structured-JSON schema
+#          (high_level_description first — key order is load-bearing), then
+#          the Qwen3-VL chat template the trainer's tokenizer probe uses.
+#          -> prompts.json {"<i>": rendered_string, ...}
+#
+# Run:
+#   /home/alex/EriDiffusion/.venv_cache/bin/python \
+#     scripts/ideogram4_stage_images.py /home/alex/datasets/gigerver3 \
+#     /home/alex/trainings/ideogram4_giger_stage 512
+
+import json
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+from safetensors.numpy import save_file
+
+def main():
+    src = Path(sys.argv[1])
+    out = Path(sys.argv[2])
+    size = int(sys.argv[3]) if len(sys.argv) > 3 else 512
+    out.mkdir(parents=True, exist_ok=True)
+
+    jpgs = sorted(src.glob("*.jpg"), key=lambda p: int(p.stem) if p.stem.isdigit() else 1 << 30)
+    tensors, prompts = {}, {}
+    kept = 0
+    for p in jpgs:
+        cap_path = p.with_suffix(".txt")
+        if not cap_path.exists():
+            print(f"skip {p.name}: no caption")
+            continue
+        img = Image.open(p).convert("RGB")
+        w, h = img.size
+        s = min(w, h)
+        img = img.crop(((w - s) // 2, (h - s) // 2, (w + s) // 2, (h + s) // 2))
+        img = img.resize((size, size), Image.LANCZOS)
+        arr = np.asarray(img, dtype=np.float32) / 127.5 - 1.0   # [H,W,3] in [-1,1]
+        arr = arr.transpose(2, 0, 1)[None]                       # [1,3,H,W]
+        tensors[f"image.{kept}"] = arr
+
+        caption = cap_path.read_text().strip()
+        # Minimal structured caption (schema: high_level_description first).
+        cap_json = json.dumps({"high_level_description": caption}, ensure_ascii=False)
+        rendered = f"<|im_start|>user\n{cap_json}<|im_end|>\n<|im_start|>assistant\n"
+        prompts[str(kept)] = rendered
+        kept += 1
+
+    save_file(tensors, str(out / "images.safetensors"))
+    (out / "prompts.json").write_text(json.dumps(prompts, ensure_ascii=False, indent=0))
+    for k, v in prompts.items():
+        (out / f"prompt.{k}.txt").write_text(v)
+    print(f"staged {kept} samples -> {out} (size {size})")
+
+if __name__ == "__main__":
+    main()

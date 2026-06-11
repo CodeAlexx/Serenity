@@ -14,6 +14,7 @@ from std.os import makedirs
 from std.time import perf_counter
 
 from serenitymojo.tensor import Tensor
+from serenitymojo.training.schedule import sample_timestep_logit_normal_scaled
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.sharded import ShardedSafeTensors
@@ -154,8 +155,18 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
     for local_step in range(run_cfg.steps):
         var sample_index = progress.global_step % cache.len()
         var seed = run_cfg.noise_seed + UInt64(opt_step + local_step)
+        # Per-step flow time ~ logit-normal(0, 1.5) — the DiffSynth-Studio
+        # Ideogram-4 512px training distribution (flow_match.py
+        # set_timesteps_ideogram4). The old fixed default_t_flow=0.7 trained
+        # EVERY step at one timestep (measured: loss collapsed to 1.3e-4
+        # with grad_norm 0.0000 on the fixture cache — learned nothing).
+        # Separate RNG stream from the noise draw (the zimage *7919 idiom).
+        var t_step = sample_timestep_logit_normal_scaled(
+            run_cfg.noise_seed * UInt64(7919) + UInt64(opt_step + local_step),
+            Float32(1.5),
+        )
         var sample = cache.sample[NT, GH, GW](
-            sample_index, run_cfg.default_t_flow, seed, ctx
+            sample_index, t_step, seed, ctx
         )
 
         var result: Ideogram4LoRATrainResult = ideogram4_lora_train_step_resident[NT, GH, GW](

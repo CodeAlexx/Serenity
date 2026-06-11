@@ -18,7 +18,7 @@ comptime SERENITY_BOXJANA_DATASET_DIR = "/home/alex/1/datasets/boxjana"
 comptime SERENITY_BOXJANA_KLEIN_CACHE = "/home/alex/1/datasets/boxjana/_klein_cache/boxjana_klein512.safetensors"
 comptime SERENITY_KLEIN9B_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
 comptime SERENITY_IDEOGRAM4_BASE = "/home/alex/.serenity/models/ideogram-4-fp8"
-comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/ideogram4_fx_predict.safetensors"
+comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/trainings/ideogram4_giger_cache/cache.safetensors"
 
 # Campaign-verified trainable verticals (serenitymojo train_<m>_real.mojo runners).
 # Checkpoints / caches mirror /home/alex/mojodiffusion/serenitymojo/configs/<m>.json

@@ -26,13 +26,13 @@ from serenity_trainer.util.config.TrainConfig import TrainConfig
 
 
 comptime DEFAULT_TRANSFORMER = "/home/alex/.serenity/models/ideogram-4-fp8/transformer/diffusion_pytorch_model.safetensors"
-comptime DEFAULT_CACHE = "/home/alex/mojodiffusion/serenitymojo/models/dit/parity/ideogram4_fx_predict.safetensors"
+comptime DEFAULT_CACHE = "/home/alex/trainings/ideogram4_giger_cache/cache.safetensors"
 comptime DEFAULT_OUTPUT = "/home/alex/mojodiffusion/output"
 comptime DEFAULT_PROGRESS = "target/serenity_trainer_progress.log"
 
-comptime NT = 651
-comptime GH = 16
-comptime GW = 16
+comptime NT = 256   # giger 512px cache bucket (prepare pads ids to 256)
+comptime GH = 32    # 512px -> packed 32x32
+comptime GW = 32
 
 
 def _clear_progress(path: String) raises:
