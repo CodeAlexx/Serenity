@@ -10,6 +10,8 @@ from serenity_trainer.ui.TrainerConfigModel import (
     SERENITY_TRAINER_OUTPUT_DIR,
     TrainerUIConfig,
     trainer_ui_config_json_snapshot,
+    trainer_ui_ideogram4_levers_path_or_skip,
+    trainer_ui_ideogram4_levers_set,
     trainer_ui_runner_train_config_json,
     trainer_ui_total_steps,
     trainer_ui_validate,
@@ -190,11 +192,23 @@ def _is_config_runner_target(target: String) -> Bool:
     )
 
 
+def _is_hidream_target(target: String) -> Bool:
+    # HiDream-O1: serenitymojo train_hidream_o1_real built into
+    # target/serenity_hidream_live_trainer. Positional argv (NOT the
+    # `<config.json> <steps>` config-runner shape):
+    #   <stage_dir> <steps> [lr] [rank] [out_dir] [ema_decay] [config.json]
+    # Progress streams on stdout (tee'd into the progress file like the
+    # config runners).
+    return target == String("hidream")
+
+
 def _backend_label(target: String) -> String:
     if target == String("klein"):
         return String("Klein 9B")
     if target == String("ideogram4"):
         return String("Ideogram4")
+    if _is_hidream_target(target):
+        return String("HiDream O1")
     if target == String("chroma"):
         return String("Chroma1 HD")
     if target == String("ernie"):
@@ -213,7 +227,7 @@ def _backend_label(target: String) -> String:
 def _runner_path(target: String) -> String:
     if target == String("klein"):
         return String(KLEIN_LIVE_RUNNER)
-    if _is_config_runner_target(target):
+    if _is_config_runner_target(target) or _is_hidream_target(target):
         return String("target/serenity_") + target.copy() + String("_live_trainer")
     return String(IDEOGRAM4_LIVE_RUNNER)
 
@@ -221,7 +235,7 @@ def _runner_path(target: String) -> String:
 def _pid_path(target: String) -> String:
     if target == String("klein"):
         return String(KLEIN_LIVE_PID)
-    if _is_config_runner_target(target):
+    if _is_config_runner_target(target) or _is_hidream_target(target):
         return String("target/serenity_") + target.copy() + String("_live_trainer.pid")
     return String(IDEOGRAM4_LIVE_PID)
 
@@ -229,7 +243,7 @@ def _pid_path(target: String) -> String:
 def _log_path(target: String) -> String:
     if target == String("klein"):
         return String(KLEIN_LIVE_LOG)
-    if _is_config_runner_target(target):
+    if _is_config_runner_target(target) or _is_hidream_target(target):
         # Config-driven runners stream progress on stdout only; tee their
         # stdout straight into the polled progress file so the legacy
         # progress-line bridge picks it up live.
@@ -264,6 +278,25 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
             _shell_quote(_runner_train_config_path(target.copy()))
             + String(" ")
             + String(steps)
+        )
+    elif _is_hidream_target(target):
+        # train_hidream_o1_real positional argv (header precedence rules):
+        # argv wins for steps/lr/rank/out_dir; ema_decay "-" so the config
+        # owns EMA (full SimpleTuner schedule when enabled); trailing
+        # [config.json] delivers the T1 levers + T2.B quantized_resident.
+        # stage_dir := cfg.cache_dir (stage-A images + raw captions).
+        args = (
+            _shell_quote(cfg.cache_dir.copy())
+            + String(" ")
+            + String(steps)
+            + String(" ")
+            + String(cfg.learning_rate)
+            + String(" ")
+            + String(rank)
+            + String(" ")
+            + _shell_quote(String(SERENITY_TRAINER_OUTPUT_DIR) + String("/hidream_o1_lora"))
+            + String(" - ")
+            + _shell_quote(_runner_train_config_path(target.copy()))
         )
     elif target == String("klein"):
         args = (
@@ -308,8 +341,25 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
             + String(cfg.learning_rate)
             + String(" ")
             + String(save_every)
+            # T1 lever delivery (Ideogram4LiveTrainer argv contract):
+            # argv 10 = caption_dropout_prob (0.0 default = never drop);
+            # argv 11 = levers config JSON path, or "-" when every lever is
+            # default-off so default runs stay byte-identical (C13).
+            + String(" ")
+            + String(cfg.caption_dropout)
+            + String(" ")
+            + _shell_quote(
+                trainer_ui_ideogram4_levers_path_or_skip(
+                    cfg, _runner_train_config_path(target.copy())
+                )
+            )
         )
     var mkdirs = String("")
+    if _is_hidream_target(target.copy()):
+        # train_hidream_o1_real saves into out_dir without creating it.
+        mkdirs = String(
+            "mkdir -p /home/alex/mojodiffusion/output/hidream_o1_lora && "
+        )
     if _is_config_runner_target(target.copy()):
         # The config-driven runners save to fixed per-model output dirs and do
         # not create them (Chroma raised "failed to open for write" on a
@@ -343,7 +393,7 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
 
 
 def _any_live_runner_active() -> Bool:
-    var rc = _sys_system(String("pgrep -f '^(/home/alex/serenity-trainer/)?target/[s]erenity_(ideogram4|klein|chroma|ernie|anima|sdxl)_live_trainer( |$)' > /dev/null 2>&1"))
+    var rc = _sys_system(String("pgrep -f '^(/home/alex/serenity-trainer/)?target/[s]erenity_(ideogram4|klein|chroma|ernie|anima|sdxl|zimage|l2p|hidream)_live_trainer( |$)' > /dev/null 2>&1"))
     return rc == 0
 
 
@@ -397,6 +447,7 @@ def trainer_ui_launch_live_runner(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime
         cfg.backend_target != String("ideogram4")
         and cfg.backend_target != String("klein")
         and not _is_config_runner_target(cfg.backend_target.copy())
+        and not _is_hidream_target(cfg.backend_target.copy())
     ):
         _append_runtime_log(
             rt,
@@ -417,7 +468,17 @@ def trainer_ui_launch_live_runner(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime
         _append_runtime_log(rt, String("live trainer launch skipped: another Serenity runner is active"))
         rt.status_text = String("Another trainer is running")
         return False
-    if _is_config_runner_target(rt.backend_target.copy()):
+    var needs_runner_config = (
+        _is_config_runner_target(rt.backend_target.copy())
+        or _is_hidream_target(rt.backend_target.copy())
+        # ideogram4: write the levers JSON ONLY when a lever is set — the
+        # no-levers launch passes "-" (argv 11 skip sentinel, C13).
+        or (
+            rt.backend_target == String("ideogram4")
+            and trainer_ui_ideogram4_levers_set(cfg)
+        )
+    )
+    if needs_runner_config:
         try:
             var cfg_path = _write_runner_train_config(cfg)
             _append_runtime_log(rt, String("wrote runner train config: ") + cfg_path.copy())

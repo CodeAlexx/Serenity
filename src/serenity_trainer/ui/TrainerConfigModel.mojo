@@ -19,6 +19,13 @@ comptime SERENITY_BOXJANA_KLEIN_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2
 comptime SERENITY_KLEIN9B_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
 comptime SERENITY_IDEOGRAM4_BASE = "/home/alex/.serenity/models/ideogram-4-fp8"
 comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/trainings/ideogram4_giger_cache/cache.safetensors"
+# HiDream-O1 — serenitymojo train_hidream_o1_real (P4 of
+# HIDREAM_O1_TRAINING_CAMPAIGN.md). Weights dir is COMPTIME in the trainer
+# (MODEL_DIR) — base_model_name is carried for display/config only. The data
+# path is a stage-A dir (images.safetensors + caption.<i>.txt from
+# scripts/ideogram4_stage_images.py); giger stage = the campaign-verified one.
+comptime SERENITY_HIDREAM_CHECKPOINT = "/home/alex/HiDream-O1-Image-Dev-weights"
+comptime SERENITY_HIDREAM_STAGE = "/home/alex/trainings/ideogram4_giger_stage"
 
 # Campaign-verified trainable verticals (serenitymojo train_<m>_real.mojo runners).
 # Checkpoints / caches mirror /home/alex/mojodiffusion/serenitymojo/configs/<m>.json
@@ -252,6 +259,10 @@ struct TrainerUIConfig(Movable):
     var loss_fn: String
     var smooth_l1_beta: Float32
     var min_snr_gamma_flow: Float32
+    # T2.B quantized-resident base weights (hidream emission carries it).
+    # "OFF" | "fp8_e4m3". Fixed "OFF" default — TODO: dropdown widget; the
+    # seam (runner JSON emission) already delivers it end-to-end.
+    var quantized_resident: String
     var loss_scaler: String
     var offset_noise_weight: Float32
     var perturbation_noise_weight: Float32
@@ -333,6 +344,8 @@ struct TrainerUIConfig(Movable):
         self.model_type_options.append(String("Z_IMAGE_L2P"))
         self.model_type_options.append(String("LTX_2_VIDEO"))
         self.model_type_options.append(String("WAN_22_VIDEO"))
+        # HiDream-O1 appended LAST so existing option indices stay stable.
+        self.model_type_options.append(String("HIDREAM_O1"))
         self.model_type_index = 1
         self.model_type_open = False
 
@@ -348,6 +361,8 @@ struct TrainerUIConfig(Movable):
         self.architecture_options.append(String("Z-Image L2P"))
         self.architecture_options.append(String("LTX-2 AV"))
         self.architecture_options.append(String("Wan2.2 T2V 14B"))
+        # HiDream-O1 appended LAST so existing option indices stay stable.
+        self.architecture_options.append(String("HiDream O1"))
         self.architecture_index = 1
         self.architecture_open = False
 
@@ -579,6 +594,7 @@ struct TrainerUIConfig(Movable):
         self.loss_fn = String("mse")        # T1.A default-off
         self.smooth_l1_beta = 1.0
         self.min_snr_gamma_flow = 0.0       # 0.0 = off
+        self.quantized_resident = String("OFF")  # T2.B default-off (C13)
         self.loss_scaler = String("NONE")
         self.offset_noise_weight = 0.0
         self.perturbation_noise_weight = 0.0
@@ -734,6 +750,8 @@ def _arch_index_for_model_type(model_type_index: Int32) -> Int32:
         return 9
     if model_type_index == 10:  # WAN_22_VIDEO
         return 10
+    if model_type_index == 11:  # HIDREAM_O1
+        return 11
     return -1  # STABLE_DIFFUSION_35: no trainable runner yet
 
 
@@ -759,6 +777,8 @@ def _model_type_for_arch_index(architecture_index: Int32) -> Int32:
         return 9
     if architecture_index == 10:  # Wan2.2 T2V 14B
         return 10
+    if architecture_index == 11:  # HiDream O1
+        return 11
     return -1
 
 
@@ -914,6 +934,23 @@ def trainer_ui_apply_model_preset(mut cfg: TrainerUIConfig, prefer_model_type: B
         cfg.base_model_name = String("/home/alex/.serenity/models/checkpoints/wan2.2_t2v_low_noise_14b_fp16.safetensors")
         cfg.model_arch = String("wan22_t2v_14b")
         cfg.frames = String("1")
+    elif arch == 11:
+        # HiDream-O1 — serenitymojo train_hidream_o1_real (campaign-verified
+        # ~1.0 s/step; flags-off 3-step anchor 0.05885428/0.33308488/
+        # 0.5214583). Weights dir is comptime in the trainer; cache_dir is
+        # the stage-A dir (argv 1). Recipe: lr 1e-4, rank 32, alpha=rank.
+        cfg.backend_target = String("hidream")
+        cfg.model_type_index = 11
+        cfg.architecture_index = 11
+        cfg.base_model_name = String(SERENITY_HIDREAM_CHECKPOINT)
+        cfg.cache_dir = String(SERENITY_HIDREAM_STAGE)
+        cfg.model_arch = String("hidream_o1")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.sampler_preset = String("HIDREAM_20")
+        cfg.learning_rate = 0.0001
+        cfg.lora_rank = 32.0
+        cfg.lora_alpha = 32.0
+        cfg.timestep_shift = 3.0
 
 
 def trainer_ui_total_steps(cfg: TrainerUIConfig) -> Int32:
@@ -1095,7 +1132,77 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + _runner_recipe_json(cfg)
             + String("}\n")
         )
+    if t == String("hidream"):
+        # HiDream-O1 — train_hidream_o1_real trailing argv [config.json]
+        # (template: serenitymojo/configs/hidream_o1.json). No arch dims
+        # required (reader keeps TrainConfig defaults for missing keys).
+        # The trainer's argv keeps winning for steps/lr/rank/out_dir when
+        # given; this JSON delivers the T1 levers + T2.B quantized_resident
+        # + lora_rank/max_steps backstops. NOTE lora_alpha is carried but
+        # the trainer is compiled alpha=rank (scale 1.0).
+        return (
+            String("{\n  \"model_type\": \"hidream_o1\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
+            + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
+            + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
+            # T2.B quantized-resident base ("OFF" | "fp8_e4m3"; default OFF).
+            + String("  \"quantized_resident\": \"") + cfg.quantized_resident.copy() + String("\",\n")
+            + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
+            + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("ideogram4"):
+        # Ideogram4 — argv 11 levers JSON for serenity_ideogram4_live_trainer
+        # (Ideogram4LiveTrainer.mojo header). The trainer syncs the shared
+        # recipe scalars (lr/rank/alpha/steps/save) from argv 1-9 — this JSON
+        # contributes ONLY the lever keys (loss_fn/min_snr_gamma_flow/ema_*/
+        # optimizer*/caption_dropout_prob).
+        return (
+            String("{\n  \"model_type\": \"ideogram4\",\n")
+            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
+            + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
+            + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
+            + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
+            + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
     raise Error(String("no runner train config template for backend ") + t)
+
+
+def trainer_ui_ideogram4_levers_set(cfg: TrainerUIConfig) -> Bool:
+    """True when any T1 lever the ideogram4 levers JSON carries is non-default.
+
+    Drives the argv 11 fail-safe (Ideogram4LiveTrainer contract): with every
+    lever default-off the bridge passes "-" (the trainer's skip sentinel) so
+    default runs stay byte-identical to the pre-bridge launches (C13).
+    caption_dropout is NOT included — it travels on argv 10 regardless.
+    """
+    if cfg.loss_fn != String("mse"):
+        return True
+    if cfg.min_snr_gamma_flow != 0.0:
+        return True
+    if cfg.ema_mode != String("OFF"):
+        return True
+    if cfg.optimizer_runner_value() != String("ADAMW"):
+        return True
+    if Int(cfg.learning_rate_warmup_steps) > 0:
+        return True
+    return False
+
+
+def trainer_ui_ideogram4_levers_path_or_skip(
+    cfg: TrainerUIConfig, levers_json_path: String
+) -> String:
+    """argv 11 for serenity_ideogram4_live_trainer: the levers config JSON
+    path when any lever is set, else "-" (trainer skip sentinel, C13)."""
+    if trainer_ui_ideogram4_levers_set(cfg):
+        return levers_json_path.copy()
+    return String("-")
 
 
 def trainer_ui_config_json_snapshot(cfg: TrainerUIConfig) -> String:
@@ -1189,6 +1296,7 @@ def trainer_ui_config_json_snapshot(cfg: TrainerUIConfig) -> String:
         + String("\"huber_delta\":") + String(cfg.huber_delta) + String(",")
         + String("\"vb_loss_strength\":") + String(cfg.vb_loss_strength) + String(",")
         + String("\"loss_weight_fn\":\"") + cfg.loss_weight_fn.copy() + String("\",")
+        + String("\"quantized_resident\":\"") + cfg.quantized_resident.copy() + String("\",")
         + String("\"loss_scaler\":\"") + cfg.loss_scaler.copy() + String("\",")
         + String("\"offset_noise_weight\":") + String(cfg.offset_noise_weight) + String(",")
         + String("\"perturbation_noise_weight\":") + String(cfg.perturbation_noise_weight) + String(",")

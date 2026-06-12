@@ -24,6 +24,9 @@ anima-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiff
 sdxl-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_sdxl_real.mojo -o target/serenity_sdxl_live_trainer"
 zimage-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_zimage_real.mojo -o target/serenity_zimage_live_trainer"
 l2p-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_l2p_real.mojo -o target/serenity_l2p_live_trainer"
+# HiDream-O1: positional argv (<stage_dir> <steps> [lr] [rank] [out_dir]
+# [ema_decay] [config.json]), NOT the <config.json> <steps> shape above.
+hidream-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -lsqlite3 /home/alex/mojodiffusion/serenitymojo/training/train_hidream_o1_real.mojo -o target/serenity_hidream_live_trainer"
 trainer-ui-build = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm src/serenity_trainer/ui/TrainUI.mojo -o target/serenity_trainer_ui", depends-on = ["build-mojoui", "ideogram4-live-trainer-build", "klein-live-trainer-build"] }
 trainer-ui = { cmd = "LD_LIBRARY_PATH=/home/alex/MojoUI target/serenity_trainer_ui", depends-on = ["trainer-ui-build"] }
 trainer-ui-runtime-test = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm tests/ui/test_trainer_runtime_bridge.mojo -o /tmp/serenity_trainer_runtime_test && LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_trainer_runtime_test", depends-on = ["build-mojoui"] }

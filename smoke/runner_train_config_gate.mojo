@@ -9,6 +9,8 @@
 from serenity_trainer.ui.TrainerConfigModel import (
     TrainerUIConfig,
     trainer_ui_apply_model_preset,
+    trainer_ui_ideogram4_levers_path_or_skip,
+    trainer_ui_ideogram4_levers_set,
     trainer_ui_runner_train_config_json,
 )
 from serenitymojo.io.train_config_reader import read_model_config
@@ -305,6 +307,184 @@ def _gate_optimizer_runner() raises:
     _check(String("optimizer-came-fails-loud"), raised, String("raised=") + String(raised))
 
 
+def _gate_hidream() raises:
+    # HiDream-O1 P4: the "hidream" emission (train_hidream_o1_real trailing
+    # argv [config.json]) must round-trip read_model_config — default-off
+    # levers + quantized_resident "OFF" (C13), and flipped levers +
+    # "fp8_e4m3" land in TrainConfig. Unsupported quantized_resident tags
+    # FAIL LOUD at config load.
+    var ui = TrainerUIConfig()
+    ui.model_type_index = 11  # HIDREAM_O1 (appended last)
+    trainer_ui_apply_model_preset(ui, True)
+    _check(String("hidream-preset"), ui.backend_target == String("hidream"),
+           String("backend_target=") + ui.backend_target.copy())
+    _check(String("hidream-preset"), Int(ui.lora_rank) == 32,
+           String("lora_rank=") + String(ui.lora_rank))
+
+    var json0 = trainer_ui_runner_train_config_json(ui)
+    var p0 = String("/tmp/serenity_ui_hidream_default_gate.json")
+    var f0 = open(p0.copy(), "w")
+    f0.write(json0)
+    f0.close()
+    var c0 = read_model_config(p0.copy())
+    _check(String("hidream-default"), c0.name == String("hidream_o1"),
+           String("model_type=") + c0.name.copy())
+    _check(String("hidream-default"), c0.checkpoint == ui.base_model_name,
+           String("checkpoint=") + c0.checkpoint.copy())
+    _check(String("hidream-default"), c0.dataset_cache_dir == ui.cache_dir,
+           String("cache_dir=") + c0.dataset_cache_dir.copy())
+    _check(String("hidream-default"), c0.lora_rank == 32,
+           String("lora_rank=") + String(c0.lora_rank))
+    _check(String("hidream-default"), c0.loss_fn == LOSS_FN_MSE,
+           String("loss_fn=") + String(c0.loss_fn))
+    _check(String("hidream-default"),
+           c0.quantized_resident == String("OFF"),
+           String("quantized_resident=") + c0.quantized_resident.copy())
+    _check(String("hidream-default"), c0.optimizer == TRAIN_OPTIMIZER_ADAMW,
+           String("optimizer=") + String(c0.optimizer))
+    _check(String("hidream-default"), not c0.ema_enabled,
+           String("ema_enabled=") + String(c0.ema_enabled))
+
+    # flipped levers + fp8_e4m3 land in TrainConfig
+    ui.loss_fn = String("huber")
+    ui.huber_delta = 0.25
+    ui.min_snr_gamma_flow = 5.0
+    ui.ema_mode = String("EMA")
+    ui.optimizer_index = 3  # ADAFACTOR
+    ui.quantized_resident = String("fp8_e4m3")
+    var json1 = trainer_ui_runner_train_config_json(ui)
+    var p1 = String("/tmp/serenity_ui_hidream_flipped_gate.json")
+    var f1 = open(p1.copy(), "w")
+    f1.write(json1)
+    f1.close()
+    var c1 = read_model_config(p1.copy())
+    _check(String("hidream-flipped"), c1.loss_fn == LOSS_FN_HUBER,
+           String("loss_fn=") + String(c1.loss_fn))
+    _check(String("hidream-flipped"), _close32(c1.huber_delta, Float32(0.25)),
+           String("huber_delta=") + String(c1.huber_delta))
+    _check(String("hidream-flipped"),
+           _close32(c1.min_snr_gamma_flow, Float32(5.0)),
+           String("min_snr_gamma_flow=") + String(c1.min_snr_gamma_flow))
+    _check(String("hidream-flipped"), c1.ema_enabled,
+           String("ema_enabled=") + String(c1.ema_enabled))
+    _check(String("hidream-flipped"),
+           c1.optimizer == TRAIN_OPTIMIZER_ADAFACTOR,
+           String("optimizer=") + String(c1.optimizer))
+    _check(String("hidream-flipped"),
+           c1.quantized_resident == String("fp8_e4m3"),
+           String("quantized_resident=") + c1.quantized_resident.copy())
+
+    # unsupported quantized_resident tag fails loud at config load
+    ui.quantized_resident = String("int4_makebelieve")
+    var json2 = trainer_ui_runner_train_config_json(ui)
+    var p2 = String("/tmp/serenity_ui_hidream_badquant_gate.json")
+    var f2 = open(p2.copy(), "w")
+    f2.write(json2)
+    f2.close()
+    var raised = False
+    try:
+        var _c2 = read_model_config(p2.copy())
+    except _e:
+        raised = True
+    _check(String("hidream-badquant-fails-loud"), raised,
+           String("raised=") + String(raised))
+
+
+def _gate_ideogram4_levers() raises:
+    # Ideogram4 lever delivery (Ideogram4LiveTrainer argv 10/11 contract):
+    # default-off config -> levers_set False and argv 11 == "-" (skip
+    # sentinel, C13 byte-identical default runs); any lever flipped ->
+    # the levers JSON path is delivered and the emission round-trips
+    # read_model_config with the lever values.
+    var ui = TrainerUIConfig()
+    ui.model_type_index = 0  # IDEOGRAM_4
+    trainer_ui_apply_model_preset(ui, True)
+    _check(String("ideogram4-preset"),
+           ui.backend_target == String("ideogram4"),
+           String("backend_target=") + ui.backend_target.copy())
+
+    # the exact path the bridge passes (_runner_train_config_path).
+    var levers_path = String("target/serenity_ideogram4_train_config.json")
+
+    # default-off: no levers JSON, argv 11 = "-", argv 10 carrier = 0.0
+    _check(String("ideogram4-default"),
+           not trainer_ui_ideogram4_levers_set(ui),
+           String("levers_set=") + String(trainer_ui_ideogram4_levers_set(ui)))
+    var skip = trainer_ui_ideogram4_levers_path_or_skip(ui, levers_path.copy())
+    _check(String("ideogram4-default"), skip == String("-"),
+           String("argv11=") + skip.copy())
+    _check(String("ideogram4-default"), String(ui.caption_dropout) == String("0.0"),
+           String("argv10=") + String(ui.caption_dropout))
+    # the default emission still parses to all-default levers (sanity)
+    var json0 = trainer_ui_runner_train_config_json(ui)
+    var p0 = String("/tmp/serenity_ui_ideogram4_levers_default_gate.json")
+    var f0 = open(p0.copy(), "w")
+    f0.write(json0)
+    f0.close()
+    var c0 = read_model_config(p0.copy())
+    _check(String("ideogram4-default"), c0.name == String("ideogram4"),
+           String("model_type=") + c0.name.copy())
+    _check(String("ideogram4-default"), c0.loss_fn == LOSS_FN_MSE,
+           String("loss_fn=") + String(c0.loss_fn))
+    _check(String("ideogram4-default"), not c0.ema_enabled,
+           String("ema_enabled=") + String(c0.ema_enabled))
+    _check(String("ideogram4-default"), c0.optimizer == TRAIN_OPTIMIZER_ADAMW,
+           String("optimizer=") + String(c0.optimizer))
+
+    # huber lever -> JSON delivered + parses
+    ui.loss_fn = String("huber")
+    ui.huber_delta = 0.25
+    _check(String("ideogram4-huber"), trainer_ui_ideogram4_levers_set(ui),
+           String("levers_set=") + String(trainer_ui_ideogram4_levers_set(ui)))
+    var path1 = trainer_ui_ideogram4_levers_path_or_skip(ui, levers_path.copy())
+    _check(String("ideogram4-huber"), path1 == levers_path,
+           String("argv11=") + path1.copy())
+    var json1 = trainer_ui_runner_train_config_json(ui)
+    var p1 = String("/tmp/serenity_ui_ideogram4_levers_huber_gate.json")
+    var f1 = open(p1.copy(), "w")
+    f1.write(json1)
+    f1.close()
+    var c1 = read_model_config(p1.copy())
+    _check(String("ideogram4-huber"), c1.loss_fn == LOSS_FN_HUBER,
+           String("loss_fn=") + String(c1.loss_fn))
+    _check(String("ideogram4-huber"), _close32(c1.huber_delta, Float32(0.25)),
+           String("huber_delta=") + String(c1.huber_delta))
+
+    # each remaining lever flips levers_set on its own
+    var ui_ema = TrainerUIConfig()
+    ui_ema.model_type_index = 0
+    trainer_ui_apply_model_preset(ui_ema, True)
+    ui_ema.ema_mode = String("EMA")
+    _check(String("ideogram4-ema-lever"),
+           trainer_ui_ideogram4_levers_set(ui_ema),
+           String("levers_set=") + String(trainer_ui_ideogram4_levers_set(ui_ema)))
+    var ui_opt = TrainerUIConfig()
+    ui_opt.model_type_index = 0
+    trainer_ui_apply_model_preset(ui_opt, True)
+    ui_opt.optimizer_index = 3  # ADAFACTOR
+    _check(String("ideogram4-opt-lever"),
+           trainer_ui_ideogram4_levers_set(ui_opt),
+           String("levers_set=") + String(trainer_ui_ideogram4_levers_set(ui_opt)))
+    var ui_snr = TrainerUIConfig()
+    ui_snr.model_type_index = 0
+    trainer_ui_apply_model_preset(ui_snr, True)
+    ui_snr.min_snr_gamma_flow = 5.0
+    _check(String("ideogram4-snr-lever"),
+           trainer_ui_ideogram4_levers_set(ui_snr),
+           String("levers_set=") + String(trainer_ui_ideogram4_levers_set(ui_snr)))
+    # caption dropout does NOT force the levers JSON (argv 10 carries it)
+    var ui_drop = TrainerUIConfig()
+    ui_drop.model_type_index = 0
+    trainer_ui_apply_model_preset(ui_drop, True)
+    ui_drop.caption_dropout = 0.25
+    _check(String("ideogram4-dropout-argv10"),
+           not trainer_ui_ideogram4_levers_set(ui_drop),
+           String("levers_set=") + String(trainer_ui_ideogram4_levers_set(ui_drop)))
+    _check(String("ideogram4-dropout-argv10"),
+           String(ui_drop.caption_dropout) == String("0.25"),
+           String("argv10=") + String(ui_drop.caption_dropout))
+
+
 def main() raises:
     print("== runner train config gate ==")
     # model_type option indices: 4=CHROMA_1, 5=ERNIE_IMAGE, 6=ANIMA, 2=SDXL,
@@ -319,4 +499,6 @@ def main() raises:
     _gate_caption_dropout_prob()
     _gate_ema()
     _gate_optimizer_runner()
+    _gate_hidream()
+    _gate_ideogram4_levers()
     print("ALL GATES PASS — UI runner train-config seam OK")

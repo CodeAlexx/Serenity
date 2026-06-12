@@ -2,6 +2,7 @@
 
 from serenity_trainer.ui.TrainerRuntimeBridge import (
     TrainerUIRuntime,
+    _live_runner_command,
     trainer_ui_apply_serenity_callback_line,
     trainer_ui_apply_progress_line,
     trainer_ui_on_optimizer_step,
@@ -17,7 +18,10 @@ from serenity_trainer.ui.TrainerRuntimeBridge import (
     trainer_ui_tick_and_apply,
     trainer_ui_cancel,
 )
-from serenity_trainer.ui.TrainerConfigModel import TrainerUIConfig
+from serenity_trainer.ui.TrainerConfigModel import (
+    TrainerUIConfig,
+    trainer_ui_apply_model_preset,
+)
 
 
 def _expect(cond: Bool, msg: String) raises:
@@ -178,6 +182,64 @@ def test_command_bridge_events() raises:
     _expect(_contains(text, String("\"action\":\"stop\"")), "stop command written")
 
 
+def test_ideogram4_launch_argv_contract() raises:
+    # Ideogram4LiveTrainer argv 10/11 (T1 lever delivery): default-off ->
+    # argv 10 = 0.0 and argv 11 = '-' (skip sentinel, C13); levers set ->
+    # argv 11 = the written levers config JSON path.
+    var cfg = TrainerUIConfig()
+    cfg.model_type_index = 0  # IDEOGRAM_4
+    trainer_ui_apply_model_preset(cfg, True)
+    var rt = TrainerUIRuntime()
+
+    var cmd0 = _live_runner_command(cfg, rt)
+    _expect(
+        _contains(cmd0, String("target/serenity_ideogram4_live_trainer")),
+        "ideogram4 runner path in command",
+    )
+    _expect(
+        _contains(cmd0, String(" 0.0 '-'")),
+        "default-off launch carries argv10=0.0 argv11='-' (got: " + cmd0 + ")",
+    )
+
+    cfg.loss_fn = String("huber")
+    var cmd1 = _live_runner_command(cfg, rt)
+    _expect(
+        _contains(
+            cmd1,
+            String(" 0.0 'target/serenity_ideogram4_train_config.json'"),
+        ),
+        "levers-on launch delivers the levers JSON path (got: " + cmd1 + ")",
+    )
+
+
+def test_hidream_launch_argv_contract() raises:
+    # train_hidream_o1_real positional argv: <stage_dir> <steps> <lr> <rank>
+    # <out_dir> - <config.json> (config delivers levers + quantized_resident).
+    var cfg = TrainerUIConfig()
+    cfg.model_type_index = 11  # HIDREAM_O1
+    trainer_ui_apply_model_preset(cfg, True)
+    var rt = TrainerUIRuntime()
+    var cmd = _live_runner_command(cfg, rt)
+    _expect(
+        _contains(cmd, String("target/serenity_hidream_live_trainer")),
+        "hidream runner path in command",
+    )
+    _expect(
+        _contains(cmd, String("'/home/alex/trainings/ideogram4_giger_stage'")),
+        "hidream stage dir is argv 1 (got: " + cmd + ")",
+    )
+    _expect(
+        _contains(
+            cmd,
+            String(
+                "'/home/alex/mojodiffusion/output/hidream_o1_lora'"
+                " - 'target/serenity_hidream_train_config.json'"
+            ),
+        ),
+        "hidream out_dir, ema '-', config json tail (got: " + cmd + ")",
+    )
+
+
 def test_system_metrics_refresh() raises:
     var rt = TrainerUIRuntime()
     trainer_ui_refresh_system_metrics(rt)
@@ -195,5 +257,7 @@ def main() raises:
     test_direct_serenity_callback_surface()
     test_start_waits_for_real_progress()
     test_command_bridge_events()
+    test_ideogram4_launch_argv_contract()
+    test_hidream_launch_argv_contract()
     test_system_metrics_refresh()
     print("PASS: trainer runtime bridge parser")
