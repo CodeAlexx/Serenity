@@ -15,10 +15,18 @@
 #          the Qwen3-VL chat template the trainer's tokenizer probe uses.
 #          -> prompts.json {"<i>": rendered_string, ...}
 #
+# --uncond (T1.D caption dropout, flag-gated, default-off): ALSO write
+#   uncond.txt = the empty-caption ("") render through the SAME schema +
+#   chat-template pipeline as the real captions (SimpleTuner precedent:
+#   helpers/models/common.py encode_dropout_caption encodes "" through the
+#   normal _encode_prompts path). Stage B (ideogram4_prepare_cache.mojo)
+#   reads it to encode the llm_uncond cache tensor; trainers substitute it
+#   when the seeded dropout schedule fires. Per-sample outputs unchanged.
+#
 # Run:
 #   /home/alex/EriDiffusion/.venv_cache/bin/python \
 #     scripts/ideogram4_stage_images.py /home/alex/datasets/gigerver3 \
-#     /home/alex/trainings/ideogram4_giger_stage 512
+#     /home/alex/trainings/ideogram4_giger_stage 512 [--uncond]
 
 import json
 import sys
@@ -28,10 +36,20 @@ import numpy as np
 from PIL import Image
 from safetensors.numpy import save_file
 
+
+def render_prompt(caption: str) -> str:
+    """Caption -> minimal structured-JSON schema -> Qwen3-VL chat template.
+    The ONE render pipeline for real captions and the --uncond empty render."""
+    cap_json = json.dumps({"high_level_description": caption}, ensure_ascii=False)
+    return f"<|im_start|>user\n{cap_json}<|im_end|>\n<|im_start|>assistant\n"
+
+
 def main():
-    src = Path(sys.argv[1])
-    out = Path(sys.argv[2])
-    size = int(sys.argv[3]) if len(sys.argv) > 3 else 512
+    args = [a for a in sys.argv[1:] if a != "--uncond"]
+    emit_uncond = "--uncond" in sys.argv[1:]
+    src = Path(args[0])
+    out = Path(args[1])
+    size = int(args[2]) if len(args) > 2 else 512
     out.mkdir(parents=True, exist_ok=True)
 
     jpgs = sorted(src.glob("*.jpg"), key=lambda p: int(p.stem) if p.stem.isdigit() else 1 << 30)
@@ -53,9 +71,7 @@ def main():
 
         caption = cap_path.read_text().strip()
         # Minimal structured caption (schema: high_level_description first).
-        cap_json = json.dumps({"high_level_description": caption}, ensure_ascii=False)
-        rendered = f"<|im_start|>user\n{cap_json}<|im_end|>\n<|im_start|>assistant\n"
-        prompts[str(kept)] = rendered
+        prompts[str(kept)] = render_prompt(caption)
         captions[str(kept)] = caption
         kept += 1
 
@@ -65,6 +81,9 @@ def main():
         (out / f"prompt.{k}.txt").write_text(v)
     for k, v in captions.items():
         (out / f"caption.{k}.txt").write_text(v)
+    if emit_uncond:
+        (out / "uncond.txt").write_text(render_prompt(""))
+        print(f"staged uncond.txt (empty-caption render) -> {out}")
     print(f"staged {kept} samples -> {out} (size {size})")
 
 if __name__ == "__main__":

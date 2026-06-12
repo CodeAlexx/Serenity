@@ -34,6 +34,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.registry.checkpoints import path_exists
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenity_trainer.model.Ideogram4VAE import Ideogram4VaeEncoder
 from serenity_trainer.model.Ideogram4TextEncoder import (
@@ -102,6 +103,28 @@ def main() raises:
         names.append(String("llm.") + String(i))
         tensors.append(TArc(llm^))
         print("[prepare] sample", i, "done (ids", len(ids), ")")
+
+    # ── T1.D caption dropout: optional uncond features ──
+    # Stage A `--uncond` writes <stage_dir>/uncond.txt (the empty-caption
+    # render through the SAME schema). Encode it through the SAME tokenize/
+    # pad/encode path as the samples into llm_uncond [1,NT,53248] BF16;
+    # Ideogram4TrainCache.uncond[NT] reads it when caption_dropout fires.
+    var uncond_path = stage_dir + "/uncond.txt"
+    if path_exists(uncond_path):
+        var uprompt = _read_text(uncond_path)
+        var uids = tok.encode(uprompt)
+        if len(uids) > NT:
+            var ucut = List[Int]()
+            for j in range(NT):
+                ucut.append(uids[j])
+            uids = ucut^
+        while len(uids) < NT:
+            uids.append(PAD_ID)
+        var ufeats = ideogram4_encode_text(tenc, uids, ctx)
+        var ullm = cast_tensor(ufeats, STDtype.BF16, ctx)
+        names.append(String("llm_uncond"))
+        tensors.append(TArc(ullm^))
+        print("[prepare] llm_uncond done (ids", len(uids), ")")
 
     save_safetensors(names, tensors, out_path, ctx)
     print("[prepare] WROTE", out_path, "samples=", n)

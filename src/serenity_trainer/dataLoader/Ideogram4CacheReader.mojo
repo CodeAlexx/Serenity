@@ -69,6 +69,10 @@ struct Ideogram4TrainCache(Movable):
     var noise_keys: List[String]
     var noisy_keys: List[String]
     var t_flow_keys: List[String]
+    # T1.D caption dropout: cached empty-caption features llm_uncond
+    # [1,NT,53248] ("" = absent; written by ideogram4_prepare_cache when the
+    # stage dir has uncond.txt from `ideogram4_stage_images.py --uncond`).
+    var llm_uncond_key: String
 
     def __init__(
         out self,
@@ -78,6 +82,7 @@ struct Ideogram4TrainCache(Movable):
         var noise_keys: List[String],
         var noisy_keys: List[String],
         var t_flow_keys: List[String],
+        var llm_uncond_key: String,
     ):
         self.src = src^
         self.clean_keys = clean_keys^
@@ -85,6 +90,7 @@ struct Ideogram4TrainCache(Movable):
         self.noise_keys = noise_keys^
         self.noisy_keys = noisy_keys^
         self.t_flow_keys = t_flow_keys^
+        self.llm_uncond_key = llm_uncond_key^
 
     @staticmethod
     def open(path: String) raises -> Ideogram4TrainCache:
@@ -109,10 +115,32 @@ struct Ideogram4TrainCache(Movable):
             raise Error("Ideogram4TrainCache: partial noisy keys are not supported")
         if len(tflow) != 0 and len(tflow) != len(clean):
             raise Error("Ideogram4TrainCache: partial t_flow keys are not supported")
-        return Ideogram4TrainCache(src^, clean^, llm^, noise^, noisy^, tflow^)
+        var uncond_key = String("")
+        if String("llm_uncond") in src.name_to_shard:
+            uncond_key = String("llm_uncond")
+        return Ideogram4TrainCache(
+            src^, clean^, llm^, noise^, noisy^, tflow^, uncond_key^
+        )
 
     def len(self) -> Int:
         return len(self.clean_keys)
+
+    def uncond[NT: Int](self, ctx: DeviceContext) raises -> Tensor:
+        """T1.D caption dropout: the cached empty-caption (uncond) features
+        [1,NT,53248] BF16. Fail-loud when the cache predates the --uncond
+        stager (default-off trainers never call this)."""
+        if self.llm_uncond_key.byte_length() == 0:
+            raise Error(
+                "Ideogram4TrainCache: caption_dropout enabled but cache has no"
+                " llm_uncond (re-run stager --uncond + prepare)"
+            )
+        var llm = cast_tensor(
+            Tensor.from_view(self.src.tensor_view(self.llm_uncond_key), ctx),
+            STDtype.BF16,
+            ctx,
+        )
+        _validate_llm_shape[NT](llm)
+        return llm^
 
     def sample[NT: Int, GH: Int, GW: Int](
         self,

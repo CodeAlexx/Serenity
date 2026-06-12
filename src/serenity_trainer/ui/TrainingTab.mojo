@@ -144,16 +144,28 @@ def render_training_tab(mut ctx: Context, mut cfg: TrainerUIConfig, content_w: I
     _ = toggle_row(ctx, label_w, val_w, String("Custom Cond"), String("Image"), cfg.custom_conditioning_image)
     end_form_panel(ctx)
 
-    ctx.layout_row(row2(cw, cw), _panel_h(ctx, 10))
+    ctx.layout_row(row2(cw, cw), _panel_h(ctx, 13))
     begin_form_panel(ctx, String("LOSS"), String("Serenity loss mix and scaling"), ctx.theme.padding)
+    # T1.A loss-fn selector (levers_loss_grad trainers, zimage first). SEPARATE
+    # from the mse/mae/huber strength combined-loss rows below — do not conflate.
+    var loss_fn_options = List[String]()
+    loss_fn_options.append(String("mse"))
+    loss_fn_options.append(String("huber"))
+    loss_fn_options.append(String("smooth_l1"))
+    _ = select_string_row(ctx, label_w, val_w, String("Loss Fn"), String("loss_fn"), loss_fn_options, cfg.loss_fn, cfg.select_open_id)
     _ = drag_row(ctx, label_w, compact_w, String("MSE"), String("mse_strength"), cfg.mse_strength, 0.1)
     _ = drag_row(ctx, label_w, compact_w, String("MAE"), String("mae_strength"), cfg.mae_strength, 0.1)
     _ = drag_row(ctx, label_w, compact_w, String("log-cosh"), String("log_cosh_strength"), cfg.log_cosh_strength, 0.1)
     _ = drag_row(ctx, label_w, compact_w, String("Huber"), String("huber_strength"), cfg.huber_strength, 0.1)
     _ = drag_row(ctx, label_w, compact_w, String("Huber Delta"), String("huber_delta"), cfg.huber_delta, 0.1)
+    _ = drag_row(ctx, label_w, compact_w, String("SmoothL1 Beta"), String("smooth_l1_beta"), cfg.smooth_l1_beta, 0.1)
     _ = drag_row(ctx, label_w, compact_w, String("VB"), String("vb_loss_strength"), cfg.vb_loss_strength, 0.1)
     _ = select_string_row(ctx, label_w, val_w, String("Weight Fn"), String("loss_weight_fn"), cfg.loss_weight_options, cfg.loss_weight_fn, cfg.select_open_id)
     _ = drag_row(ctx, label_w, compact_w, String("Gamma"), String("loss_weight_strength"), cfg.loss_weight_strength, 0.1)
+    # Min-SNR gamma (flow): SimpleTuner ε-style min(SNR,γ)/SNR weight, 0 = off.
+    # NOTE divisor: this is /SNR, NOT the klein loss_weight_fn=MIN_SNR_GAMMA
+    # lever above which divides by (SNR+1).
+    _ = drag_row(ctx, label_w, compact_w, String("Min-SNR Flow"), String("min_snr_gamma_flow"), cfg.min_snr_gamma_flow, 0.1)
     _ = select_string_row(ctx, label_w, val_w, String("Loss Scaler"), String("loss_scaler"), cfg.loss_scaler_options, cfg.loss_scaler, cfg.select_open_id)
     field_row(ctx, label_w, val_w, String("Backend"), String("Serenity loss mix"))
     end_form_panel(ctx)

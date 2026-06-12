@@ -357,6 +357,10 @@ struct TrainerUIConfig(Movable):
         self.optimizer_options.append(String("CAME"))
         self.optimizer_options.append(String("ADAFACTOR"))
         self.optimizer_options.append(String("MUON"))
+        # T1.C: serenitymojo schedule-free AdamW (training/adamw_schedulefree
+        # .mojo via the levers optimizer dispatch). Appended LAST so existing
+        # option indices stay stable.
+        self.optimizer_options.append(String("SCHEDULE_FREE_ADAMW"))
         self.optimizer_index = 1
         self.optimizer_open = False
 
@@ -532,7 +536,10 @@ struct TrainerUIConfig(Movable):
         self.clear_cache_before_training = False
         self.resolution = String("512")
         self.caption_extension = String("txt")
-        self.caption_dropout = 0.05
+        # T1.D REQUIRED C13 companion: caption dropout now actually REACHES the
+        # runners via the recipe JSON, so the UI default must be OFF (0.0) to
+        # keep default runs byte-identical to the pre-T1.D baselines.
+        self.caption_dropout = 0.0
 
         self.learning_rate = 0.0004
         self.text_encoder_learning_rate = 0.00001
@@ -667,6 +674,16 @@ struct TrainerUIConfig(Movable):
 
     def optimizer_label(self) -> String:
         return self.optimizer_options[Int(self.optimizer_index)].copy()
+
+    def optimizer_runner_value(self) -> String:
+        """T1.C: the optimizer enum string emitted into the RUNNER train
+        config (serenitymojo io/train_config_reader.mojo _optimizer_int).
+        The dropdown labels ADAMW / ADAFACTOR / SCHEDULE_FREE_ADAMW map
+        verbatim; everything else (ADAMW8BIT / CAME / MUON) is passed
+        through UNCHANGED so the runner FAILS LOUD at config load with the
+        supported list instead of silently training AdamW (the pre-T1.C
+        behavior, when the runner config carried no optimizer tag at all)."""
+        return self.optimizer_label()
 
     def scheduler_label(self) -> String:
         return self.scheduler_options[Int(self.scheduler_index)].copy()
@@ -930,6 +947,12 @@ def _runner_recipe_json(cfg: TrainerUIConfig) -> String:
         + String("  \"lora_rank\": ") + String(rank) + String(",\n")
         + String("  \"lora_alpha\": ") + String(cfg.lora_alpha) + String(",\n")
         + String("  \"timestep_shift\": ") + String(cfg.timestep_shift) + String(",\n")
+        + String("  \"caption_dropout_prob\": ") + String(cfg.caption_dropout) + String(",\n")
+        # T1.B EMA — read_model_config maps "ema" OFF/EMA -> ema_enabled
+        # (train_zimage_real consumes via training/lora_ema.mojo).
+        + String("  \"ema\": \"") + cfg.ema_mode.copy() + String("\",\n")
+        + String("  \"ema_decay\": ") + String(cfg.ema_decay) + String(",\n")
+        + String("  \"ema_update_step_interval\": ") + String(Int(cfg.ema_update_step_interval)) + String(",\n")
         + String("  \"max_grad_norm\": ") + String(cfg.clip_grad_norm) + String(",\n")
         + String("  \"max_steps\": ") + String(steps) + String(",\n")
         + String("  \"save_every\": ") + String(save_every) + String(",\n")
@@ -1019,6 +1042,13 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
             + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
+            # T1.C optimizer lever — zimage only this phase (train_zimage_real
+            # wires training/levers.mojo levers_optimizer_step). Defaults
+            # (ADAMW, warmup 0) keep the lever OFF; unsupported dropdown
+            # values fail loud at runner config load. optimizer_warmup_steps
+            # mirrors SimpleTuner's warmup_steps := args.lr_warmup_steps.
+            + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
+            + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
             + _runner_recipe_json(cfg)
             + String("}\n")
         )

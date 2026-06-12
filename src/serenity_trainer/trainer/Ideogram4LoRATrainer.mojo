@@ -14,6 +14,7 @@ from std.os import makedirs
 from std.time import perf_counter
 
 from serenitymojo.tensor import Tensor
+from serenitymojo.training.levers import caption_dropout_pick
 from serenitymojo.training.schedule import sample_timestep_logit_normal_scaled
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors_writer import save_safetensors
@@ -61,6 +62,11 @@ struct Ideogram4LoRATrainRunConfig(Copyable, Movable):
     var noise_seed: UInt64
     var lora_seed: UInt64
     var progress_file_path: String
+    # T1.D caption dropout probability (default-off 0.0; serenity-trainer's
+    # TrainConfig does not carry caption_dropout_prob, so the run config owns
+    # it). When the pick fires, the step trains on cache.uncond[NT] (the
+    # llm_uncond empty-caption features) instead of the sample's llm features.
+    var caption_dropout_prob: Float32
 
     @staticmethod
     def defaults(
@@ -81,6 +87,7 @@ struct Ideogram4LoRATrainRunConfig(Copyable, Movable):
             noise_seed=UInt64(0x1D3A_4A11),
             lora_seed=UInt64(0x1D3A_4000),
             progress_file_path=String(""),
+            caption_dropout_prob=Float32(0.0),
         )
 
 
@@ -169,13 +176,25 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
             sample_index, t_step, seed, ctx
         )
 
+        # T1.D caption dropout (default-off p<=0 never draws): shared levers
+        # pick on the noise_seed stream; when it fires, train this step on the
+        # cached empty-caption llm_uncond features (fail-loud if the cache
+        # predates the --uncond stager).
+        var llm_in = sample.llm_features.copy()
+        if caption_dropout_pick(
+            UInt64(opt_step + local_step),
+            run_cfg.noise_seed,
+            run_cfg.caption_dropout_prob,
+        ):
+            llm_in = ArcPointer[Tensor](cache.uncond[NT](ctx))
+
         var result: Ideogram4LoRATrainResult = ideogram4_lora_train_step_resident[NT, GH, GW](
             weights,
             sample.noisy[],
             sample.clean[],
             sample.noise[],
             sample.t_flow,
-            sample.llm_features[],
+            llm_in[],
             loras,
             opt,
             opt_step + 1,

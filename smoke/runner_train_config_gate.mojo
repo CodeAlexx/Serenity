@@ -14,6 +14,8 @@ from serenity_trainer.ui.TrainerConfigModel import (
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import (
     LOSS_FN_MSE, LOSS_FN_HUBER, LOSS_FN_SMOOTH_L1,
+    TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
+    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
 )
 
 
@@ -153,6 +155,142 @@ def _gate_zimage_loss_levers() raises:
            String("loss_fn=") + String(c2.loss_fn))
 
 
+def _gate_caption_dropout_prob() raises:
+    # T1.D: the recipe JSON must emit caption_dropout_prob and round-trip it
+    # through read_model_config — default OFF (0.0, the C13 companion flip of
+    # the UI's old 0.05 default) and a flipped value.
+    var ui = TrainerUIConfig()
+    ui.model_type_index = 7
+    trainer_ui_apply_model_preset(ui, True)
+
+    var json0 = trainer_ui_runner_train_config_json(ui)
+    var p0 = String("/tmp/serenity_ui_caption_dropout_default_gate.json")
+    var f0 = open(p0.copy(), "w")
+    f0.write(json0)
+    f0.close()
+    var c0 = read_model_config(p0.copy())
+    _check(String("caption-dropout-default"),
+           _close32(c0.caption_dropout_prob, Float32(0.0)),
+           String("caption_dropout_prob=") + String(c0.caption_dropout_prob))
+
+    ui.caption_dropout = 0.1
+    var json1 = trainer_ui_runner_train_config_json(ui)
+    var p1 = String("/tmp/serenity_ui_caption_dropout_flipped_gate.json")
+    var f1 = open(p1.copy(), "w")
+    f1.write(json1)
+    f1.close()
+    var c1 = read_model_config(p1.copy())
+    _check(String("caption-dropout-flipped"),
+           _close32(c1.caption_dropout_prob, Float32(0.1)),
+           String("caption_dropout_prob=") + String(c1.caption_dropout_prob))
+
+
+def _gate_ema() raises:
+    # T1.B: the UI EMA keys (ema/ema_decay/ema_update_step_interval) must
+    # round-trip through read_model_config — default OFF (ema_enabled False),
+    # and the UI's "EMA" dropdown choice (TrainerConfigModel ema_options is
+    # OFF/EMA) must parse to enabled + carry decay/interval into TrainConfig
+    # (train_zimage_real.mojo lora_ema wiring consumes them).
+    var ui = TrainerUIConfig()
+    ui.model_type_index = 7
+    trainer_ui_apply_model_preset(ui, True)
+
+    var json0 = trainer_ui_runner_train_config_json(ui)
+    var p0 = String("/tmp/serenity_ui_ema_default_gate.json")
+    var f0 = open(p0.copy(), "w")
+    f0.write(json0)
+    f0.close()
+    var c0 = read_model_config(p0.copy())
+    _check(String("ema-default"), not c0.ema_enabled,
+           String("ema_enabled=") + String(c0.ema_enabled))
+    _check(String("ema-default"), _close32(c0.ema_decay, Float32(0.999)),
+           String("ema_decay=") + String(c0.ema_decay))
+    _check(String("ema-default"), c0.ema_update_step_interval == 5,
+           String("ema_update_step_interval=") + String(c0.ema_update_step_interval))
+
+    ui.ema_mode = String("EMA")
+    ui.ema_decay = 0.99
+    ui.ema_update_step_interval = 2.0
+    var json1 = trainer_ui_runner_train_config_json(ui)
+    var p1 = String("/tmp/serenity_ui_ema_flipped_gate.json")
+    var f1 = open(p1.copy(), "w")
+    f1.write(json1)
+    f1.close()
+    var c1 = read_model_config(p1.copy())
+    _check(String("ema-flipped"), c1.ema_enabled,
+           String("ema_enabled=") + String(c1.ema_enabled))
+    _check(String("ema-flipped"), _close32(c1.ema_decay, Float32(0.99)),
+           String("ema_decay=") + String(c1.ema_decay))
+    _check(String("ema-flipped"), c1.ema_update_step_interval == 2,
+           String("ema_update_step_interval=") + String(c1.ema_update_step_interval))
+
+
+def _gate_optimizer_runner() raises:
+    # T1.C: the zimage emission carries the optimizer enum (from the existing
+    # UI optimizer dropdown via optimizer_runner_value) + optimizer_warmup_
+    # steps (:= learning_rate_warmup_steps) and round-trips through
+    # serenitymojo's REAL read_model_config — default ADAMW/0 (lever OFF),
+    # flipped ADAFACTOR and SCHEDULE_FREE_ADAMW land in TrainConfig, and an
+    # unsupported dropdown value (CAME) FAILS LOUD at config load.
+    var ui = TrainerUIConfig()
+    ui.model_type_index = 7
+    trainer_ui_apply_model_preset(ui, True)
+
+    # default emission == lever off (ADAMW, warmup 0)
+    var json0 = trainer_ui_runner_train_config_json(ui)
+    var p0 = String("/tmp/serenity_ui_optimizer_default_gate.json")
+    var f0 = open(p0.copy(), "w")
+    f0.write(json0)
+    f0.close()
+    var c0 = read_model_config(p0.copy())
+    _check(String("optimizer-default"), c0.optimizer == TRAIN_OPTIMIZER_ADAMW,
+           String("optimizer=") + String(c0.optimizer))
+    _check(String("optimizer-default"), c0.optimizer_warmup_steps == 0,
+           String("optimizer_warmup_steps=") + String(c0.optimizer_warmup_steps))
+
+    # flipped: ADAFACTOR (dropdown index 3)
+    ui.optimizer_index = 3
+    var json1 = trainer_ui_runner_train_config_json(ui)
+    var p1 = String("/tmp/serenity_ui_optimizer_adafactor_gate.json")
+    var f1 = open(p1.copy(), "w")
+    f1.write(json1)
+    f1.close()
+    var c1 = read_model_config(p1.copy())
+    _check(String("optimizer-adafactor"),
+           c1.optimizer == TRAIN_OPTIMIZER_ADAFACTOR,
+           String("optimizer=") + String(c1.optimizer))
+
+    # flipped: SCHEDULE_FREE_ADAMW (dropdown index 5, appended T1.C) with
+    # warmup from learning_rate_warmup_steps
+    ui.optimizer_index = 5
+    ui.learning_rate_warmup_steps = 25.0
+    var json2 = trainer_ui_runner_train_config_json(ui)
+    var p2 = String("/tmp/serenity_ui_optimizer_sf_gate.json")
+    var f2 = open(p2.copy(), "w")
+    f2.write(json2)
+    f2.close()
+    var c2 = read_model_config(p2.copy())
+    _check(String("optimizer-schedulefree"),
+           c2.optimizer == TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
+           String("optimizer=") + String(c2.optimizer))
+    _check(String("optimizer-schedulefree"), c2.optimizer_warmup_steps == 25,
+           String("optimizer_warmup_steps=") + String(c2.optimizer_warmup_steps))
+
+    # unsupported dropdown value (CAME, index 2) fails loud at config load
+    ui.optimizer_index = 2
+    var json3 = trainer_ui_runner_train_config_json(ui)
+    var p3 = String("/tmp/serenity_ui_optimizer_came_gate.json")
+    var f3 = open(p3.copy(), "w")
+    f3.write(json3)
+    f3.close()
+    var raised = False
+    try:
+        var _c3 = read_model_config(p3.copy())
+    except _e:
+        raised = True
+    _check(String("optimizer-came-fails-loud"), raised, String("raised=") + String(raised))
+
+
 def main() raises:
     print("== runner train config gate ==")
     # model_type option indices: 4=CHROMA_1, 5=ERNIE_IMAGE, 6=ANIMA, 2=SDXL,
@@ -164,4 +302,7 @@ def main() raises:
     _gate_target(7, String("zimage"), String("zimage"), 3840, 30, 30)
     _gate_target(8, String("l2p"), String("l2p"), 3840, 30, 30)
     _gate_zimage_loss_levers()
+    _gate_caption_dropout_prob()
+    _gate_ema()
+    _gate_optimizer_runner()
     print("ALL GATES PASS — UI runner train-config seam OK")
