@@ -97,3 +97,34 @@ Per-model verification = (1) run serenitymojo `<m>` torch lora_stack_parity [aut
 
 ## Port pattern (precedent: Klein, Lens already in the port)
 Copy serenitymojo `models/<model>/*` → `serenity-trainer/src/serenity_trainer/model/<model>/`, adapt namespace to `serenity_trainer` (import ONLY tensor/autograd/ops from serenitymojo). Wire `smoke/<model>_train_ref_{forward,loss,grad_update}_replay.mojo` mirroring the `klein_train_ref_*_replay.mojo` gates. Agents run SEQUENTIALLY (no concurrent mojo builds).
+
+## ⭐ ADDENDUM 2026-06-12 — UI launch reality + lever delivery + LoKr
+
+- **Klein: the UI now launches the REAL serenitymojo `train_klein_real`**
+  (commit aa0e2cf headline). MEASURED before the fix: the UI's klein
+  launches went to this repo's legacy `KleinLiveTrainer` — hardwired
+  MSE/AdamW, 11 positional argv, ZERO lever support (verified by grep +
+  strings on the deployed binary). Klein is now the 7th config-driven
+  runner: full lever emission (loss/optimizer/EMA/dropout + arch dims from
+  klein9b.json), pixi klein-live-trainer-build builds train_klein_real
+  (sm_86, sdpa shim + rpaths), emitted-config dry-run passes
+  read_model_config + validate_klein_train_config + cache preflight.
+  NOTE: the in-table "Klein BWD BUG d_B ~1.5-2×" finding was against the
+  legacy port path; the serenitymojo train_klein_real path carries its own
+  anchor gates (0.5414/0.2154/0.7810, mojodiffusion ledger).
+- **Lever delivery matrix (capability table = trainer_ui_supported_lever_keys,
+  measured by consumption grep, aa0e2cf):** klein/zimage/hidream/ideogram4
+  CONSUME levers (loss fns/EMA/optimizer/dropout via serenitymojo
+  training/levers.mojo — fan-out commits mojodiffusion 12190f6 +
+  serenity-trainer da7cbb9); chroma/ernie/anima/sdxl/l2p consume NONE
+  (the earlier "EMA reaches all" audit claim was parse-only). The UI now
+  renders a LOUD pre-launch WARNING naming any ignored non-default keys.
+- **LoKr e2e TRAINABLE on klein** (mojodiffusion 7ea52ed, T2.G SimpleTuner
+  full parity): adapter_algo=4 trains for real via Kronecker-carrier fold;
+  init_lokr_norm exact port; upstream LokrModule loads trained checkpoints
+  BIT-EXACT; klein flags-off anchors in-class (0.5414 exact/0.2155/0.7810).
+  Rebuild the deployed klein runner post-T2.G (it was built from the
+  in-flight tree, LoKr default-off).
+- Detail ledgers: mojodiffusion serenitymojo/docs/TIER1_PARITY_CAMPAIGN_
+  2026-06-11.md + TIER2_PARITY_CAMPAIGN_2026-06-11.md; UI audit:
+  docs/UI_AUDIT_2026-06-12.md.

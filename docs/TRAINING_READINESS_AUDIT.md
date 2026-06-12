@@ -1,5 +1,24 @@
 # Training-Readiness Audit — serenity-trainer (CLI, no UI)
 
+> **CORRECTIONS 2026-06-12 (today's work supersedes specific claims below):**
+> 1. **Klein**: "Klein has a CLI `def main` (KleinLiveTrainer.mojo:53)" is now a
+>    LEGACY path — measured (aa0e2cf): it was hardwired MSE/AdamW, 11 positional
+>    argv, zero lever support. The UI (and the pixi klein-live-trainer-build
+>    target) now launch serenitymojo's `train_klein_real` as the 7th
+>    config-driven runner; the `_force_constant_timestep` fidelity caveat does
+>    not apply to that path.
+> 2. **HiDream**: "STUB → cannot train · T3" is superseded for HiDream-O1 — it
+>    trains via serenitymojo `training/train_hidream_o1_real.mojo` (~1.0 s/step,
+>    30-step gate green) launched from this repo's NEW
+>    `target/serenity_hidream_live_trainer` runner (eaa88f1). The in-repo
+>    OneTrainer-port `BaseHiDreamSetup` stubs themselves remain stubs.
+> 3. **Ideogram4** (excluded from this audit) now trains for REAL: the prior
+>    run was a one-sample parity fixture at fixed t=0.7 (loss 1.3e-4, grad 0 —
+>    measured); fixed in 166882f (real giger cache + per-step logit-normal t).
+> 4. Lever capability (06-12, measured by consumption grep): klein/zimage/
+>    hidream/ideogram4 consume runtime levers; chroma/ernie/anima/sdxl/l2p
+>    consume none — UI warns loudly pre-launch (aa0e2cf).
+
 **Status: RECONCILED — auditor + skeptic + reviewer.** Reviewer personally opened the disputed
 files (Z-Image/Lens smokes, the 6 stubs, predict-only setups, Klein driver, factory) and confirmed
 every claim below with file:line evidence. No per-model verdict changed during reconciliation; the

@@ -105,3 +105,11 @@ range for an untrained base on a new style.
   compute (and the reference is bf16, so the benefit is unproven).
 - The end-to-end dataLoader cache + train-loop driver are owned/in-progress
   elsewhere; gate them on a real giger batch when they land.
+  **CLOSED 2026-06-11/12 (166882f):** real giger cache landed (70 samples,
+  stage-A jpg+txt → 512px f32 + chat-templated JSON prompts; stage-B Mojo
+  VAE + Qwen3-VL encoders → indexed clean/llm cache) + per-step
+  t ~ logit-normal(0,1.5) per DiffSynth. The prior 3000-step run was the
+  ONE-SAMPLE parity fixture at fixed t=0.7 (measured loss ~1.3e-4,
+  grad_norm 0.0000 — the counterexample this gate sequence exists to
+  catch). Live gate green: loss 0.6-1.2 class decreasing, 204 LoRA-B
+  nonzero.
