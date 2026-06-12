@@ -35,7 +35,7 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     jpgs = sorted(src.glob("*.jpg"), key=lambda p: int(p.stem) if p.stem.isdigit() else 1 << 30)
-    tensors, prompts = {}, {}
+    tensors, prompts, captions = {}, {}, {}
     kept = 0
     for p in jpgs:
         cap_path = p.with_suffix(".txt")
@@ -56,12 +56,15 @@ def main():
         cap_json = json.dumps({"high_level_description": caption}, ensure_ascii=False)
         rendered = f"<|im_start|>user\n{cap_json}<|im_end|>\n<|im_start|>assistant\n"
         prompts[str(kept)] = rendered
+        captions[str(kept)] = caption
         kept += 1
 
     save_file(tensors, str(out / "images.safetensors"))
     (out / "prompts.json").write_text(json.dumps(prompts, ensure_ascii=False, indent=0))
     for k, v in prompts.items():
         (out / f"prompt.{k}.txt").write_text(v)
+    for k, v in captions.items():
+        (out / f"caption.{k}.txt").write_text(v)
     print(f"staged {kept} samples -> {out} (size {size})")
 
 if __name__ == "__main__":
