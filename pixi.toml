@@ -13,7 +13,7 @@ version = "0.0.1"
 
 [tasks]
 build-mojoui = "make -C /home/alex/MojoUI/c_floor"
-ideogram4-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion src/serenity_trainer/trainer/Ideogram4LiveTrainer.mojo -o target/serenity_ideogram4_live_trainer"
+ideogram4-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm src/serenity_trainer/trainer/Ideogram4LiveTrainer.mojo -o target/serenity_ideogram4_live_trainer"
 klein-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm src/serenity_trainer/trainer/KleinLiveTrainer.mojo -o target/serenity_klein_live_trainer"
 # Config-driven runners reused from the campaign-verified serenitymojo trainers
 # (argv: <train_config.json> <steps>; stdout = shared progress-line stream).

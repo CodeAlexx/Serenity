@@ -14,7 +14,22 @@ from std.os import makedirs
 from std.time import perf_counter
 
 from serenitymojo.tensor import Tensor
-from serenitymojo.training.levers import caption_dropout_pick
+from serenitymojo.training.levers import (
+    caption_dropout_pick,
+    levers_optimizer_active,
+    levers_optimizer_validate,
+    levers_optimizer_eval_for_save,
+    levers_optimizer_train_after_save,
+)
+from serenitymojo.training.lora_ema import (
+    LoraEmaState,
+    lora_ema_track,
+    ema_update,
+    ema_shadow_a_bf16,
+    ema_shadow_b_bf16,
+    ema_path_for_lora,
+)
+from serenitymojo.training.train_config import TrainConfig as LeversConfig
 from serenitymojo.training.schedule import sample_timestep_logit_normal_scaled
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors_writer import save_safetensors
@@ -32,12 +47,19 @@ from serenity_trainer.modelLoader.Ideogram4LoRALoader import (
 from serenity_trainer.modelSaver.Ideogram4LoRAModelSaver import (
     Ideogram4LoRAModelSaver,
 )
+from serenity_trainer.module.LoRAModule import LoraAdapter
 from serenity_trainer.trainer.Ideogram4LoRATrainStep import (
     Ideogram4LoRATrainResult,
     ideogram4_lora_train_step_resident,
+    ideogram4_lora_train_compute_resident,
 )
 from serenity_trainer.trainer.Ideogram4StackTrain import (
     Ideogram4LoraAdamState,
+    Ideogram4LeversBridge,
+    apply_ideogram4_lora_grads,
+    ideogram4_levers_mirrors_init,
+    ideogram4_levers_refresh_mirrors,
+    ideogram4_levers_optimizer_step,
     make_ideogram4_lora_adam_state,
 )
 from serenity_trainer.trainer.TrainState import TrainProgress
@@ -66,7 +88,16 @@ struct Ideogram4LoRATrainRunConfig(Copyable, Movable):
     # TrainConfig does not carry caption_dropout_prob, so the run config owns
     # it). When the pick fires, the step trains on cache.uncond[NT] (the
     # llm_uncond empty-caption features) instead of the sample's llm features.
+    # 0.0 here falls back to levers.caption_dropout_prob (one knob wins).
     var caption_dropout_prob: Float32
+    # T1 levers carrier (serenitymojo TrainConfig): loss_fn/huber_delta/
+    # smooth_l1_beta/min_snr_gamma_flow (T1.A), ema_* (T1.B), optimizer/
+    # optimizer_* (T1.C), caption_dropout_prob fallback (T1.D). Defaults are
+    # ALL default-off (C13) == the pre-lever trainer byte-for-byte. The shared
+    # recipe scalars (lr/beta1/beta2/eps/weight_decay/rank/alpha) are SYNCED
+    # from the serenity-trainer TrainConfig at run start — that struct stays
+    # the single source of truth for them.
+    var levers: LeversConfig
 
     @staticmethod
     def defaults(
@@ -88,6 +119,7 @@ struct Ideogram4LoRATrainRunConfig(Copyable, Movable):
             lora_seed=UInt64(0x1D3A_4000),
             progress_file_path=String(""),
             caption_dropout_prob=Float32(0.0),
+            levers=LeversConfig.default(),
         )
 
 
@@ -119,6 +151,39 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
 ) raises -> Ideogram4LoRATrainSummary:
     if run_cfg.steps < 1:
         raise Error("train_ideogram4_lora_from_cache: steps must be >= 1")
+
+    # ── T1 levers config (TIER1_PARITY_CAMPAIGN_2026-06-11.md) ────────────────
+    # run_cfg.levers carries the LEVER keys; the shared optimizer/LoRA recipe
+    # scalars are synced FROM the serenity-trainer cfg (the struct argv/gates
+    # already control) so there is exactly one knob per scalar.
+    var lcfg = run_cfg.levers.copy()
+    lcfg.lr = cfg.learning_rate
+    lcfg.beta1 = cfg.beta1
+    lcfg.beta2 = cfg.beta2
+    lcfg.eps = cfg.eps
+    lcfg.weight_decay = cfg.weight_decay
+    lcfg.lora_rank = cfg.lora_rank
+    lcfg.lora_alpha = cfg.lora_alpha
+    if lcfg.masked_training:
+        raise Error(
+            "train_ideogram4_lora_from_cache: masked_training is set but the"
+            " ideogram4 stager emits no masks — masked loss (T1.E) is not"
+            " wired for this trainer"
+        )
+    levers_optimizer_validate(lcfg, String("Ideogram4 trainer"))
+    var levers_opt = levers_optimizer_active(lcfg)
+    if levers_opt:
+        print(
+            "[Ideogram4-lora] T1.C levers optimizer active: tag=",
+            lcfg.optimizer,
+            " (2=ADAFACTOR, 7=SCHEDULE_FREE_ADAMW) warmup=",
+            lcfg.optimizer_warmup_steps,
+        )
+    # effective caption-dropout p: run_cfg owns it (T1.D precedent); 0.0 falls
+    # back to the levers key so a config-file value still reaches the pick.
+    var drop_p = run_cfg.caption_dropout_prob
+    if drop_p <= Float32(0.0):
+        drop_p = lcfg.caption_dropout_prob
 
     makedirs(run_cfg.output_dir, exist_ok=True)
     var final_lora_path = _final_lora_path(run_cfg.output_dir)
@@ -154,6 +219,29 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
         progress = loaded.progress.copy()
         opt_step = loaded.opt_step
 
+    # T1.C levers bridge (host mirrors + optimizer state; nothing allocated on
+    # the default AdamW path unless EMA needs the mirrors) + T1.B EMA shadows.
+    # EMA tracks AFTER any resume load (shadow init = clone of current params,
+    # SimpleTuner ema.py:123 semantics via training/lora_ema.mojo).
+    var bridge = Ideogram4LeversBridge()
+    var ema = LoraEmaState(
+        lcfg.ema_decay, lcfg.ema_min_decay,
+        lcfg.ema_update_after_step, lcfg.ema_update_step_interval,
+    )
+    if lcfg.ema_enabled or levers_opt:
+        ideogram4_levers_mirrors_init(bridge, loras, ctx)
+    if lcfg.ema_enabled:
+        var ema_base = lora_ema_track(ema, bridge.mirrors, 0, len(bridge.mirrors))
+        if ema_base != 0:
+            raise Error("train_ideogram4_lora_from_cache: ema shadow base must be 0")
+        print(
+            "[Ideogram4-lora] T1.B EMA tracking", len(bridge.mirrors),
+            "adapters decay=", lcfg.ema_decay,
+            " min_decay=", lcfg.ema_min_decay,
+            " update_after_step=", lcfg.ema_update_after_step,
+            " interval=", lcfg.ema_update_step_interval,
+        )
+
     var last_loss = Float32(0.0)
     var last_b = Float32(0.0)
     var train_start = perf_counter()
@@ -184,11 +272,13 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
         if caption_dropout_pick(
             UInt64(opt_step + local_step),
             run_cfg.noise_seed,
-            run_cfg.caption_dropout_prob,
+            drop_p,
         ):
             llm_in = ArcPointer[Tensor](cache.uncond[NT](ctx))
 
-        var result: Ideogram4LoRATrainResult = ideogram4_lora_train_step_resident[NT, GH, GW](
+        # forward + loss (T1.A lever seam inside) + backward — NO optimizer.
+        var step_loss = Float32(0.0)
+        var grads = ideogram4_lora_train_compute_resident[NT, GH, GW](
             weights,
             sample.noisy[],
             sample.clean[],
@@ -196,20 +286,41 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
             sample.t_flow,
             llm_in[],
             loras,
-            opt,
-            opt_step + 1,
-            cfg,
+            lcfg,
+            step_loss,
             ctx,
         )
-        last_loss = result.loss
-        last_b = result.adapter_b_l1
+        # T1.C optimizer seam: levers host path vs the existing literal fused
+        # AdamW call (C13: optimizer=ADAMW routes around the levers entirely).
+        var k = opt_step + 1
+        var step_b_l1 = Float32(0.0)
+        if levers_opt:
+            step_b_l1 = ideogram4_levers_optimizer_step(
+                lcfg, loras, bridge, grads, k,
+                cfg.learning_rate, ctx,
+            )
+            _ = grads^
+        else:
+            var res = apply_ideogram4_lora_grads(
+                loras, opt, grads^, k, cfg, ctx
+            )
+            step_b_l1 = res.adapter_b_l1
+        # T1.B EMA, post-optimizer: the default AdamW stepped the params on
+        # device, so refresh the host mirrors first; the levers optimizer
+        # keeps the mirrors authoritative already.
+        if lcfg.ema_enabled:
+            if not levers_opt:
+                ideogram4_levers_refresh_mirrors(bridge, loras, ctx)
+            ema_update(ema, bridge.mirrors, k)
+        last_loss = step_loss
+        last_b = step_b_l1
         opt_step += 1
         progress.next_step(cfg.batch_size)
         if not smooth_inited:
-            smooth_loss = result.loss
+            smooth_loss = step_loss
             smooth_inited = True
         else:
-            smooth_loss = smooth_loss * Float32(0.99) + result.loss * Float32(0.01)
+            smooth_loss = smooth_loss * Float32(0.99) + step_loss * Float32(0.01)
 
         if run_cfg.progress_file_path.byte_length() > 0:
             var elapsed = perf_counter() - train_start
@@ -219,27 +330,40 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
                 progress,
                 run_cfg.steps,
                 cfg,
-                result.loss,
+                last_loss,
                 smooth_loss,
                 Float32(speed),
                 elapsed,
             )
 
         if run_cfg.save_every_steps > 0 and opt_step % run_cfg.save_every_steps == 0:
-            _save_lora(loras, _step_lora_path(run_cfg.output_dir, opt_step), ctx)
+            # schedule-free save bracket (no-op for every other optimizer —
+            # levers.mojo SAVE CONTRACT) around the product save + EMA sibling.
+            levers_optimizer_eval_for_save(lcfg, bridge.opt_st)
+            var step_path = _step_lora_path(run_cfg.output_dir, opt_step)
+            _save_lora(loras, step_path, ctx)
+            if lcfg.ema_enabled:
+                _save_lora_ema(ema, loras, step_path, ctx)
+            levers_optimizer_train_after_save(lcfg, bridge.opt_st)
 
         if (
             run_cfg.checkpoint_every_steps > 0
             and opt_step % run_cfg.checkpoint_every_steps == 0
         ):
+            levers_optimizer_eval_for_save(lcfg, bridge.opt_st)
             var ckpt_dir = _step_state_dir(run_cfg.output_dir, opt_step)
             save_ideogram4_lora_train_state(ckpt_dir, opt, progress, opt_step, ctx)
+            levers_optimizer_train_after_save(lcfg, bridge.opt_st)
 
     var train_elapsed = perf_counter() - train_start
     var seconds_per_step = train_elapsed / Float64(run_cfg.steps)
 
+    levers_optimizer_eval_for_save(lcfg, bridge.opt_st)
     _save_lora(loras, final_lora_path, ctx)
+    if lcfg.ema_enabled:
+        _save_lora_ema(ema, loras, final_lora_path, ctx)
     save_ideogram4_lora_train_state(final_state_dir, opt, progress, opt_step, ctx)
+    levers_optimizer_train_after_save(lcfg, bridge.opt_st)
 
     return Ideogram4LoRATrainSummary(
         run_cfg.steps,
@@ -344,6 +468,36 @@ def _load_or_build_loras(
 def _save_lora(loras: Ideogram4LoraSet, path: String, ctx: DeviceContext) raises:
     var saver = Ideogram4LoRAModelSaver()
     saver.save_block_stack_lora(loras, path, ctx)
+
+
+# T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a
+# just-saved LoRA, through the SAME product writer (zimage's
+# _save_zimage_lora_ema precedent). Shadows are flat-indexed 1:1 with
+# loras.ad (lora_ema_track tracked the full mirror set, base 0); the bf16
+# export round is lora_ema.mojo's copy_to cast (ema.py:454).
+def _save_lora_ema(
+    ema: LoraEmaState, loras: Ideogram4LoraSet, lora_path: String,
+    ctx: DeviceContext,
+) raises:
+    var ad = List[ArcPointer[LoraAdapter]]()
+    for i in range(len(loras.ad)):
+        var a_t = Tensor.from_host_bf16(
+            ema_shadow_a_bf16(ema, i), loras.ad[i][].a.shape(), ctx
+        )
+        var b_t = Tensor.from_host_bf16(
+            ema_shadow_b_bf16(ema, i), loras.ad[i][].b.shape(), ctx
+        )
+        ad.append(
+            ArcPointer[LoraAdapter](
+                LoraAdapter(
+                    a_t^, b_t^, loras.ad[i][].rank, loras.ad[i][].alpha
+                )
+            )
+        )
+    var ema_set = Ideogram4LoraSet(ad^, loras.n_layers, loras.rank)
+    var ema_path = ema_path_for_lora(lora_path)
+    _save_lora(ema_set, ema_path, ctx)
+    print("[Ideogram4-lora] save_ema path=", ema_path)
 
 
 def _append_ideogram4_live_progress(

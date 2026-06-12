@@ -73,6 +73,13 @@ from serenity_trainer.trainer.Ideogram4StackTrain import (
     apply_ideogram4_lora_grads,
 )
 from serenity_trainer.util.config.TrainConfig import TrainConfig
+
+# T1 levers (TIER1_PARITY_CAMPAIGN_2026-06-11.md): the shared runtime-config
+# loss dispatch. LeversConfig is serenitymojo's TrainConfig (the lever-key
+# carrier), DISTINCT from serenity-trainer's own TrainConfig above — the
+# serenity-trainer struct keeps owning the AdamW/LoRA recipe scalars.
+from serenitymojo.training.levers import levers_loss_active, levers_loss_grad
+from serenitymojo.training.train_config import TrainConfig as LeversConfig
 from serenity_trainer.modelSampler.Ideogram4Sampler import (
     IDEOGRAM4_NUM_LAYERS,
     IDEOGRAM4_NUM_HEADS,
@@ -547,6 +554,102 @@ def ideogram4_lora_final_backward[
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# T1.A LOSS LEVER SEAM — the ONE ideogram4 flow-loss site.
+#   DEFAULT (levers_loss_active(lcfg) == False, i.e. loss_fn==MSE and
+#   min_snr_gamma_flow==0): the literal pre-existing GPU MSE block
+#   (sub → mul → reduce_mean_f32 → 2/N scale), byte-identical op chain (C13).
+#   LEVER ACTIVE: velocity/target are brought to HOST and levers_loss_grad
+#   dispatches huber/smooth_l1/min-SNR (torch-oracle-gated math in
+#   ops/loss_fns.mojo), sigma := this step's t_flow (flow time, 1 = noise);
+#   d_velocity is re-uploaded as the F32 backward seed. Correctness over
+#   speed: one D2H pair + one H2D per lever-active step.
+# NOTE: masked loss (T1.E) is NOT wired — the ideogram4 stager emits no masks;
+# the trainer driver fails loud when lcfg.masked_training is set.
+# ──────────────────────────────────────────────────────────────────────────────
+struct _I4LossDvel(Movable):
+    var loss: Float32
+    var d_velocity: Tensor   # [1, 128, GH, GW] F32
+
+    def __init__(out self, loss: Float32, var d_velocity: Tensor):
+        self.loss = loss
+        self.d_velocity = d_velocity^
+
+
+def _i4_flow_loss_and_dvel(
+    velocity: Tensor,    # [1, 128, GH, GW] F32
+    target: Tensor,      # [1, 128, GH, GW] F32
+    t_flow: Float32,     # this step's flow-match sigma
+    n_elems: Int,        # velocity element count (128 * GH * GW)
+    lcfg: LeversConfig,
+    ctx: DeviceContext,
+) raises -> _I4LossDvel:
+    if levers_loss_active(lcfg):
+        var pred_h = velocity.to_host(ctx)
+        var tgt_h = target.to_host(ctx)
+        var lg = levers_loss_grad(pred_h, tgt_h, t_flow, lcfg)
+        var d_vel = Tensor.from_host(
+            lg.d_pred, velocity.shape(), STDtype.F32, ctx
+        )
+        return _I4LossDvel(lg.loss, d_vel^)
+    # literal legacy block (the trainers' inline MSE — default path):
+    # loss = mean((velocity - target)^2) ; d_velocity = (2/N)*(velocity - target)
+    var diff = sub(velocity, target, ctx)
+    var sq = mul(diff, diff, ctx)
+    var dims = List[Int]()
+    dims.append(0); dims.append(1); dims.append(2); dims.append(3)
+    var loss_t = reduce_mean_f32(sq, dims, False, ctx)
+    var loss_h = loss_t.to_host(ctx)
+    var d_velocity = mul_scalar(diff, Float32(2.0) / Float32(n_elems), ctx)
+    return _I4LossDvel(loss_h[0], d_velocity^)
+
+
+# compute-only entry: loss (via loss_out) + the per-adapter grads, NO
+# optimizer applied. The driver chooses the optimizer (literal fused AdamW
+# default vs the T1.C levers host path) — see
+# Ideogram4LoRATrainer.train_ideogram4_lora_from_cache.
+def ideogram4_lora_train_compute_resident[
+    NT: Int, GH: Int, GW: Int
+](
+    rw: Ideogram4Weights,
+    noisy_latents: Tensor,
+    clean: Tensor,
+    noise: Tensor,
+    t_flow: Float32,
+    llm_features: Tensor,
+    loras: Ideogram4LoraSet,
+    lcfg: LeversConfig,
+    mut loss_out: Float32,
+    ctx: DeviceContext,
+) raises -> Ideogram4StackLoraGrads:
+    """forward → loss (T1.A lever seam) → final backward → stack backward.
+    Identical math to ideogram4_lora_train_step_resident minus the AdamW
+    apply; with lcfg at LeversConfig.default() the loss path is the literal
+    legacy MSE block (C13)."""
+    comptime NIMG = GH * GW
+    comptime SEQ = NT + NIMG
+    comptime N = IDEOGRAM4_PACKED_CHANNELS * NIMG
+
+    var fwd = ideogram4_lora_train_forward_resident[NT, GH, GW](
+        rw, noisy_latents, t_flow, llm_features, loras, ctx
+    )
+
+    var target = ideogram4_flow_target(noise, clean, ctx)
+    var ld = _i4_flow_loss_and_dvel(fwd.velocity, target, t_flow, N, lcfg, ctx)
+    loss_out = ld.loss
+
+    var d_h = ideogram4_lora_final_backward[NT, GH, GW](
+        ld.d_velocity, fwd.h, fwd.fscale, fwd.flw, ctx
+    )
+
+    var grads = ideogram4_stack_lora_backward_resident[
+        SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+        IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+    ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, rw, loras, fwd.stack_fwd^, ctx)
+
+    return grads^
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # FULL TRAINING STEP.
 #   forward → velocity ; target = noise - clean ; loss = mean((velocity-target)^2)
 #   d_velocity = (2/N)*(velocity-target) ; final-backward → d_stack_out
@@ -581,18 +684,17 @@ def ideogram4_lora_train_step[
     var target = ideogram4_flow_target(noise, clean, ctx)             # [1,128,GH,GW] F32
 
     # loss = mean((velocity - target)^2) ; d_velocity = (2/N)*(velocity - target)
-    var diff = sub(fwd.velocity, target, ctx)
-    var sq = mul(diff, diff, ctx)
-    var dims = List[Int]()
-    dims.append(0); dims.append(1); dims.append(2); dims.append(3)
-    var loss_t = reduce_mean_f32(sq, dims, False, ctx)
-    var loss_h = loss_t.to_host(ctx)
-    var loss = loss_h[0]
-    var d_velocity = mul_scalar(diff, Float32(2.0) / Float32(N), ctx)
+    # (the shared loss seam at LeversConfig.default() == the literal MSE block;
+    # this non-resident path is gate-only — the production resident path takes
+    # the live lcfg via ideogram4_lora_train_compute_resident)
+    var ld = _i4_flow_loss_and_dvel(
+        fwd.velocity, target, t_flow, N, LeversConfig.default(), ctx
+    )
+    var loss = ld.loss
 
     # final-backward (FROZEN) → d_stack_out
     var d_h = ideogram4_lora_final_backward[NT, GH, GW](
-        d_velocity, fwd.h, fwd.fscale, fwd.flw, ctx
+        ld.d_velocity, fwd.h, fwd.fscale, fwd.flw, ctx
     )
 
     # stack LoRA backward → per-adapter grads
@@ -624,35 +726,13 @@ def ideogram4_lora_train_step_resident[
     cfg: TrainConfig,
     ctx: DeviceContext,
 ) raises -> Ideogram4LoRATrainResult:
-    comptime NIMG = GH * GW
-    comptime SEQ = NT + NIMG
-    comptime N = IDEOGRAM4_PACKED_CHANNELS * NIMG
-
-    var fwd = ideogram4_lora_train_forward_resident[NT, GH, GW](
-        rw, noisy_latents, t_flow, llm_features, loras, ctx
+    # compute (default levers config == literal legacy loss path) + AdamW apply.
+    var loss = Float32(0.0)
+    var grads = ideogram4_lora_train_compute_resident[NT, GH, GW](
+        rw, noisy_latents, clean, noise, t_flow, llm_features, loras,
+        LeversConfig.default(), loss, ctx,
     )
-
-    var target = ideogram4_flow_target(noise, clean, ctx)
-    var diff = sub(fwd.velocity, target, ctx)
-    var sq = mul(diff, diff, ctx)
-    var dims = List[Int]()
-    dims.append(0); dims.append(1); dims.append(2); dims.append(3)
-    var loss_t = reduce_mean_f32(sq, dims, False, ctx)
-    var loss_h = loss_t.to_host(ctx)
-    var loss = loss_h[0]
-    var d_velocity = mul_scalar(diff, Float32(2.0) / Float32(N), ctx)
-
-    var d_h = ideogram4_lora_final_backward[NT, GH, GW](
-        d_velocity, fwd.h, fwd.fscale, fwd.flw, ctx
-    )
-
-    var grads = ideogram4_stack_lora_backward_resident[
-        SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
-        IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
-    ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, rw, loras, fwd.stack_fwd^, ctx)
-
     var res = apply_ideogram4_lora_grads(
         loras, opt_state, grads^, optimizer_step, cfg, ctx
     )
-
     return Ideogram4LoRATrainResult(loss, res.adapter_b_l1, True)

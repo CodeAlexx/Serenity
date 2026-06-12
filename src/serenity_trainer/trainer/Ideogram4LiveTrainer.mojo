@@ -10,6 +10,23 @@
 #   7 alpha
 #   8 learning_rate
 #   9 save_every_steps
+#  10 caption_dropout_prob   (T1.D; "-" or absent = 0.0 = never drop)
+#  11 levers_config_json     (T1 levers: serenitymojo train-config JSON read by
+#                             io/train_config_reader read_model_config — the
+#                             same format trainer_ui_runner_train_config_json
+#                             emits for the config-driven runners; carries
+#                             loss_fn/min_snr_gamma_flow/ema_*/optimizer*/
+#                             caption_dropout_prob; "-" or absent = all
+#                             default-off). NOTE (gap, documented):
+#                             TrainerRuntimeBridge currently launches this
+#                             runner with only argv 1-9, so the UI's lever
+#                             widgets do NOT reach ideogram4 until the bridge
+#                             appends argv 10/11 (bridge is not owned by this
+#                             wiring pass). The recipe scalars argv already
+#                             carries (lr/rank/alpha/steps/save) keep winning
+#                             over the JSON — the JSON contributes ONLY the
+#                             lever keys (Ideogram4LoRATrainer syncs the shared
+#                             scalars from the argv-built TrainConfig).
 #
 # The UI launches this as a background process. Progress is written as
 # Serenity-shaped callback lines so TrainerRuntimeBridge can tail the file.
@@ -17,6 +34,8 @@
 from std.gpu.host import DeviceContext
 from std.os import makedirs
 from std.sys import argv
+
+from serenitymojo.io.train_config_reader import read_model_config
 
 from serenity_trainer.trainer.Ideogram4LoRATrainer import (
     Ideogram4LoRATrainRunConfig,
@@ -108,6 +127,20 @@ def main() raises:
         if v.byte_length() > 0 and v != String("-"):
             save_every_steps = atol(v)
 
+    # T1.D caption dropout (argv 10; default-off 0.0)
+    var caption_dropout_prob = Float32(0.0)
+    if len(args) > 10:
+        var v = String(args[10])
+        if v.byte_length() > 0 and v != String("-"):
+            caption_dropout_prob = Float32(atof(v))
+
+    # T1 levers config JSON (argv 11; optional — fail loud on a bad file)
+    var levers_config_path = String("")
+    if len(args) > 11:
+        var v = String(args[11])
+        if v.byte_length() > 0 and v != String("-"):
+            levers_config_path = v^
+
     if steps < 1:
         steps = 1
     if save_every_steps < 0:
@@ -147,6 +180,20 @@ def main() raises:
     run_cfg.save_every_steps = save_every_steps
     run_cfg.checkpoint_every_steps = save_every_steps
     run_cfg.progress_file_path = progress_file.copy()
+    run_cfg.caption_dropout_prob = caption_dropout_prob
+    if levers_config_path.byte_length() > 0:
+        # Lever keys (loss_fn / min_snr_gamma_flow / ema_* / optimizer* /
+        # caption_dropout_prob fallback) come from the JSON; the shared recipe
+        # scalars stay argv-owned (the trainer syncs them from `cfg` above).
+        run_cfg.levers = read_model_config(levers_config_path)
+        print(
+            "[Ideogram4-lora] levers config ", levers_config_path,
+            " | loss_fn ", run_cfg.levers.loss_fn,
+            " | min_snr_gamma_flow ", run_cfg.levers.min_snr_gamma_flow,
+            " | optimizer ", run_cfg.levers.optimizer,
+            " | ema_enabled ", run_cfg.levers.ema_enabled,
+            " | caption_dropout_prob ", run_cfg.levers.caption_dropout_prob,
+        )
 
     var ctx = DeviceContext()
     var summary = train_ideogram4_lora_from_cache[NT, GH, GW](cfg, run_cfg, ctx)

@@ -153,3 +153,153 @@ def _l1_sum(x: Tensor, ctx: DeviceContext) raises -> Float32:
         else:
             s += v
     return s
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# T1.C OPTIMIZER LEVERS BRIDGE (TIER1_PARITY_CAMPAIGN_2026-06-11.md).
+#
+# serenitymojo's levers optimizers (adafactor / schedule-free AdamW,
+# training/levers.mojo levers_optimizer_step_host) step HOST
+# serenitymojo.training.train_step.LoraAdapter mirrors (List[BFloat16] a/b),
+# while ideogram4's adapters are DEVICE Tensors (module/LoRAModule.LoraAdapter
+# inside Ideogram4LoraSet) stepped in place by the fused adamw_step above. The
+# structs do not match, so this bridge implements the documented
+# adapter-mirror host path:
+#   lazy init (step 1): download every device a/b into a host mirror set
+#   per step:           grads D2H -> levers_optimizer_step_host on the mirrors
+#                       -> RNE-bf16 mirrors re-uploaded into the LoraSet's
+#                          device tensors (Tensor.from_host_bf16, the same
+#                          host->device construction the LoRA loader uses)
+# The mirrors stay authoritative for params while the lever is active (the
+# device AdamW never runs), so no per-step download is needed after init.
+# Correctness over speed: ~2 H2D/D2H sweeps of the 204-adapter set per step.
+#
+# DEFAULT-OFF CONTRACT (C13): the trainer seam is
+#   `if levers_optimizer_active(lcfg): ideogram4_levers_optimizer_step(...)
+#    else: <the existing literal apply_ideogram4_lora_grads call>`
+# — optimizer=ADAMW (the config default) never enters this section.
+#
+# RESUME: levers optimizer state has no save/resume sidecar (levers.mojo T1.C
+# header) — levers_optimizer_step_host fails loud when its first call arrives
+# at k != 1, which covers ideogram4 resume runs.
+# ══════════════════════════════════════════════════════════════════════════════
+
+from serenitymojo.training.train_step import LoraAdapter as SmLoraAdapter
+from serenitymojo.training.levers import (
+    LeversOptimizerState,
+    levers_optimizer_active,
+    levers_optimizer_step_host,
+)
+from serenitymojo.training.train_config import TrainConfig as LeversConfig
+
+
+struct Ideogram4LeversBridge(Movable):
+    """Host mirror set + levers optimizer state for one train run. Also the
+    EMA tracking target (training/lora_ema.mojo wants the same host-mirror
+    shape): with the default AdamW the driver refreshes the mirrors from
+    device after each step; with a levers optimizer they are already live."""
+
+    var mirrors: List[SmLoraAdapter]
+    var mirrors_inited: Bool
+    var opt_st: LeversOptimizerState
+
+    def __init__(out self):
+        self.mirrors = List[SmLoraAdapter]()
+        self.mirrors_inited = False
+        self.opt_st = LeversOptimizerState()
+
+
+def ideogram4_levers_mirrors_init(
+    mut bridge: Ideogram4LeversBridge,
+    loras: Ideogram4LoraSet,
+    ctx: DeviceContext,
+) raises:
+    """Download the device LoRA set into fresh host mirrors (bf16-exact:
+    device bf16 -> F32 upcast -> the SmLoraAdapter ctor's RNE bf16 re-round is
+    the identity on bf16-representable values). Adam moment lists are left
+    EMPTY — the levers optimizers and lora_ema only touch a/b/shape fields."""
+    if bridge.mirrors_inited:
+        return
+    for i in range(len(loras.ad)):
+        var a_sh = loras.ad[i][].a.shape()   # [rank, in]
+        var b_sh = loras.ad[i][].b.shape()   # [out, rank]
+        var rank = loras.ad[i][].rank
+        if len(a_sh) != 2 or len(b_sh) != 2 or a_sh[0] != rank or b_sh[1] != rank:
+            raise Error(
+                String("ideogram4_levers_mirrors_init: adapter ") + String(i)
+                + String(" has unexpected a/b shape")
+            )
+        bridge.mirrors.append(
+            SmLoraAdapter(
+                loras.ad[i][].a.to_host(ctx),
+                loras.ad[i][].b.to_host(ctx),
+                rank, a_sh[1], b_sh[0],
+                loras.ad[i][].scale(),
+                List[Float32](), List[Float32](),
+                List[Float32](), List[Float32](),
+            )
+        )
+    bridge.mirrors_inited = True
+
+
+def ideogram4_levers_refresh_mirrors(
+    mut bridge: Ideogram4LeversBridge,
+    loras: Ideogram4LoraSet,
+    ctx: DeviceContext,
+) raises:
+    """Re-pull the live device a/b into the host mirrors (verbatim bf16).
+    Needed each step ONLY on the default fused-AdamW path when EMA is on —
+    the levers optimizer path keeps the mirrors authoritative itself."""
+    if not bridge.mirrors_inited or len(bridge.mirrors) != len(loras.ad):
+        raise Error("ideogram4_levers_refresh_mirrors: mirrors not initialized")
+    for i in range(len(loras.ad)):
+        bridge.mirrors[i].a = loras.ad[i][].a.to_host_bf16(ctx)
+        bridge.mirrors[i].b = loras.ad[i][].b.to_host_bf16(ctx)
+
+
+def ideogram4_levers_optimizer_step(
+    lcfg: LeversConfig,
+    loras: Ideogram4LoraSet,
+    mut bridge: Ideogram4LeversBridge,
+    grads: Ideogram4StackLoraGrads,
+    k: Int,
+    step_lr: Float32,
+    ctx: DeviceContext,
+) raises -> Float32:
+    """The ONE ideogram4 call for the T1.C optimizer lever: host
+    adafactor/schedule-free step over ALL adapters' mirrors, then re-upload
+    into the LoraSet's live device tensors. step_lr = the trainer-scheduled lr
+    (ideogram4 has no LR scheduler -> the constant cfg.learning_rate; the
+    schedule-free path ignores it and uses lcfg.lr per the levers contract).
+    Returns the post-step LoRA-B |.|_1 (host, for the progress summary).
+    Call ONLY when levers_optimizer_active(lcfg) (C13)."""
+    ideogram4_levers_mirrors_init(bridge, loras, ctx)
+    if len(grads.d_a) != len(bridge.mirrors) or len(grads.d_b) != len(bridge.mirrors):
+        raise Error("ideogram4_levers_optimizer_step: grad/mirror count mismatch")
+
+    var d_a_h = List[List[Float32]]()
+    var d_b_h = List[List[Float32]]()
+    for i in range(len(bridge.mirrors)):
+        d_a_h.append(grads.d_a[i][].to_host(ctx))
+        d_b_h.append(grads.d_b[i][].to_host(ctx))
+
+    levers_optimizer_step_host(
+        lcfg, bridge.mirrors, d_a_h, d_b_h, k, step_lr,
+        0, len(bridge.mirrors), bridge.opt_st,
+    )
+
+    var b_l1 = Float32(0.0)
+    for i in range(len(bridge.mirrors)):
+        loras.ad[i][].a = Tensor.from_host_bf16(
+            bridge.mirrors[i].a, loras.ad[i][].a.shape(), ctx
+        )
+        loras.ad[i][].b = Tensor.from_host_bf16(
+            bridge.mirrors[i].b, loras.ad[i][].b.shape(), ctx
+        )
+        for j in range(len(bridge.mirrors[i].b)):
+            var v = bridge.mirrors[i].b[j].cast[DType.float32]()
+            if v < Float32(0.0):
+                b_l1 -= v
+            else:
+                b_l1 += v
+    return b_l1
