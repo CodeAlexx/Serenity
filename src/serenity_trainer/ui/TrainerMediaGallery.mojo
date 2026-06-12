@@ -13,6 +13,9 @@ from serenity_trainer.ui.TrainerRuntimeBridge import TrainerUIRuntime
 
 struct TrainerMediaGalleryState(Movable):
     var preview_textures_loaded: Bool
+    # Throttle for the in-training sample-gallery rescan (frames since the
+    # last sample-dir scan; ~180 frames = ~3 s at 60 fps).
+    var sample_refresh_frames: Int32
     var active_preview_texture: UInt32
     var active_preview_width: Int32
     var active_preview_height: Int32
@@ -40,6 +43,7 @@ struct TrainerMediaGalleryState(Movable):
 
     def __init__(out self):
         self.preview_textures_loaded = False
+        self.sample_refresh_frames = 0
         self.active_preview_texture = UInt32(0)
         self.active_preview_width = 0
         self.active_preview_height = 0
@@ -411,6 +415,49 @@ def clear_preview_galleries(mut media_state: TrainerMediaGalleryState):
     media_state = TrainerMediaGalleryState()
 
 
+def _sync_runtime_samples(media_state: TrainerMediaGalleryState, mut rt: TrainerUIRuntime):
+    # Keep the status-rail / logs-tab "Samples" surface fed from the scanned
+    # sample gallery (rt.samples was never populated anywhere before).
+    rt.samples = List[String]()
+    for i in range(len(media_state.sample_preview_paths)):
+        rt.samples.append(media_state.sample_preview_paths[i].copy())
+
+
+def _refresh_sample_gallery(
+    mut media_state: TrainerMediaGalleryState,
+    cfg: TrainerUIConfig,
+    mut rt: TrainerUIRuntime,
+):
+    """Rescan the sample dir and rebuild the sample gallery iff the media
+    file count changed (new training samples landed). The cheap rescan runs
+    throttled from load_preview_textures; the texture rebuild only happens
+    on an actual change."""
+    if cfg.sample_output_dir.byte_length() == 0:
+        return
+    try:
+        var media = Backend.scan_media_files(cfg.sample_output_dir.copy(), True, 4096)
+        if len(media) == len(media_state.sample_preview_paths):
+            return
+        _destroy_texture_list(media_state.sample_preview_textures)
+        media_state.sample_preview_textures = List[UInt32]()
+        media_state.sample_preview_widths = List[Int32]()
+        media_state.sample_preview_heights = List[Int32]()
+        media_state.sample_preview_titles = List[String]()
+        media_state.sample_preview_subtitles = List[String]()
+        media_state.sample_preview_paths = List[String]()
+        media_state.sample_preview_is_videos = List[Bool]()
+        var count = _load_sample_gallery(media_state, cfg)
+        _sync_runtime_samples(media_state, rt)
+        rt.logs.append(
+            String("sample gallery refreshed: ")
+            + String(count)
+            + String(" files in ")
+            + cfg.sample_output_dir.copy()
+        )
+    except e:
+        rt.logs.append(String("sample gallery refresh failed: ") + String(e))
+
+
 def load_preview_textures(
     mut media_state: TrainerMediaGalleryState,
     cfg: TrainerUIConfig,
@@ -418,6 +465,16 @@ def load_preview_textures(
 ):
     var source_key = cfg.dataset_path.copy() + String("\n") + cfg.sample_output_dir.copy()
     if media_state.preview_textures_loaded and media_state.preview_source_path == source_key:
+        # Pick up NEW sample images written during/after training: throttled
+        # count-only rescan (~3 s). Skipped while a lightbox preview is open
+        # so the active texture is never destroyed under it.
+        media_state.sample_refresh_frames = media_state.sample_refresh_frames + 1
+        if (
+            media_state.sample_refresh_frames >= 180
+            and media_state.active_preview_texture == UInt32(0)
+        ):
+            media_state.sample_refresh_frames = 0
+            _refresh_sample_gallery(media_state, cfg, rt)
         return
     if media_state.preview_textures_loaded:
         clear_preview_galleries(media_state)
@@ -426,6 +483,7 @@ def load_preview_textures(
         if _load_scanned_gallery(media_state, cfg):
             media_state.preview_textures_loaded = True
             media_state.preview_source_path = source_key.copy()
+            _sync_runtime_samples(media_state, rt)
             rt.logs.append(
                 String("loaded media galleries: ")
                 + String(len(media_state.dataset_preview_textures))

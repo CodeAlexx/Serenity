@@ -377,6 +377,8 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
         + mkdirs
         + String("rm -f ")
         + _shell_quote(_pid_path(target.copy()))
+        + String(" ")
+        + _shell_quote(_term_pid_path(target.copy()))
         + String(" && bash ")
         + String(TERMINAL_LAUNCHER)
         + String(" ")
@@ -398,23 +400,45 @@ def _any_live_runner_active() -> Bool:
 
 
 def _owned_live_runner_active(target: String) -> Bool:
+    # kill -0 alone false-positives on a RECYCLED pid from a stale pidfile
+    # (wrapper SIGKILL/logout paths can leave the pidfile behind), which
+    # blocks every future launch with "Trainer already running" and no
+    # terminal. Require the pid's cmdline to actually be this runner.
     var rc = _sys_system(
         String("pid=$(cat ")
         + _shell_quote(_pid_path(target.copy()))
         + String(" 2>/dev/null); [ -n \"$pid\" ] && kill -0 \"$pid\" 2>/dev/null")
+        + String(" && grep -aq ")
+        + _shell_quote(_runner_path(target.copy()))
+        + String(" \"/proc/$pid/cmdline\" 2>/dev/null")
     )
     return rc == 0
 
 
+def _term_pid_path(target: String) -> String:
+    # Terminal-wrapper pid written by scripts/serenity_terminal_launcher.sh's
+    # run script ("$pidfile.term"). TERMing the WRAPPER is what closes the
+    # gnome-terminal window: its trap kills the runner and exits. The runner
+    # pid alone cannot close the window — the runner shares the wrapper's
+    # process group, so the old group-kill on the runner pid always failed
+    # and the window lingered at a "Press Enter" prompt (measured 2026-06-11).
+    return _pid_path(target.copy()) + String(".term")
+
+
 def _stop_live_runner(target: String) -> Bool:
+    var pid_q = _shell_quote(_pid_path(target.copy()))
+    var term_q = _shell_quote(_term_pid_path(target.copy()))
     var rc = _sys_system(
-        String("pid=$(cat ")
-        + _shell_quote(_pid_path(target.copy()))
-        + String(" 2>/dev/null); if [ -n \"$pid\" ]; then ")
-        + String("kill -TERM -- -\"$pid\" 2>/dev/null || kill -TERM \"$pid\" 2>/dev/null; ")
-        + String("rm -f ")
-        + _shell_quote(_pid_path(target.copy()))
-        + String("; else exit 1; fi")
+        String("term=$(cat ") + term_q + String(" 2>/dev/null); ")
+        + String("pid=$(cat ") + pid_q + String(" 2>/dev/null); ")
+        + String("ok=1; ")
+        # Preferred: TERM the terminal wrapper — its trap stops the runner
+        # AND closes the terminal window.
+        + String("if [ -n \"$term\" ] && kill -TERM \"$term\" 2>/dev/null; then ok=0; fi; ")
+        # Fallback (wrapper already gone / legacy launch): TERM the runner.
+        + String("if [ -n \"$pid\" ] && kill -TERM \"$pid\" 2>/dev/null; then ok=0; fi; ")
+        + String("rm -f ") + pid_q + String(" ") + term_q + String("; ")
+        + String("exit $ok")
     )
     return rc == 0
 
@@ -431,7 +455,12 @@ def _record_live_runner_exit(mut rt: TrainerUIRuntime):
         _ = _apply_progress_text_from(rt, text.copy(), 0)
     except:
         pass
-    _ = _sys_system(String("rm -f ") + _shell_quote(_pid_path(rt.backend_target.copy())))
+    _ = _sys_system(
+        String("rm -f ")
+        + _shell_quote(_pid_path(rt.backend_target.copy()))
+        + String(" ")
+        + _shell_quote(_term_pid_path(rt.backend_target.copy()))
+    )
 
 
 def _write_runner_train_config(cfg: TrainerUIConfig) raises -> String:
@@ -1072,9 +1101,15 @@ def trainer_ui_tick_and_apply(mut rt: TrainerUIRuntime):
         trainer_ui_refresh_system_metrics(rt)
     if not rt.has_running or rt.paused:
         return
-    if trainer_ui_poll_progress_file(rt):
-        return
-    if rt.live_launch_enabled and rt.start_time > 0.0:
+    # Throttle bridge I/O off the 60 Hz render thread:
+    # - the progress poll re-reads the WHOLE progress file (tee'd full trainer
+    #   stdout, grows monotonically) — at 60 Hz that is O(file bytes) per
+    #   frame; a ~100 ms cadence is plenty for the live rail.
+    # - the liveness probe forks a shell (cat + kill -0 + grep) — 1 Hz.
+    if rt.frame_counter % 6 == 0:
+        if trainer_ui_poll_progress_file(rt):
+            return
+    if rt.live_launch_enabled and rt.start_time > 0.0 and rt.frame_counter == 30:
         var elapsed = perf_counter() - rt.start_time
         if elapsed > 3.0 and not _owned_live_runner_active(rt.backend_target.copy()):
             _record_live_runner_exit(rt)

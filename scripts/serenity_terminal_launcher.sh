@@ -15,8 +15,16 @@ pidfile="$3"
 logfile="$4"
 shift 4
 
+# Terminal-wrapper pid lives NEXT TO the runner pidfile. The UI stop path
+# TERMs the wrapper (its trap tears down the runner and exits, which closes
+# the gnome-terminal window); the runner pidfile alone cannot close the
+# terminal — the runner shares the wrapper's process group, so a group-kill
+# on the runner pid fails and the wrapper used to linger at a read prompt
+# forever (the "trainer closed but terminal stays open" bug).
+termpidfile="$pidfile.term"
+
 mkdir -p "$root/target" "$(dirname "$logfile")"
-rm -f "$pidfile" "$logfile"
+rm -f "$pidfile" "$termpidfile" "$logfile"
 
 cat > "$terminal_script" <<'EOS'
 #!/usr/bin/env bash
@@ -29,8 +37,11 @@ backend_label="$4"
 runner="$5"
 shift 5
 
+termpidfile="$pidfile.term"
+
 cd "$root"
 rm -f "$pidfile"
+echo "$$" > "$termpidfile"
 
 echo "Serenity ${backend_label} trainer"
 echo "Working dir: $root"
@@ -43,22 +54,30 @@ child="$!"
 echo "$child" > "$pidfile"
 
 stop_child() {
+    # UI Stop / window close / logout: kill the runner, clean up, and exit
+    # immediately so the terminal window closes (no "Press Enter" hold).
     if [ -n "${child:-}" ]; then
         kill -TERM "$child" 2>/dev/null || true
         wait "$child" 2>/dev/null || true
     fi
-    rm -f "$pidfile"
+    rm -f "$pidfile" "$termpidfile"
     exit 143
 }
 
-trap stop_child TERM INT
+trap stop_child TERM INT HUP
+
 wait "$child"
 status="$?"
 rm -f "$pidfile"
 
 echo
 echo "Serenity ${backend_label} trainer exited with status $status"
-read -r -p "Press Enter to close terminal..."
+if [ "$status" -ne 0 ]; then
+    # Keep failures visible for 30s, then close anyway (full output is in
+    # $logfile either way). Successful/stopped runs close immediately.
+    read -r -t 30 -p "Trainer failed (status $status); closing in 30s, Enter to close now..." || true
+fi
+rm -f "$termpidfile"
 exit "$status"
 EOS
 chmod +x "$terminal_script"
@@ -86,3 +105,20 @@ env -i \
             "$backend_label" \
             "$runner" \
             "$@"
+
+# gnome-terminal hands the spawn to gnome-terminal-server over D-Bus and
+# returns immediately — rc 0 does NOT mean the wrapper started. Wait for the
+# runner pidfile so a silent spawn failure surfaces as a nonzero rc in the UI
+# ("training started but no terminal ever opened" bug). 20s budget covers a
+# loaded desktop; idle spawn is < 1s.
+for _ in $(seq 1 200); do
+    # pidfile = runner registered; logfile = the wrapper's tee opened it the
+    # instant the runner spawned (covers an instant-exit runner that already
+    # removed its pidfile again).
+    if [ -s "$pidfile" ] || [ -e "$logfile" ]; then
+        exit 0
+    fi
+    sleep 0.1
+done
+echo "serenity_terminal_launcher: terminal did not start the runner within 20s" >&2
+exit 1
