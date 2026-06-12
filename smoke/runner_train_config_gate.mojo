@@ -15,7 +15,7 @@ from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import (
     LOSS_FN_MSE, LOSS_FN_HUBER, LOSS_FN_SMOOTH_L1,
     TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
-    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW,
+    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_ADAMW_8BIT,
 )
 
 
@@ -275,6 +275,20 @@ def _gate_optimizer_runner() raises:
            String("optimizer=") + String(c2.optimizer))
     _check(String("optimizer-schedulefree"), c2.optimizer_warmup_steps == 25,
            String("optimizer_warmup_steps=") + String(c2.optimizer_warmup_steps))
+
+    # flipped: ADAMW8BIT (dropdown index 0) — T2.A: optimizer_runner_value
+    # maps the UI label to the runner enum ADAMW_8BIT (bnb block-wise 8-bit
+    # AdamW, serenitymojo training/adamw8bit.mojo via the levers dispatch)
+    ui.optimizer_index = 0
+    var json8 = trainer_ui_runner_train_config_json(ui)
+    var p8 = String("/tmp/serenity_ui_optimizer_adamw8bit_gate.json")
+    var f8 = open(p8.copy(), "w")
+    f8.write(json8)
+    f8.close()
+    var c8 = read_model_config(p8.copy())
+    _check(String("optimizer-adamw8bit"),
+           c8.optimizer == TRAIN_OPTIMIZER_ADAMW_8BIT,
+           String("optimizer=") + String(c8.optimizer))
 
     # unsupported dropdown value (CAME, index 2) fails loud at config load
     ui.optimizer_index = 2

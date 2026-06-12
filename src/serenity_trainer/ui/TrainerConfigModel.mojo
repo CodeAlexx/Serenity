@@ -676,14 +676,19 @@ struct TrainerUIConfig(Movable):
         return self.optimizer_options[Int(self.optimizer_index)].copy()
 
     def optimizer_runner_value(self) -> String:
-        """T1.C: the optimizer enum string emitted into the RUNNER train
+        """T1.C/T2.A: the optimizer enum string emitted into the RUNNER train
         config (serenitymojo io/train_config_reader.mojo _optimizer_int).
         The dropdown labels ADAMW / ADAFACTOR / SCHEDULE_FREE_ADAMW map
-        verbatim; everything else (ADAMW8BIT / CAME / MUON) is passed
+        verbatim; ADAMW8BIT maps to the runner enum ADAMW_8BIT (T2.A: bnb
+        block-wise 8-bit AdamW, serenitymojo training/adamw8bit.mojo via the
+        levers optimizer dispatch); everything else (CAME / MUON) is passed
         through UNCHANGED so the runner FAILS LOUD at config load with the
         supported list instead of silently training AdamW (the pre-T1.C
         behavior, when the runner config carried no optimizer tag at all)."""
-        return self.optimizer_label()
+        var label = self.optimizer_label()
+        if label == String("ADAMW8BIT"):
+            return String("ADAMW_8BIT")
+        return label^
 
     def scheduler_label(self) -> String:
         return self.scheduler_options[Int(self.scheduler_index)].copy()
