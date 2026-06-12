@@ -48,7 +48,9 @@ def render_dataset_tab(
     _ = edit_row(ctx, label_w, val_w, String("Dataset Path"), String("dataset_path"), cfg.dataset_path, dataset_path_edit)
     field_row(ctx, label_w, val_w, String("Concept File"), cfg.concept_file_name.copy())
     _ = select_string_row(ctx, label_w, val_w, String("Resolution"), String("dataset_resolution"), cfg.resolution_options, cfg.resolution, cfg.select_open_id)
-    _ = toggle_row(ctx, label_w, val_w, String("Aspect Buckets"), String("Enabled"), cfg.aspect_ratio_bucketing)
+    # Capability honesty (UI wave 2): no runner consumes this toggle —
+    # bucketing is baked into the prepared caches. Snapshot-only.
+    _ = toggle_row(ctx, label_w, val_w, String("Aspect Buckets [not wired]"), String("Enabled"), cfg.aspect_ratio_bucketing)
     _ = toggle_row(ctx, label_w, val_w, String("Latent Caching"), String("Enabled"), cfg.latent_caching)
     _ = toggle_row(ctx, label_w, val_w, String("Clear Cache"), String("Before training"), cfg.clear_cache_before_training)
     end_form_panel(ctx)

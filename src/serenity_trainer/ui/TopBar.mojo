@@ -5,7 +5,11 @@ from mojoui.core.textedit import TextEditState
 from mojoui.widgets.app_shell import action_button
 from mojoui.widgets.basic import label
 from mojoui.widgets.text_edit import text_edit
-from serenity_trainer.ui.TrainerConfigModel import TrainerUIConfig, trainer_ui_validate
+from serenity_trainer.ui.TrainerConfigModel import (
+    TrainerUIConfig,
+    trainer_ui_ignored_lever_summary,
+    trainer_ui_validate,
+)
 from serenity_trainer.ui.TrainerRuntimeBridge import (
     TrainerUIRuntime,
     trainer_ui_cancel,
@@ -62,17 +66,27 @@ def render_top_bar(
     if validation_w < 360:
         validation_w = 360
     ctx.layout_row(row4(validation_w, pause_w, sample_w, save_w), ctx.theme.row_height)
-    label(ctx, String("VALIDATION - ") + trainer_ui_validate(cfg))
+    # Capability-table honesty banner: any non-default widget the selected
+    # model's runner does not consume is named HERE, before launch, every
+    # frame — no widget may silently lie.
+    var ignored = trainer_ui_ignored_lever_summary(cfg)
+    if ignored.byte_length() > 0:
+        label(ctx, String("VALIDATION - ") + trainer_ui_validate(cfg) + String("  |  WARNING ") + ignored)
+    else:
+        label(ctx, String("VALIDATION - ") + trainer_ui_validate(cfg))
+    # Pause/Sample-now append to the command file, but NO trainer reads it
+    # yet (wave-3 command-file protocol). Marked so the buttons cannot lie:
+    # "Paused" is UI state only; the trainer keeps running.
     if rt.has_running:
         if rt.paused:
-            if action_button(ctx, String("resume"), String("Resume"), False):
+            if action_button(ctx, String("resume"), String("Resume [not wired]"), False):
                 _ = trainer_ui_resume(rt)
         else:
-            if action_button(ctx, String("pause"), String("Pause"), False):
+            if action_button(ctx, String("pause"), String("Pause [not wired]"), False):
                 _ = trainer_ui_pause(rt)
     else:
         label(ctx, String(""))
-    if action_button(ctx, String("sample_now"), String("Sample now"), False):
+    if action_button(ctx, String("sample_now"), String("Sample [not wired]"), False):
         _ = trainer_ui_sample_now(rt)
     if action_button(ctx, String("save_now"), String("Save checkpoint"), False):
         _ = trainer_ui_save_checkpoint_now(cfg, rt)

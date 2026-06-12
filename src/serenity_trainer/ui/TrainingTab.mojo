@@ -60,19 +60,36 @@ def render_training_tab(mut ctx: Context, mut cfg: TrainerUIConfig, content_w: I
     _ = slider_row(ctx, label_w, val_w, String("Local Batch"), String("batch_size"), cfg.batch_size, 1.0, 16.0)
     _ = slider_row(ctx, label_w, val_w, String("Accum Steps"), String("gradient_accumulation_steps"), cfg.gradient_accumulation_steps, 1.0, 16.0)
     _ = drag_row(ctx, label_w, compact_w, String("Warmup"), String("warmup_steps"), cfg.learning_rate_warmup_steps, 10.0)
+    if cfg.learning_rate_warmup_steps < 0.0:
+        cfg.learning_rate_warmup_steps = 0.0
     _ = drag_row(ctx, label_w, compact_w, String("LR Min Factor"), String("learning_rate_min_factor"), cfg.learning_rate_min_factor, 0.01)
     _ = drag_row(ctx, label_w, compact_w, String("LR Cycles"), String("learning_rate_cycles"), cfg.learning_rate_cycles, 0.1)
     _ = select_string_row(ctx, label_w, val_w, String("LR Scaler"), String("learning_rate_scaler"), cfg.lr_scaler_options, cfg.learning_rate_scaler, cfg.select_open_id)
     _ = drag_row(ctx, label_w, compact_w, String("Seed"), String("seed"), cfg.seed, 1.0)
-    field_row(ctx, label_w, val_w, String("Live Steps"), String("max train steps"))
+    if cfg.seed < 0.0:
+        cfg.seed = 0.0
+    # max_train_steps was a display-only row ("max train steps" literal) —
+    # now the real editable field. Every runner takes steps from this value
+    # (config runners argv 2, hidream argv 2, ideogram4 argv 5) plus the
+    # max_steps key in the runner config JSON.
+    _ = drag_row(ctx, label_w, compact_w, String("Max Steps"), String("max_train_steps"), cfg.max_train_steps, 50.0)
+    if cfg.max_train_steps < 1.0:
+        cfg.max_train_steps = 1.0
     end_form_panel(ctx)
 
     begin_form_panel(ctx, String("OPTIMIZER"), String("Optimizer, scheduler, learning rates"), ctx.theme.padding)
     _ = select_index_row(ctx, label_w, val_w, String("Optimizer"), String("optimizer"), cfg.optimizer_options, cfg.optimizer_index, cfg.select_open_id)
     _ = select_index_row(ctx, label_w, val_w, String("Scheduler"), String("scheduler"), cfg.scheduler_options, cfg.scheduler_index, cfg.select_open_id)
     _ = drag_row(ctx, label_w, compact_w, String("Learning Rate"), String("learning_rate"), cfg.learning_rate, 0.00001)
+    # drag_value has no clamping — a scrub past zero must not emit lr <= 0.
+    if cfg.learning_rate < 0.000001:
+        cfg.learning_rate = 0.000001
     _ = drag_row(ctx, label_w, compact_w, String("Text Enc LR"), String("text_encoder_learning_rate"), cfg.text_encoder_learning_rate, 0.00001)
+    if cfg.text_encoder_learning_rate < 0.0:
+        cfg.text_encoder_learning_rate = 0.0
     _ = drag_row(ctx, label_w, compact_w, String("Transformer LR"), String("transformer_learning_rate"), cfg.transformer_learning_rate, 0.00001)
+    if cfg.transformer_learning_rate < 0.0:
+        cfg.transformer_learning_rate = 0.0
     _ = drag_row(ctx, label_w, compact_w, String("Weight Decay"), String("weight_decay"), cfg.weight_decay, 0.001)
     _ = drag_row(ctx, label_w, compact_w, String("Clip Grad"), String("clip_grad_norm"), cfg.clip_grad_norm, 0.1)
     end_form_panel(ctx)
@@ -135,7 +152,10 @@ def render_training_tab(mut ctx: Context, mut cfg: TrainerUIConfig, content_w: I
     field_row(ctx, label_w, val_w, String("Prediction"), String("flow matching"))
     end_form_panel(ctx)
 
-    begin_form_panel(ctx, String("MASKED TRAINING"), String("Mask weighting and custom conditioning"), ctx.theme.padding)
+    # Capability honesty (UI wave 2): NO runner consumes masked-training —
+    # the widgets are snapshot-only and excluded from every runner emission.
+    # The [not wired] suffix + capability-table warning keep them from lying.
+    begin_form_panel(ctx, String("MASKED TRAINING [not wired]"), String("No runner consumes these yet - excluded from launch config"), ctx.theme.padding)
     _ = toggle_row(ctx, label_w, val_w, String("Masked"), String("Enabled"), cfg.masked_training)
     _ = slider_row(ctx, label_w, val_w, String("Unmasked Prob"), String("unmasked_probability"), cfg.unmasked_probability, 0.0, 1.0)
     _ = slider_row(ctx, label_w, val_w, String("Unmasked Weight"), String("unmasked_weight"), cfg.unmasked_weight, 0.0, 2.0)
@@ -174,6 +194,8 @@ def render_training_tab(mut ctx: Context, mut cfg: TrainerUIConfig, content_w: I
     _ = select_string_row(ctx, label_w, val_w, String("Preset"), String("layer_filter_preset"), cfg.layer_filter_preset_options, cfg.layer_filter_preset, cfg.select_open_id)
     field_row(ctx, label_w, val_w, String("Filter"), cfg.layer_filter.copy())
     _ = toggle_row(ctx, label_w, val_w, String("Regex"), String("Enabled"), cfg.layer_filter_regex)
-    _ = select_string_row(ctx, label_w, val_w, String("PEFT"), String("peft_type_training"), cfg.peft_options, cfg.peft_type, cfg.select_open_id)
+    # PEFT selector is decorative: adapter_algo is never emitted to any
+    # runner (UI always trains plain LoRA). Marked until LoKr/LoHa/OFT land.
+    _ = select_string_row(ctx, label_w, val_w, String("PEFT [LORA only]"), String("peft_type_training"), cfg.peft_options, cfg.peft_type, cfg.select_open_id)
     field_row(ctx, label_w, val_w, String("Target"), String("transformer blocks"))
     end_form_panel(ctx)

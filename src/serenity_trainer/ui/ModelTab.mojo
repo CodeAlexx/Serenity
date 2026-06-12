@@ -52,7 +52,10 @@ def render_model_tab(
     var val_w = value_w(cw - ctx.theme.padding * 2, label_w)
     ctx.layout_row(row2(cw, cw), _panel_h(ctx, 7))
     begin_form_panel(ctx, String("BASE MODEL"), String("Method, architecture, and checkpoint"), ctx.theme.padding)
-    _ = select_index_row(ctx, label_w, val_w, String("Train Method"), String("training_method"), cfg.training_method_options, cfg.training_method_index, cfg.select_open_id)
+    # Capability honesty (UI wave 2): every wired runner trains LoRA only —
+    # "Fine Tune"/"Embedding" reach no runner (snapshot label only). The
+    # capability-table warning names training_method when non-default.
+    _ = select_index_row(ctx, label_w, val_w, String("Train Method [LoRA only]"), String("training_method"), cfg.training_method_options, cfg.training_method_index, cfg.select_open_id)
     var model_changed = select_index_row(ctx, label_w, val_w, String("Model Type"), String("model_type"), cfg.model_type_options, cfg.model_type_index, cfg.select_open_id)
     var arch_changed = select_index_row(ctx, label_w, val_w, String("Architecture"), String("architecture"), cfg.architecture_options, cfg.architecture_index, cfg.select_open_id)
     if model_changed or arch_changed:

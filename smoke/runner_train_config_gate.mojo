@@ -11,6 +11,7 @@ from serenity_trainer.ui.TrainerConfigModel import (
     trainer_ui_apply_model_preset,
     trainer_ui_ideogram4_levers_path_or_skip,
     trainer_ui_ideogram4_levers_set,
+    trainer_ui_ignored_lever_summary,
     trainer_ui_runner_train_config_json,
 )
 from serenitymojo.io.train_config_reader import read_model_config
@@ -390,6 +391,112 @@ def _gate_hidream() raises:
            String("raised=") + String(raised))
 
 
+def _gate_klein_levers() raises:
+    # Klein lever delivery (UI wave 2): klein is config-driven via
+    # serenitymojo train_klein_real (`<config.json> <steps>`), which CONSUMES
+    # loss_fn/min_snr_gamma_flow/optimizer/EMA/caption_dropout from the
+    # config JSON. Default emission keeps every lever OFF (C13); flipped
+    # widgets land in TrainConfig; unsupported optimizers fail loud.
+    var ui = TrainerUIConfig()
+    ui.model_type_index = 1  # FLUX_2 -> klein preset
+    trainer_ui_apply_model_preset(ui, True)
+    _check(String("klein-preset"), ui.backend_target == String("klein"),
+           String("backend_target=") + ui.backend_target.copy())
+
+    var json0 = trainer_ui_runner_train_config_json(ui)
+    var p0 = String("/tmp/serenity_ui_klein_levers_default_gate.json")
+    var f0 = open(p0.copy(), "w")
+    f0.write(json0)
+    f0.close()
+    var c0 = read_model_config(p0.copy())
+    _check(String("klein-default"), c0.name == String("klein"),
+           String("model_type=") + c0.name.copy())
+    _check(String("klein-default"), c0.loss_fn == LOSS_FN_MSE,
+           String("loss_fn=") + String(c0.loss_fn))
+    _check(String("klein-default"), _close32(c0.min_snr_gamma_flow, Float32(0.0)),
+           String("min_snr_gamma_flow=") + String(c0.min_snr_gamma_flow))
+    _check(String("klein-default"), c0.optimizer == TRAIN_OPTIMIZER_ADAMW,
+           String("optimizer=") + String(c0.optimizer))
+    _check(String("klein-default"), c0.optimizer_warmup_steps == 0,
+           String("optimizer_warmup_steps=") + String(c0.optimizer_warmup_steps))
+    _check(String("klein-default"), not c0.ema_enabled,
+           String("ema_enabled=") + String(c0.ema_enabled))
+    _check(String("klein-default"),
+           _close32(c0.caption_dropout_prob, Float32(0.0)),
+           String("caption_dropout_prob=") + String(c0.caption_dropout_prob))
+    # arch dims verbatim from serenitymojo/configs/klein9b.json — these are
+    # exactly what validate_klein_train_config re-asserts at trainer startup.
+    _check(String("klein-default"), c0.d_model == 4096,
+           String("inner_dim=") + String(c0.d_model))
+    _check(String("klein-default"), c0.num_double == 8 and c0.num_single == 24,
+           String("double=") + String(c0.num_double) + String(" single=") + String(c0.num_single))
+    _check(String("klein-default"), c0.n_heads == 32 and c0.head_dim == 128,
+           String("heads=") + String(c0.n_heads) + String(" head_dim=") + String(c0.head_dim))
+    _check(String("klein-default"),
+           c0.in_channels == 128 and c0.out_channels == 128,
+           String("in/out=") + String(c0.in_channels) + String("/") + String(c0.out_channels))
+    _check(String("klein-default"), c0.joint_attention_dim == 12288,
+           String("joint_attention_dim=") + String(c0.joint_attention_dim))
+    _check(String("klein-default"),
+           c0.checkpoint.endswith(String(".safetensors")),
+           String("checkpoint=") + c0.checkpoint.copy())
+    _check(String("klein-default"),
+           c0.validation_prompts_file != String(""),
+           String("validation_prompts_file=") + c0.validation_prompts_file.copy())
+
+    # flipped levers land in TrainConfig
+    ui.loss_fn = String("huber")
+    ui.huber_delta = 0.25
+    ui.min_snr_gamma_flow = 5.0
+    ui.ema_mode = String("EMA")
+    ui.ema_decay = 0.99
+    ui.ema_update_step_interval = 2.0
+    ui.caption_dropout = 0.1
+    ui.optimizer_index = 3  # ADAFACTOR
+    ui.learning_rate_warmup_steps = 25.0
+    var json1 = trainer_ui_runner_train_config_json(ui)
+    var p1 = String("/tmp/serenity_ui_klein_levers_flipped_gate.json")
+    var f1 = open(p1.copy(), "w")
+    f1.write(json1)
+    f1.close()
+    var c1 = read_model_config(p1.copy())
+    _check(String("klein-flipped"), c1.loss_fn == LOSS_FN_HUBER,
+           String("loss_fn=") + String(c1.loss_fn))
+    _check(String("klein-flipped"), _close32(c1.huber_delta, Float32(0.25)),
+           String("huber_delta=") + String(c1.huber_delta))
+    _check(String("klein-flipped"),
+           _close32(c1.min_snr_gamma_flow, Float32(5.0)),
+           String("min_snr_gamma_flow=") + String(c1.min_snr_gamma_flow))
+    _check(String("klein-flipped"), c1.ema_enabled,
+           String("ema_enabled=") + String(c1.ema_enabled))
+    _check(String("klein-flipped"), _close32(c1.ema_decay, Float32(0.99)),
+           String("ema_decay=") + String(c1.ema_decay))
+    _check(String("klein-flipped"), c1.ema_update_step_interval == 2,
+           String("ema_update_step_interval=") + String(c1.ema_update_step_interval))
+    _check(String("klein-flipped"),
+           _close32(c1.caption_dropout_prob, Float32(0.1)),
+           String("caption_dropout_prob=") + String(c1.caption_dropout_prob))
+    _check(String("klein-flipped"),
+           c1.optimizer == TRAIN_OPTIMIZER_ADAFACTOR,
+           String("optimizer=") + String(c1.optimizer))
+    _check(String("klein-flipped"), c1.optimizer_warmup_steps == 25,
+           String("optimizer_warmup_steps=") + String(c1.optimizer_warmup_steps))
+
+    # unsupported dropdown value (MUON, index 4) fails loud at config load
+    ui.optimizer_index = 4
+    var json2 = trainer_ui_runner_train_config_json(ui)
+    var p2 = String("/tmp/serenity_ui_klein_levers_muon_gate.json")
+    var f2 = open(p2.copy(), "w")
+    f2.write(json2)
+    f2.close()
+    var raised = False
+    try:
+        var _c2 = read_model_config(p2.copy())
+    except _e:
+        raised = True
+    _check(String("klein-muon-fails-loud"), raised, String("raised=") + String(raised))
+
+
 def _gate_ideogram4_levers() raises:
     # Ideogram4 lever delivery (Ideogram4LiveTrainer argv 10/11 contract):
     # default-off config -> levers_set False and argv 11 == "-" (skip
@@ -485,6 +592,115 @@ def _gate_ideogram4_levers() raises:
            String("argv10=") + String(ui_drop.caption_dropout))
 
 
+def _contains(text: String, token: String) -> Bool:
+    var tb = text.as_bytes()
+    var kb = token.as_bytes()
+    if len(kb) == 0:
+        return True
+    if len(tb) < len(kb):
+        return False
+    for i in range(len(tb) - len(kb) + 1):
+        var ok = True
+        for j in range(len(kb)):
+            if tb[i + j] != kb[j]:
+                ok = False
+                break
+        if ok:
+            return True
+    return False
+
+
+def _gate_capability_warnings() raises:
+    # UI wave 2 item 2: the capability table must name every non-default
+    # widget the selected model's runner does not consume — and stay SILENT
+    # on defaults (C13) and on fully-supported levers.
+    var def_cfg = TrainerUIConfig()  # klein defaults
+    _check(String("cap-default-silent"),
+           trainer_ui_ignored_lever_summary(def_cfg) == String(""),
+           String("summary='") + trainer_ui_ignored_lever_summary(def_cfg) + String("'"))
+
+    # chroma + optimizer/EMA/dropout flips -> all named (its trainer consumes
+    # none of them; measured zero ema_enabled/caption_dropout_prob/levers hits)
+    var ch = TrainerUIConfig()
+    ch.model_type_index = 4  # CHROMA_1
+    trainer_ui_apply_model_preset(ch, True)
+    ch.optimizer_index = 3  # ADAFACTOR
+    ch.ema_mode = String("EMA")
+    ch.caption_dropout = 0.1
+    ch.loss_fn = String("huber")
+    var s_ch = trainer_ui_ignored_lever_summary(ch)
+    _check(String("cap-chroma-named"),
+           _contains(s_ch, String("chroma ignores: "))
+           and _contains(s_ch, String("optimizer"))
+           and _contains(s_ch, String("ema"))
+           and _contains(s_ch, String("caption_dropout"))
+           and _contains(s_ch, String("loss_fn")),
+           String("summary='") + s_ch + String("'"))
+
+    # klein consumes all six levers -> same flips warn about NOTHING
+    var kl = TrainerUIConfig()
+    kl.model_type_index = 1  # FLUX_2 -> klein
+    trainer_ui_apply_model_preset(kl, True)
+    kl.optimizer_index = 3
+    kl.ema_mode = String("EMA")
+    kl.caption_dropout = 0.1
+    kl.loss_fn = String("huber")
+    kl.min_snr_gamma_flow = 5.0
+    kl.learning_rate_warmup_steps = 25.0
+    _check(String("cap-klein-silent"),
+           trainer_ui_ignored_lever_summary(kl) == String(""),
+           String("summary='") + trainer_ui_ignored_lever_summary(kl) + String("'"))
+
+    # decorative widgets are unsupported EVERYWHERE (masked / full-FT / PEFT)
+    kl.masked_training = True
+    kl.training_method_index = 1  # Fine Tune
+    kl.peft_type = String("LOKR")
+    var s_kl = trainer_ui_ignored_lever_summary(kl)
+    _check(String("cap-decorative-named"),
+           _contains(s_kl, String("klein ignores: "))
+           and _contains(s_kl, String("masked_training"))
+           and _contains(s_kl, String("training_method"))
+           and _contains(s_kl, String("peft_type")),
+           String("summary='") + s_kl + String("'"))
+
+    # zimage fully supported set stays silent too
+    var zi = TrainerUIConfig()
+    zi.model_type_index = 7
+    trainer_ui_apply_model_preset(zi, True)
+    zi.optimizer_index = 3
+    zi.ema_mode = String("EMA")
+    _check(String("cap-zimage-silent"),
+           trainer_ui_ignored_lever_summary(zi) == String(""),
+           String("summary='") + trainer_ui_ignored_lever_summary(zi) + String("'"))
+
+    # UI wave 2 item 3: decorative widgets are EXCLUDED from every runner
+    # emission — flipping them must not change the runner config at all
+    # (so they cannot silently no-op inside a launch).
+    var kl2 = TrainerUIConfig()
+    kl2.model_type_index = 1
+    trainer_ui_apply_model_preset(kl2, True)
+    var base_json = trainer_ui_runner_train_config_json(kl2)
+    kl2.masked_training = True
+    kl2.unmasked_probability = 0.5
+    kl2.training_method_index = 1
+    kl2.peft_type = String("LOKR")
+    kl2.aspect_ratio_bucketing = False
+    var flipped_json = trainer_ui_runner_train_config_json(kl2)
+    _check(String("decorative-excluded-klein"), base_json == flipped_json,
+           String("emission changed when only decorative widgets flipped"))
+    for token_i in range(4):
+        var token = String("masked")
+        if token_i == 1:
+            token = String("adapter_algo")
+        elif token_i == 2:
+            token = String("aspect")
+        elif token_i == 3:
+            token = String("peft")
+        _check(String("decorative-key-absent"),
+               not _contains(base_json, token.copy()),
+               String("token '") + token + String("' leaked into klein emission"))
+
+
 def main() raises:
     print("== runner train config gate ==")
     # model_type option indices: 4=CHROMA_1, 5=ERNIE_IMAGE, 6=ANIMA, 2=SDXL,
@@ -495,10 +711,14 @@ def main() raises:
     _gate_target(2, String("sdxl"), String("sdxl"), 0, 0, 0)
     _gate_target(7, String("zimage"), String("zimage"), 3840, 30, 30)
     _gate_target(8, String("l2p"), String("l2p"), 3840, 30, 30)
+    # klein (UI wave 2): model_type index 1 = FLUX_2 -> klein preset.
+    _gate_target(1, String("klein"), String("klein"), 4096, 24, 32)
+    _gate_klein_levers()
     _gate_zimage_loss_levers()
     _gate_caption_dropout_prob()
     _gate_ema()
     _gate_optimizer_runner()
     _gate_hidream()
     _gate_ideogram4_levers()
+    _gate_capability_warnings()
     print("ALL GATES PASS — UI runner train-config seam OK")

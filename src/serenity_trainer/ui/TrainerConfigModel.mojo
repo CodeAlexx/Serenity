@@ -17,6 +17,12 @@ comptime SERENITY_TRAINER_OUTPUT_DIR = "/home/alex/mojodiffusion/output"
 comptime SERENITY_BOXJANA_DATASET_DIR = "/home/alex/1/datasets/boxjana"
 comptime SERENITY_BOXJANA_KLEIN_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/alina_klein9b"  # was boxjana single-file (MISSING, 06-11 audit); alina = the engine-verified cache
 comptime SERENITY_KLEIN9B_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
+# Klein 9B config-driven runner (serenitymojo train_klein_real.mojo): the VAE
+# and PRECACHED sample-prompt config mirror serenitymojo/configs/klein9b.json
+# (the trainer's own default config; validate_klein_train_config re-asserts
+# every arch dim at startup).
+comptime SERENITY_KLEIN_VAE = "/home/alex/.serenity/models/vaes/flux2-vae.safetensors"
+comptime SERENITY_KLEIN_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/klein9b_alina_samples.json"
 comptime SERENITY_IDEOGRAM4_BASE = "/home/alex/.serenity/models/ideogram-4-fp8"
 comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/trainings/ideogram4_giger_cache/cache.safetensors"
 # HiDream-O1 — serenitymojo train_hidream_o1_real (P4 of
@@ -974,6 +980,83 @@ def trainer_ui_validate(cfg: TrainerUIConfig) -> String:
     return String("Ready")
 
 
+# ── UI wave 2: capability table (model -> lever keys its runner CONSUMES) ──
+# ONE table drives the pre-launch "X ignores: ..." warning (TopBar validation
+# line + submit log). MEASURED 2026-06-12 by grepping each runner's trainer
+# source for actual consumption (not just reader parsing):
+#   klein/zimage  (serenitymojo train_<m>_real): levers_loss_grad,
+#     levers_optimizer_*, cfg.ema_enabled, cfg.caption_dropout_prob — ALL six.
+#   hidream/ideogram4: same six (T1 fan-out + Ideogram4LiveTrainer argv 10/11).
+#   chroma/ernie/anima/sdxl/l2p: ZERO hits for ema_enabled /
+#     caption_dropout_prob / levers_* — the recipe-tail keys are parsed by
+#     read_model_config but NEVER READ by those trainers.
+#   masked_training / training_method (full-FT) / peft_type: consumed by NO
+#   runner — decorative until wired (snapshot-only, excluded from emission).
+
+
+def trainer_ui_supported_lever_keys(target: String) -> List[String]:
+    var keys = List[String]()
+    if (
+        target == String("klein")
+        or target == String("zimage")
+        or target == String("hidream")
+        or target == String("ideogram4")
+    ):
+        keys.append(String("optimizer"))
+        keys.append(String("warmup"))
+        keys.append(String("loss_fn"))
+        keys.append(String("min_snr_gamma_flow"))
+        keys.append(String("ema"))
+        keys.append(String("caption_dropout"))
+    return keys^
+
+
+def trainer_ui_active_lever_keys(cfg: TrainerUIConfig) -> List[String]:
+    # Non-default lever/decorative widgets, stable display order. Defaults
+    # produce an EMPTY list (C13: default launches warn about nothing).
+    var keys = List[String]()
+    if cfg.optimizer_runner_value() != String("ADAMW"):
+        keys.append(String("optimizer"))
+    if Int(cfg.learning_rate_warmup_steps) > 0:
+        keys.append(String("warmup"))
+    if cfg.loss_fn != String("mse"):
+        keys.append(String("loss_fn"))
+    if cfg.min_snr_gamma_flow != 0.0:
+        keys.append(String("min_snr_gamma_flow"))
+    if cfg.ema_mode != String("OFF"):
+        keys.append(String("ema"))
+    if cfg.caption_dropout > 0.0:
+        keys.append(String("caption_dropout"))
+    if cfg.masked_training:
+        keys.append(String("masked_training"))
+    if cfg.training_method_index != 0:
+        keys.append(String("training_method"))
+    if cfg.peft_type != String("LORA"):
+        keys.append(String("peft_type"))
+    return keys^
+
+
+def trainer_ui_ignored_lever_summary(cfg: TrainerUIConfig) -> String:
+    """\"<model> ignores: a, b\" for every non-default widget the selected
+    model's runner does not consume; empty when nothing is ignored."""
+    var active = trainer_ui_active_lever_keys(cfg)
+    var supported = trainer_ui_supported_lever_keys(cfg.backend_target.copy())
+    var ignored = String("")
+    for i in range(len(active)):
+        var hit = False
+        for j in range(len(supported)):
+            if supported[j] == active[i]:
+                hit = True
+                break
+        if not hit:
+            if ignored.byte_length() > 0:
+                ignored = ignored + String(", ")
+            ignored = ignored + active[i].copy()
+    if ignored.byte_length() == 0:
+        return String("")
+    return cfg.backend_target.copy() + String(" ignores: ") + ignored
+
+
 def _runner_recipe_json(cfg: TrainerUIConfig) -> String:
     # Shared recipe tail for the serenitymojo TrainConfig JSON schema
     # (io/train_config_reader.mojo read_model_config keys).
@@ -1017,6 +1100,33 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
     Only the recipe (lr/rank/alpha/steps/save/cache/ckpt) comes from the UI.
     """
     var t = cfg.backend_target.copy()
+    if t == String("klein"):
+        # Klein 9B — serenitymojo train_klein_real (config-driven; reads the
+        # T1 lever keys via read_model_config since the levers fan-out commit
+        # 12190f6 and CONSUMES them: levers_loss_grad, levers_optimizer_step,
+        # cfg.ema_enabled, cfg.caption_dropout_prob). Arch dims verbatim from
+        # serenitymojo/configs/klein9b.json — validate_klein_train_config
+        # fails loud on any drift. Lever emission mirrors zimage's.
+        return (
+            String("{\n  \"model_type\": \"klein\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"vae\": \"") + String(SERENITY_KLEIN_VAE) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_KLEIN_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"inner_dim\": 4096,\n  \"in_channels\": 128,\n")
+            + String("  \"joint_attention_dim\": 12288,\n  \"out_channels\": 128,\n")
+            + String("  \"num_double\": 8,\n  \"num_single\": 24,\n")
+            + String("  \"num_heads\": 32,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 12288,\n  \"timestep_dim\": 256,\n")
+            + String("  \"rope_theta\": 2000,\n")
+            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
+            + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
+            + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
+            + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
+            + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
     if t == String("chroma"):
         return (
             String("{\n  \"model_type\": \"chroma\",\n")

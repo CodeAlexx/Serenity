@@ -212,6 +212,38 @@ def test_ideogram4_launch_argv_contract() raises:
     )
 
 
+def test_klein_launch_argv_contract() raises:
+    # Klein is config-driven (UI wave 2): the launch must be the shared
+    # `<train_config.json> <steps>` config-runner shape (serenitymojo
+    # train_klein_real argv), NOT the old 11-arg positional KleinLiveTrainer
+    # shape (progress_file/ckpt/cache/.../vae) which carried no levers.
+    var cfg = TrainerUIConfig()
+    cfg.model_type_index = 1  # FLUX_2 -> klein preset
+    trainer_ui_apply_model_preset(cfg, True)
+    var rt = TrainerUIRuntime()
+    var cmd = _live_runner_command(cfg, rt)
+    _expect(
+        _contains(cmd, String("target/serenity_klein_live_trainer")),
+        "klein runner path in command",
+    )
+    _expect(
+        _contains(cmd, String("'target/serenity_klein_train_config.json' 3000")),
+        "klein launch is <config.json> <steps> (got: " + cmd + ")",
+    )
+    _expect(
+        _contains(cmd, String("/home/alex/mojodiffusion/output/alina_train")),
+        "klein LORA_DIR/SAMPLE_DIR self-heal mkdir (got: " + cmd + ")",
+    )
+    _expect(
+        not _contains(cmd, String("flux2-vae.safetensors")),
+        "old positional vae argv is gone (vae now travels in the config JSON)",
+    )
+    _expect(
+        not _contains(cmd, String("/tmp/serenity_klein_live_trainer.log")),
+        "klein stdout tees into the shared progress log, not the legacy log",
+    )
+
+
 def test_hidream_launch_argv_contract() raises:
     # train_hidream_o1_real positional argv: <stage_dir> <steps> <lr> <rank>
     # <out_dir> - <config.json> (config delivers levers + quantized_resident).
@@ -258,6 +290,7 @@ def main() raises:
     test_start_waits_for_real_progress()
     test_command_bridge_events()
     test_ideogram4_launch_argv_contract()
+    test_klein_launch_argv_contract()
     test_hidream_launch_argv_contract()
     test_system_metrics_refresh()
     print("PASS: trainer runtime bridge parser")

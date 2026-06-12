@@ -12,6 +12,7 @@ from serenity_trainer.ui.TrainerConfigModel import (
     trainer_ui_config_json_snapshot,
     trainer_ui_ideogram4_levers_path_or_skip,
     trainer_ui_ideogram4_levers_set,
+    trainer_ui_ignored_lever_summary,
     trainer_ui_runner_train_config_json,
     trainer_ui_total_steps,
     trainer_ui_validate,
@@ -20,13 +21,9 @@ from serenity_trainer.ui.TrainerConfigModel import (
 
 comptime BytePtr = UnsafePointer[UInt8, MutExternalOrigin]
 comptime IDEOGRAM4_LIVE_RUNNER = "target/serenity_ideogram4_live_trainer"
-comptime KLEIN_LIVE_RUNNER = "target/serenity_klein_live_trainer"
 comptime TERMINAL_LAUNCHER = "scripts/serenity_terminal_launcher.sh"
 comptime IDEOGRAM4_LIVE_LOG = "/tmp/serenity_ideogram4_live_trainer.log"
 comptime IDEOGRAM4_LIVE_PID = "target/serenity_ideogram4_live_trainer.pid"
-comptime KLEIN_LIVE_LOG = "/tmp/serenity_klein_live_trainer.log"
-comptime KLEIN_LIVE_PID = "target/serenity_klein_live_trainer.pid"
-comptime KLEIN_VAE_PATH = "/home/alex/.serenity/models/vaes/flux2-vae.safetensors"
 
 
 struct TrainerUILiveStats(Copyable, Movable):
@@ -182,6 +179,10 @@ def _is_config_runner_target(target: String) -> Bool:
     # Config-driven runners (serenitymojo train_<m>_real.mojo built into
     # target/serenity_<m>_live_trainer). They take `<train_config.json> <steps>`
     # and stream the shared print_trainer_progress line shape on stdout.
+    # klein joined 2026-06-12 (UI wave 2): train_klein_real argv is
+    # `<config.json> [run_steps]` and it CONSUMES the T1 levers
+    # (loss/optimizer/EMA/caption-dropout) from the config JSON — the old
+    # positional KleinLiveTrainer port carried no levers at all.
     return (
         target == String("chroma")
         or target == String("ernie")
@@ -189,6 +190,7 @@ def _is_config_runner_target(target: String) -> Bool:
         or target == String("sdxl")
         or target == String("zimage")
         or target == String("l2p")
+        or target == String("klein")
     )
 
 
@@ -225,24 +227,18 @@ def _backend_label(target: String) -> String:
 
 
 def _runner_path(target: String) -> String:
-    if target == String("klein"):
-        return String(KLEIN_LIVE_RUNNER)
     if _is_config_runner_target(target) or _is_hidream_target(target):
         return String("target/serenity_") + target.copy() + String("_live_trainer")
     return String(IDEOGRAM4_LIVE_RUNNER)
 
 
 def _pid_path(target: String) -> String:
-    if target == String("klein"):
-        return String(KLEIN_LIVE_PID)
     if _is_config_runner_target(target) or _is_hidream_target(target):
         return String("target/serenity_") + target.copy() + String("_live_trainer.pid")
     return String(IDEOGRAM4_LIVE_PID)
 
 
 def _log_path(target: String) -> String:
-    if target == String("klein"):
-        return String(KLEIN_LIVE_LOG)
     if _is_config_runner_target(target) or _is_hidream_target(target):
         # Config-driven runners stream progress on stdout only; tee their
         # stdout straight into the polled progress file so the legacy
@@ -298,30 +294,6 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
             + String(" - ")
             + _shell_quote(_runner_train_config_path(target.copy()))
         )
-    elif target == String("klein"):
-        args = (
-            _shell_quote(rt.progress_file_path.copy())
-            + String(" ")
-            + _shell_quote(cfg.base_model_name.copy())
-            + String(" ")
-            + _shell_quote(cfg.cache_dir.copy())
-            + String(" ")
-            + _shell_quote(cfg.dataset_path.copy())
-            + String(" ")
-            + _shell_quote(String(SERENITY_TRAINER_OUTPUT_DIR))
-            + String(" ")
-            + String(steps)
-            + String(" ")
-            + String(rank)
-            + String(" ")
-            + String(alpha)
-            + String(" ")
-            + String(cfg.learning_rate)
-            + String(" ")
-            + String(save_every)
-            + String(" ")
-            + _shell_quote(String(KLEIN_VAE_PATH))
-        )
     else:
         args = (
             _shell_quote(rt.progress_file_path.copy())
@@ -364,14 +336,24 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
         # The config-driven runners save to fixed per-model output dirs and do
         # not create them (Chroma raised "failed to open for write" on a
         # missing dir after an otherwise-good step). Self-heal at launch.
-        mkdirs = String(
-            "mkdir -p /home/alex/mojodiffusion/output/chroma_boxjana"
-            " /home/alex/mojodiffusion/output/alina_sdxl"
-            " /home/alex/mojodiffusion/output/alina_zimage"
-            " /home/alex/mojodiffusion/output/alina_l2p"
-            " /home/alex/mojodiffusion/serenitymojo/output"
-            " /home/alex/mojodiffusion/output && "
-        )
+        if target == String("klein"):
+            # train_klein_real saves LoRAs/samples into its comptime
+            # LORA_DIR/SAMPLE_DIR (alina_train); it mkdirs SAMPLE_DIR itself
+            # but self-heal here too. Klein-only so the other config runners'
+            # launch commands stay byte-identical (C13).
+            mkdirs = String(
+                "mkdir -p /home/alex/mojodiffusion/output/alina_train"
+                " /home/alex/mojodiffusion/output && "
+            )
+        else:
+            mkdirs = String(
+                "mkdir -p /home/alex/mojodiffusion/output/chroma_boxjana"
+                " /home/alex/mojodiffusion/output/alina_sdxl"
+                " /home/alex/mojodiffusion/output/alina_zimage"
+                " /home/alex/mojodiffusion/output/alina_l2p"
+                " /home/alex/mojodiffusion/serenitymojo/output"
+                " /home/alex/mojodiffusion/output && "
+            )
     return (
         String("cd /home/alex/serenity-trainer && ")
         + mkdirs
@@ -474,7 +456,6 @@ def _write_runner_train_config(cfg: TrainerUIConfig) raises -> String:
 def trainer_ui_launch_live_runner(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime) -> Bool:
     if (
         cfg.backend_target != String("ideogram4")
-        and cfg.backend_target != String("klein")
         and not _is_config_runner_target(cfg.backend_target.copy())
         and not _is_hidream_target(cfg.backend_target.copy())
     ):
@@ -677,6 +658,13 @@ def trainer_ui_submit_current(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime) ->
     if rt.last_validation_summary != String("Ready"):
         _append_runtime_log(rt, String("validation failed: ") + rt.last_validation_summary.copy())
         return UInt64(0)
+    # Capability-table honesty (UI wave 2): launch proceeds, but every
+    # non-default widget the selected runner does not consume is named LOUDLY
+    # in the status rail + run log so the run record cannot silently lie.
+    var ignored = trainer_ui_ignored_lever_summary(cfg)
+    if ignored.byte_length() > 0:
+        _append_runtime_log(rt, String("WARNING before launch: ") + ignored.copy())
+        rt.last_validation_summary = String("WARNING ") + ignored.copy()
     var config_path: String
     try:
         config_path = _save_config_snapshot(cfg)
