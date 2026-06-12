@@ -12,6 +12,9 @@ from serenity_trainer.ui.TrainerConfigModel import (
     trainer_ui_runner_train_config_json,
 )
 from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.train_config import (
+    LOSS_FN_MSE, LOSS_FN_HUBER, LOSS_FN_SMOOTH_L1,
+)
 
 
 def _check(name: String, cond: Bool, detail: String) raises:
@@ -86,6 +89,70 @@ def _gate_target(
     )
 
 
+def _close32(v: Float32, exp: Float32) -> Bool:
+    var d = v - exp
+    if d < Float32(0.0):
+        d = -d
+    return d < Float32(1.0e-5)
+
+
+def _gate_zimage_loss_levers() raises:
+    # T1.A: the UI loss-lever keys (loss_fn/huber_delta/smooth_l1_beta/
+    # min_snr_gamma_flow) must round-trip through serenitymojo's REAL
+    # read_model_config for the zimage target — default OFF, and flipped
+    # values land in TrainConfig (training/levers.mojo consumes them).
+    var ui = TrainerUIConfig()
+    ui.model_type_index = 7
+    trainer_ui_apply_model_preset(ui, True)
+
+    # default emission == lever off (mse / 1.0 / 1.0 / 0.0)
+    var json0 = trainer_ui_runner_train_config_json(ui)
+    var p0 = String("/tmp/serenity_ui_zimage_levers_default_gate.json")
+    var f0 = open(p0.copy(), "w")
+    f0.write(json0)
+    f0.close()
+    var c0 = read_model_config(p0.copy())
+    _check(String("zimage-levers-default"), c0.loss_fn == LOSS_FN_MSE,
+           String("loss_fn=") + String(c0.loss_fn))
+    _check(String("zimage-levers-default"), _close32(c0.huber_delta, Float32(1.0)),
+           String("huber_delta=") + String(c0.huber_delta))
+    _check(String("zimage-levers-default"), _close32(c0.smooth_l1_beta, Float32(1.0)),
+           String("smooth_l1_beta=") + String(c0.smooth_l1_beta))
+    _check(String("zimage-levers-default"), _close32(c0.min_snr_gamma_flow, Float32(0.0)),
+           String("min_snr_gamma_flow=") + String(c0.min_snr_gamma_flow))
+
+    # flipped from the UI cfg → parsed TrainConfig carries the lever
+    ui.loss_fn = String("huber")
+    ui.huber_delta = 0.25
+    ui.smooth_l1_beta = 2.0
+    ui.min_snr_gamma_flow = 5.0
+    var json1 = trainer_ui_runner_train_config_json(ui)
+    var p1 = String("/tmp/serenity_ui_zimage_levers_flipped_gate.json")
+    var f1 = open(p1.copy(), "w")
+    f1.write(json1)
+    f1.close()
+    var c1 = read_model_config(p1.copy())
+    _check(String("zimage-levers-flipped"), c1.loss_fn == LOSS_FN_HUBER,
+           String("loss_fn=") + String(c1.loss_fn))
+    _check(String("zimage-levers-flipped"), _close32(c1.huber_delta, Float32(0.25)),
+           String("huber_delta=") + String(c1.huber_delta))
+    _check(String("zimage-levers-flipped"), _close32(c1.smooth_l1_beta, Float32(2.0)),
+           String("smooth_l1_beta=") + String(c1.smooth_l1_beta))
+    _check(String("zimage-levers-flipped"), _close32(c1.min_snr_gamma_flow, Float32(5.0)),
+           String("min_snr_gamma_flow=") + String(c1.min_snr_gamma_flow))
+
+    # smooth_l1 selector tag parses too
+    ui.loss_fn = String("smooth_l1")
+    var json2 = trainer_ui_runner_train_config_json(ui)
+    var p2 = String("/tmp/serenity_ui_zimage_levers_sl1_gate.json")
+    var f2 = open(p2.copy(), "w")
+    f2.write(json2)
+    f2.close()
+    var c2 = read_model_config(p2.copy())
+    _check(String("zimage-levers-sl1"), c2.loss_fn == LOSS_FN_SMOOTH_L1,
+           String("loss_fn=") + String(c2.loss_fn))
+
+
 def main() raises:
     print("== runner train config gate ==")
     # model_type option indices: 4=CHROMA_1, 5=ERNIE_IMAGE, 6=ANIMA, 2=SDXL,
@@ -96,4 +163,5 @@ def main() raises:
     _gate_target(2, String("sdxl"), String("sdxl"), 0, 0, 0)
     _gate_target(7, String("zimage"), String("zimage"), 3840, 30, 30)
     _gate_target(8, String("l2p"), String("l2p"), 3840, 30, 30)
+    _gate_zimage_loss_levers()
     print("ALL GATES PASS — UI runner train-config seam OK")

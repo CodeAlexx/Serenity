@@ -242,6 +242,16 @@ struct TrainerUIConfig(Movable):
     var huber_delta: Float32
     var vb_loss_strength: Float32
     var loss_weight_fn: String
+    # ── T1.A loss levers (serenitymojo training/levers.mojo) ──
+    # loss_fn: "mse"|"huber"|"smooth_l1" — torch-semantics selector consumed
+    # by trainers that call levers_loss_grad (zimage first). SEPARATE from
+    # the mse/mae/huber_strength combined-loss scheme above (klein) — do not
+    # conflate. min_snr_gamma_flow is the SimpleTuner ε-style min(SNR,γ)/SNR
+    # weight (0.0 = off); loss_weight_fn=MIN_SNR_GAMMA above is the klein
+    # min(SNR,γ)/(SNR+1) lever. Defaults = all off (mse, γ_flow=0).
+    var loss_fn: String
+    var smooth_l1_beta: Float32
+    var min_snr_gamma_flow: Float32
     var loss_scaler: String
     var offset_noise_weight: Float32
     var perturbation_noise_weight: Float32
@@ -559,6 +569,9 @@ struct TrainerUIConfig(Movable):
         self.huber_delta = 1.0
         self.vb_loss_strength = 0.0
         self.loss_weight_fn = String("MIN_SNR_GAMMA")
+        self.loss_fn = String("mse")        # T1.A default-off
+        self.smooth_l1_beta = 1.0
+        self.min_snr_gamma_flow = 0.0       # 0.0 = off
         self.loss_scaler = String("NONE")
         self.offset_noise_weight = 0.0
         self.perturbation_noise_weight = 0.0
@@ -999,6 +1012,13 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + String("  \"rope_theta\": 256,\n  \"rope_axes_dim\": [32, 48, 48],\n")
             + String("  \"time_scale\": 1000.0,\n  \"pad_tokens_multiple\": 32,\n")
             + String("  \"norm_eps\": 1e-5,\n  \"final_norm_eps\": 1e-6,\n")
+            # T1.A loss levers — zimage only this phase (train_zimage_real
+            # calls serenitymojo training/levers.mojo levers_loss_grad).
+            # Defaults (mse / 1.0 / 1.0 / 0.0) keep the lever OFF.
+            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
+            + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
+            + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
             + _runner_recipe_json(cfg)
             + String("}\n")
         )
