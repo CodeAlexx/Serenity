@@ -290,6 +290,22 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
             step_loss,
             ctx,
         )
+        # Real gradient L1 for the progress line. The apply/levers telemetry
+        # returns were stubbed (apply_ideogram4_lora_grads returned grad_b_l1=0.0,
+        # adapter_b_l1=0.0) and the progress line hardcoded "grad_norm 0.0000" —
+        # so the trainer looked dead even though LoRA-B is learning. grads.d_b
+        # holds the per-adapter LoRA-B gradients; to_host upcasts to Float32.
+        # Computed BEFORE the optimizer consumes `grads` (grads^), once for both
+        # the default-AdamW and levers paths.
+        var step_grad_l1 = Float32(0.0)
+        for gi in range(len(grads.d_b)):
+            var gh = grads.d_b[gi][].to_host(ctx)
+            for gj in range(len(gh)):
+                var gv = gh[gj]
+                if gv < Float32(0.0):
+                    step_grad_l1 -= gv
+                else:
+                    step_grad_l1 += gv
         # T1.C optimizer seam: levers host path vs the existing literal fused
         # AdamW call (C13: optimizer=ADAMW routes around the levers entirely).
         var k = opt_step + 1
@@ -332,6 +348,7 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
                 cfg,
                 last_loss,
                 smooth_loss,
+                step_grad_l1,
                 Float32(speed),
                 elapsed,
             )
@@ -507,6 +524,7 @@ def _append_ideogram4_live_progress(
     cfg: TrainConfig,
     loss: Float32,
     smooth_loss: Float32,
+    grad_norm: Float32,
     speed_seconds: Float32,
     elapsed_seconds: Float64,
 ) raises:
@@ -524,7 +542,9 @@ def _append_ideogram4_live_progress(
         + String(loss)
         + String(" | smooth_loss ")
         + String(smooth_loss)
-        + String(" | grad_norm 0.0000 | ")
+        + String(" | grad_norm ")
+        + String(grad_norm)
+        + String(" | ")
         + String(speed_seconds)
         + String("s/step | elapsed ")
         + _format_hms(elapsed_seconds)

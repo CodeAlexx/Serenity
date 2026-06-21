@@ -79,7 +79,15 @@ def apply_ideogram4_lora_grads(
     if len(loras.ad) != len(state.m_a) or len(loras.ad) != len(state.m_b):
         raise Error("apply_ideogram4_lora_grads: optimizer state count mismatch")
 
+    # Real LoRA-B gradient L1 (the 10-step gate reads result.grad_b_l1). Sum
+    # |d_b| across every adapter BEFORE the optimizer step, so it reflects the
+    # gradients that drove this step — matches the live trainer's grad_norm and
+    # the levers path. Replaces the old grad_b_l1=0.0 / adapter_b_l1=0.0 stubs
+    # that made the gate fail and the trainer look dead while it was learning.
     var grad_b_l1 = Float32(0.0)
+    for i in range(len(loras.ad)):
+        grad_b_l1 += _l1_sum(grads.d_b[i][], ctx)
+
     for i in range(len(loras.ad)):
         adamw_step(
             loras.ad[i][].a,
@@ -112,8 +120,14 @@ def apply_ideogram4_lora_grads(
             ctx,
         )
 
+    # Post-step LoRA-B param L1 (the live trainer reads result.adapter_b_l1 for
+    # its last_b summary; mirrors the levers path's returned b_l1).
+    var adapter_b_l1 = Float32(0.0)
+    for i in range(len(loras.ad)):
+        adapter_b_l1 += _l1_sum(loras.ad[i][].b, ctx)
+
     return Ideogram4StackTrainResult(
-        len(loras.ad), I4_SLOTS_PER_BLOCK, grad_b_l1, Float32(0.0)
+        len(loras.ad), I4_SLOTS_PER_BLOCK, grad_b_l1, adapter_b_l1
     )
 
 
