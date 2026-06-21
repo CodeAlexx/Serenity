@@ -42,6 +42,26 @@ from serenitymojo.ops.fp8 import load_fp8_dequant, fp8_e4m3_dequant_perrow_to_bf
 from serenitymojo.ops.linalg_backward import linear_backward, linear_backward_dx
 from serenitymojo.ops.norm_backward import rms_norm_backward_dx
 from serenitymojo.ops.attention_backward import sdpa_backward
+from serenitymojo.ops.attention_flash import (
+    sdpa_flash_train_fwd_f32,
+    sdpa_flash_backward_f32,
+)
+
+# C13 gate-don't-delete: cuDNN flash SDPA replaces the custom Mojo SDPA
+# (sdpa_nomask/sdpa_backward) for the attention fwd+bwd. Approved numerics
+# change (precedent: klein KLEIN_SDPA_FLASH, zimage ZIMAGE_SDPA_FLASH). Flash
+# bwd dQ is nondeterministic run-to-run -> trainer gates are 4dp value-class,
+# NOT bit. Requires S % 128 == 0 (giger 512 cache: S=NT256+NIMG1024=1280=10x128),
+# Build needs the cshim link args + cuDNN on LD_LIBRARY_PATH
+# (see docs/IDEOGRAM4_FLASH_SDPA_WIRING_2026-06-20.md).
+#
+# GATED OFF — MEASURED BLOCKER 2026-06-20: cuDNN flash BACKWARD supports only
+# head_dim ∈ {64,96,128} (serenitymojo/ops/cshim/cudnn_sdpa_bwd.cpp:5). The flash
+# forward accepts ideogram4's Dh=256 but the backward g->build() finds no plan
+# (shim rc=-1, B=1 S=1280 H=18 Dh=256). klein/zimage use Dh=128 → flash works;
+# ideogram4 Dh=256 does not. Wiring kept compiled-but-off (C13) for a future
+# D=256-capable flash backward (cuDNN upgrade / frontend HeurMode fallback).
+comptime IDEOGRAM4_SDPA_FLASH = False
 from serenitymojo.ops.loss_swiglu_backward import swiglu_backward
 from serenitymojo.ops.shape_backward import broadcast_backward
 from serenitymojo.ops.rope_struct_backward import rope_halfsplit_full_backward
@@ -317,6 +337,13 @@ struct Ideogram4BlockActs(Movable):
     var down_w2: Tensor
     var down_w3: Tensor
     var down_adaln: Tensor
+    # Flash-SDPA saved set (filled only on the IDEOGRAM4_SDPA_FLASH path; bf16
+    # q/k/v/o + F32 stats — exactly what sdpa_flash_backward_f32 consumes).
+    var flash_q: Optional[TArc]
+    var flash_k: Optional[TArc]
+    var flash_v: Optional[TArc]
+    var flash_o: Optional[TArc]
+    var flash_stats: Optional[TArc]
 
     def __init__(
         out self,
@@ -354,6 +381,11 @@ struct Ideogram4BlockActs(Movable):
         var down_w2: Tensor,
         var down_w3: Tensor,
         var down_adaln: Tensor,
+        var flash_q: Optional[TArc] = None,
+        var flash_k: Optional[TArc] = None,
+        var flash_v: Optional[TArc] = None,
+        var flash_o: Optional[TArc] = None,
+        var flash_stats: Optional[TArc] = None,
     ):
         self.x_in = x_in^
         self.adaln_input = adaln_input^
@@ -389,6 +421,11 @@ struct Ideogram4BlockActs(Movable):
         self.down_w2 = down_w2^
         self.down_w3 = down_w3^
         self.down_adaln = down_adaln^
+        self.flash_q = flash_q^
+        self.flash_k = flash_k^
+        self.flash_v = flash_v^
+        self.flash_o = flash_o^
+        self.flash_stats = flash_stats^
 
 
 struct Ideogram4BlockOut(Movable):
@@ -445,7 +482,28 @@ def ideogram4_block_lora_forward[
     var k_norm = rms_norm(k, w.norm_k, I4_EPS, ctx)
     var q_rope = apply_rope_ideogram(q_norm, cosf, sinf, ctx)
     var k_rope = apply_rope_ideogram(k_norm, cosf, sinf, ctx)
-    var attn4 = sdpa_nomask[1, S, Heads, Dh](q_rope, k_rope, v, scale, ctx)
+    var attn4: Tensor
+    var _flash_q: Optional[TArc] = None
+    var _flash_k: Optional[TArc] = None
+    var _flash_v: Optional[TArc] = None
+    var _flash_o: Optional[TArc] = None
+    var _flash_stats: Optional[TArc] = None
+    comptime if IDEOGRAM4_SDPA_FLASH:
+        # cuDNN flash: bf16 q/k/v/o + F32 stats go to the tape for the flash
+        # backward (no recompute, no re-cast). att is the F32 [1,S,H,Dh] drop-in.
+        var ff = sdpa_flash_train_fwd_f32[1, S, Heads, Dh](
+            q_rope, k_rope, v, scale, ctx
+        )
+        # flash _f32 returns F32 att; ideogram4's block is BF16 end-to-end
+        # (math sdpa_nomask returns BF16) -> cast to match the downstream.
+        attn4 = cast_tensor(ff.att, STDtype.BF16, ctx)
+        _flash_q = Optional[TArc](ff.q_bf)
+        _flash_k = Optional[TArc](ff.k_bf)
+        _flash_v = Optional[TArc](ff.v_bf)
+        _flash_o = Optional[TArc](ff.o_bf)
+        _flash_stats = Optional[TArc](ff.stats)
+    else:
+        attn4 = sdpa_nomask[1, S, Heads, Dh](q_rope, k_rope, v, scale, ctx)
     var attn_flat = reshape(attn4, _shape2(S, Hidden), ctx)
 
     var of = _lora_linear_fwd(attn_flat, w.o_w, loras[I4_SLOT_O][], None, ctx)
@@ -500,6 +558,11 @@ def ideogram4_block_lora_forward[
         _clone(w2f.down, ctx),
         _clone(w3f.down, ctx),
         down_adaln^,
+        _flash_q^,
+        _flash_k^,
+        _flash_v^,
+        _flash_o^,
+        _flash_stats^,
     )
     return Ideogram4BlockOut(out^, acts^)
 
@@ -607,19 +670,41 @@ def ideogram4_block_lora_backward[
     d_b[I4_SLOT_O] = TArc(_clone(ob.d_b, ctx))
 
     var d_attn4 = reshape(ob.d_x, _shape4(1, S, Heads, Dh), ctx)
-    var sd = sdpa_backward[1, S, Heads, Dh](
-        acts.q_rope, acts.k_rope, acts.v_bshd, d_attn4, scale, ctx
-    )
+    var sd_d_q: Tensor
+    var sd_d_k: Tensor
+    var sd_d_v: Tensor
+    comptime if IDEOGRAM4_SDPA_FLASH:
+        if not acts.flash_stats:
+            raise Error(
+                "ideogram4 block bwd: IDEOGRAM4_SDPA_FLASH on but the tape has"
+                " no flash set (fwd/bwd flag mismatch)"
+            )
+        var fb = sdpa_flash_backward_f32[1, S, Heads, Dh](
+            acts.flash_q.value(), acts.flash_k.value(), acts.flash_v.value(),
+            acts.flash_o.value(), acts.flash_stats.value(), d_attn4, scale, ctx,
+        )
+        # flash _f32 returns F32 grads; the math path's grads are BF16 -> cast
+        # to match the downstream rope/rms backward (also avoids a partial move).
+        sd_d_q = cast_tensor(fb.d_q, STDtype.BF16, ctx)
+        sd_d_k = cast_tensor(fb.d_k, STDtype.BF16, ctx)
+        sd_d_v = cast_tensor(fb.d_v, STDtype.BF16, ctx)
+    else:
+        var sd = sdpa_backward[1, S, Heads, Dh](
+            acts.q_rope, acts.k_rope, acts.v_bshd, d_attn4, scale, ctx
+        )
+        sd_d_q = Tensor(sd.d_q.buf.copy(), sd.d_q.shape(), sd.d_q.dtype())
+        sd_d_k = Tensor(sd.d_k.buf.copy(), sd.d_k.shape(), sd.d_k.dtype())
+        sd_d_v = Tensor(sd.d_v.buf.copy(), sd.d_v.shape(), sd.d_v.dtype())
     var cos_full = _expand_rope_table[Heads, Dh](cosf, S, ctx)
     var sin_full = _expand_rope_table[Heads, Dh](sinf, S, ctx)
-    var d_q_norm = rope_halfsplit_full_backward(sd.d_q, cos_full, sin_full, ctx)
-    var d_k_norm = rope_halfsplit_full_backward(sd.d_k, cos_full, sin_full, ctx)
+    var d_q_norm = rope_halfsplit_full_backward(sd_d_q, cos_full, sin_full, ctx)
+    var d_k_norm = rope_halfsplit_full_backward(sd_d_k, cos_full, sin_full, ctx)
 
     var d_q_raw = rms_norm_backward_dx(d_q_norm, acts.q_raw, w.norm_q, I4_EPS, ctx)
     var d_k_raw = rms_norm_backward_dx(d_k_norm, acts.k_raw, w.norm_k, I4_EPS, ctx)
     var d_q = reshape(d_q_raw, _shape2(S, Hidden), ctx)
     var d_k = reshape(d_k_raw, _shape2(S, Hidden), ctx)
-    var d_v = reshape(sd.d_v, _shape2(S, Hidden), ctx)
+    var d_v = reshape(sd_d_v, _shape2(S, Hidden), ctx)
     var d_qkv = concat(1, ctx, d_q, d_k, d_v)
 
     var qkvb = _lora_linear_bwd(
