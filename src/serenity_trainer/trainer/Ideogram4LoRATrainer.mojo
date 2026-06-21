@@ -250,15 +250,17 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
     for local_step in range(run_cfg.steps):
         var sample_index = progress.global_step % cache.len()
         var seed = run_cfg.noise_seed + UInt64(opt_step + local_step)
-        # Per-step flow time ~ logit-normal(0, 1.5) — the DiffSynth-Studio
-        # Ideogram-4 512px training distribution (flow_match.py
-        # set_timesteps_ideogram4). The old fixed default_t_flow=0.7 trained
-        # EVERY step at one timestep (measured: loss collapsed to 1.3e-4
-        # with grad_norm 0.0000 on the fixture cache — learned nothing).
+        # Per-step flow time ~ logit-normal(0, 1.0) = t = sigmoid(N(0,1)),
+        # matching BOTH references: OneTrainer (ModelSetupNoiseMixin LOGIT_NORMAL,
+        # scale = noising_weight+1.0 = 1.0 with the ideogram preset's defaults) and
+        # the Rust train_ideogram (t = sigmoid(u)). Was 1.5 (DiffSynth INFERENCE
+        # set_timesteps_ideogram4) — wrong vs both training oracles.
+        # The old fixed default_t_flow=0.7 trained EVERY step at one timestep
+        # (measured: loss collapsed to 1.3e-4, grad_norm 0 — learned nothing).
         # Separate RNG stream from the noise draw (the zimage *7919 idiom).
         var t_step = sample_timestep_logit_normal_scaled(
             run_cfg.noise_seed * UInt64(7919) + UInt64(opt_step + local_step),
-            Float32(1.5),
+            Float32(1.0),
         )
         var sample = cache.sample[NT, GH, GW](
             sample_index, t_step, seed, ctx
