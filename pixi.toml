@@ -20,19 +20,93 @@ ideogram4-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /ho
 # emits; the old positional KleinLiveTrainer port carried no levers.
 # RUNPATH -L set mirrors the zimage runner (sqlite3 for SerenityBoard,
 # cshim for cuDNN SDPA, pip cudnn libs).
-klein-live-trainer-build = "mkdir -p target && mojo build --target-accelerator sm_86 -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -lsqlite3 -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib /home/alex/mojodiffusion/serenitymojo/training/train_klein_real.mojo -o target/serenity_klein_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the klein trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_klein_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) PLUS -lsqlite3
+# (SerenityBoard) — harmless if a given driver doesn't pull every symbol.
+# Klein also needs -I /home/alex/MOJO-libs: its sampler include (klein_sampler ->
+# proc_ipc/ipc_codec) imports the local 'net' and 'json' modules that live there,
+# matching mojodiffusion's own klein build tasks.
+klein-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -I /home/alex/MOJO-libs -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -lsqlite3 -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_klein_real.mojo -o target/serenity_klein_live_trainer"
 # Config-driven runners reused from the campaign-verified serenitymojo trainers
 # (argv: <train_config.json> <steps>; stdout = shared progress-line stream).
 # Build ONE at a time — concurrent mojo builds race on serenitymojo.mojopkg.
-chroma-live-trainer-build = "mkdir -p target && mojo build --target-accelerator sm_86 -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda /home/alex/mojodiffusion/serenitymojo/training/train_chroma_real.mojo -o target/serenity_chroma_live_trainer"
-ernie-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_ernie_real.mojo -o target/serenity_ernie_live_trainer"
-anima-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_anima_real.mojo -o target/serenity_anima_live_trainer"
-sdxl-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_sdxl_real.mojo -o target/serenity_sdxl_live_trainer"
-zimage-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_zimage_real.mojo -o target/serenity_zimage_live_trainer"
-l2p-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm /home/alex/mojodiffusion/serenitymojo/training/train_l2p_real.mojo -o target/serenity_l2p_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the chroma trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_chroma_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+chroma-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_chroma_real.mojo -o target/serenity_chroma_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the ernie trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_ernie_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+ernie-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_ernie_real.mojo -o target/serenity_ernie_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the anima trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_anima_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+anima-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_anima_real.mojo -o target/serenity_anima_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the sdxl trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_sdxl_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+sdxl-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_sdxl_real.mojo -o target/serenity_sdxl_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the sd35 trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_sd35_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+sd35-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_sd35_real.mojo -o target/serenity_sd35_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the qwenimage trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_qwenimage_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+qwenimage-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_qwenimage_real.mojo -o target/serenity_qwenimage_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the flux trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_flux_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+flux-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_flux_real.mojo -o target/serenity_flux_live_trainer"
+# Pulled back into serenity-trainer (2026-06-23): the zimage trainer DRIVER now
+# lives here (src/serenity_trainer/trainer/train_zimage_real.mojo) and uses
+# serenitymojo ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion.
+# Links flame-core's cuDNN flash-SDPA shim (libserenity_cudnn_sdpa) — Mojo's own
+# cuDNN is unused here (see serenitymojo/ops/cshim/build.sh). The old task linked
+# only -lm and never linked the shim, so it failed on flame_cudnn_sdpa_* symbols.
+zimage-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_zimage_real.mojo -o target/serenity_zimage_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the l2p trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_l2p_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+l2p-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_l2p_real.mojo -o target/serenity_l2p_live_trainer"
 # HiDream-O1: positional argv (<stage_dir> <steps> [lr] [rank] [out_dir]
 # [ema_decay] [config.json]), NOT the <config.json> <steps> shape above.
-hidream-live-trainer-build = "mkdir -p target && mojo build -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -lsqlite3 /home/alex/mojodiffusion/serenitymojo/training/train_hidream_o1_real.mojo -o target/serenity_hidream_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the hidream trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_hidream_o1_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+hidream-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_hidream_o1_real.mojo -o target/serenity_hidream_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the ltx2 trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_ltx2_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+ltx2-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_ltx2_real.mojo -o target/serenity_ltx2_live_trainer"
+# Pulled into serenity-trainer (2026-06-23): the wan22 trainer DRIVER now lives
+# here (src/serenity_trainer/trainer/train_wan22_real.mojo) and uses serenitymojo
+# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
+# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
+# given driver doesn't pull every symbol.
+wan22-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_wan22_real.mojo -o target/serenity_wan22_live_trainer"
 trainer-ui-build = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm src/serenity_trainer/ui/TrainUI.mojo -o target/serenity_trainer_ui", depends-on = ["build-mojoui", "ideogram4-live-trainer-build"] }
 trainer-ui = { cmd = "LD_LIBRARY_PATH=/home/alex/MojoUI target/serenity_trainer_ui", depends-on = ["trainer-ui-build"] }
 trainer-ui-runtime-test = { cmd = "mkdir -p target && mojo build -I . -I src -I /home/alex/MojoUI -Xlinker -L/home/alex/MojoUI -Xlinker -lmojoui_floor -Xlinker -lm tests/ui/test_trainer_runtime_bridge.mojo -o /tmp/serenity_trainer_runtime_test && LD_LIBRARY_PATH=/home/alex/MojoUI /tmp/serenity_trainer_runtime_test", depends-on = ["build-mojoui"] }
