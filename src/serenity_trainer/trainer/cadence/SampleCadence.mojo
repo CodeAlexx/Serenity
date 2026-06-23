@@ -100,7 +100,7 @@ struct SampleCadence(Movable):
     # WIRING (see module footer): call once per micro-step at the top of the
     # train-loop body, exactly where GenericTrainer.py:691 evaluates
     # __needs_sample(train_progress), passing the driver's live TrainProgress.
-    def should_sample(mut self, progress: TrainProgress) -> Bool:
+    def should_sample(mut self, progress: TrainProgress) raises -> Bool:
         var elapsed = self.timed.single_action_elapsed(
             "sample_skip_first",
             self.sample_skip_first,
@@ -126,7 +126,7 @@ struct SampleCadence(Movable):
     def num_prompts(self) -> Int:
         return len(self.prompts)
 
-    def prompt(self, i: Int) -> String:
+    def prompt(self, i: Int) raises -> String:
         return self.prompts[i]
 
 

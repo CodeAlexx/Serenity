@@ -32,6 +32,7 @@ from serenitymojo.training.lora_ema import (
 from serenitymojo.training.train_config import TrainConfig as LeversConfig
 from serenitymojo.training.schedule import sample_timestep_logit_normal_scaled
 from serenitymojo.io.dtype import STDtype
+from serenitymojo.ops.tensor_algebra import zeros_device
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.models.dit.ideogram4_resident import Ideogram4Weights
@@ -63,7 +64,15 @@ from serenity_trainer.trainer.Ideogram4StackTrain import (
     make_ideogram4_lora_adam_state,
 )
 from serenity_trainer.trainer.TrainState import TrainProgress
+from serenity_trainer.trainer.cadence.SampleCadence import SampleCadence
+from serenity_trainer.trainer.Ideogram4SampleResident import (
+    ideogram4_sample_resident,
+    ideogram4_decode_latent_to_png,
+)
+from serenity_trainer.util.enum.TimeUnit import TU_STEP
 from serenity_trainer.util.config.TrainConfig import TrainConfig
+
+from serenitymojo.ops.random import randn
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -98,6 +107,23 @@ struct Ideogram4LoRATrainRunConfig(Copyable, Movable):
     # from the serenity-trainer TrainConfig at run start — that struct stays
     # the single source of truth for them.
     var levers: LeversConfig
+    # ── sample-during-training (v1, SampleCadence-wired) ──────────────────────
+    # sample_every_steps: TU_STEP cadence interval (0 = disabled, default-off so
+    #   the pre-sampling trainer is byte-for-byte unchanged). On fire, for each
+    #   prompt index the trainer denoises a sample from the CURRENT resident base
+    #   + live LoRA and writes <output_dir>/samples/step_<N>_<promptidx>.png.
+    # sample_steps / sample_cfg: the denoise loop length + CFG scale (inference
+    #   defaults 8 / 7.0 — ideogram4_pipeline.mojo:35-36).
+    # sample_seed: base RNG seed for the t=1 init noise (per-prompt offset added).
+    # V1 CONDITIONING (flagged): the prompt list is carried for forward-compat but
+    #   each sample is CONDITIONED ON A CACHED CAPTION's llm_features (the cache
+    #   has no arbitrary-prompt encoder wired). prompt index i -> cache sample
+    #   (i % cache.len()). See Ideogram4SampleResident.mojo header for the why.
+    var sample_every_steps: Int
+    var sample_steps: Int
+    var sample_cfg: Float32
+    var sample_seed: UInt64
+    var sample_prompts: List[String]
 
     @staticmethod
     def defaults(
@@ -120,6 +146,11 @@ struct Ideogram4LoRATrainRunConfig(Copyable, Movable):
             progress_file_path=String(""),
             caption_dropout_prob=Float32(0.0),
             levers=LeversConfig.default(),
+            sample_every_steps=0,          # default-off: no sampling-in-training
+            sample_steps=8,                # inference default (pipeline STEPS)
+            sample_cfg=Float32(7.0),       # inference default (pipeline CFG)
+            sample_seed=UInt64(0x1D3A_5A91),
+            sample_prompts=List[String](),
         )
 
 
@@ -247,6 +278,29 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
     var train_start = perf_counter()
     var smooth_loss = Float32(0.0)
     var smooth_inited = False
+
+    # ── sample-during-training cadence (default-off when sample_every_steps==0) ─
+    # SampleCadence drives "should we sample now?" on the SAME TrainProgress that
+    # threads through the loop. TU_STEP + start_at_zero=True: fires when
+    # global_step % sample_every_steps == 0. We check it AFTER progress.next_step
+    # so the just-completed optimizer step is reflected in the sampled LoRA state.
+    var sample_enabled = run_cfg.sample_every_steps > 0
+    var samples_dir = run_cfg.output_dir + String("/samples")
+    if sample_enabled:
+        makedirs(samples_dir, exist_ok=True)
+    # prompt list: carried for forward-compat. If the caller gave none but enabled
+    # sampling, default to ONE prompt so the path still fires (its conditioning is
+    # cache sample 0 — see the V1 CONDITIONING note in the run-config fields).
+    var sample_prompt_list = run_cfg.sample_prompts.copy()
+    if sample_enabled and len(sample_prompt_list) == 0:
+        sample_prompt_list.append(String("(cached caption 0)"))
+    var cadence = SampleCadence(
+        Float64(run_cfg.sample_every_steps),
+        TU_STEP,
+        Float64(0.0),                      # sample_skip_first: no delay
+        sample_prompt_list^,
+    )
+
     for local_step in range(run_cfg.steps):
         var sample_index = progress.global_step % cache.len()
         var seed = run_cfg.noise_seed + UInt64(opt_step + local_step)
@@ -374,6 +428,17 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
             save_ideogram4_lora_train_state(ckpt_dir, opt, progress, opt_step, ctx)
             levers_optimizer_train_after_save(lcfg, bridge.opt_st)
 
+        # ── sample-during-training (fail-loud; default-off) ───────────────────
+        # Checked AFTER next_step so global_step reflects the just-completed step.
+        # cadence.should_sample mutates the cadence clock; only fires when
+        # sample_every_steps>0 (sample_enabled) AND the TU_STEP interval is hit.
+        if sample_enabled and cadence.should_sample(progress):
+            for pi in range(cadence.num_prompts()):
+                _ideogram4_run_sample[NT, GH, GW](
+                    cache, weights, loras, run_cfg, samples_dir,
+                    progress.global_step, pi, ctx,
+                )
+
     var train_elapsed = perf_counter() - train_start
     var seconds_per_step = train_elapsed / Float64(run_cfg.steps)
 
@@ -470,6 +535,64 @@ def load_ideogram4_lora_train_state(
         Int(meta[0]), Int(meta[1]), Int(meta[2]), Int(meta[3])
     )
     return Ideogram4LoadedLoRAState(progress.copy(), Int(meta[4]))
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# _ideogram4_run_sample — one sample-during-training image.
+#   cond conditioning : cached caption (prompt_idx % cache.len()) llm_features
+#                       (v1 — see the run-config sample_* field docs).
+#   uncond conditioning: a zeroed [1,NT,53248] bf16 tensor (CFG empty cond, same
+#                       as the inference pipeline's neg_llm).
+#   init noise        : randn [1,128,GH,GW] F32, seed = sample_seed + step*1000 +
+#                       prompt_idx (deterministic per (step,prompt)).
+#   denoise           : ideogram4_sample_resident (resident base + live LoRA).
+#   decode + write    : ideogram4_decode_latent_to_png ->
+#                       <samples_dir>/step_<N>_<promptidx>.png.
+# Fail-loud: any raise propagates (no silent skip), per the build request.
+def _ideogram4_run_sample[NT: Int, GH: Int, GW: Int](
+    cache: Ideogram4TrainCache,
+    weights: Ideogram4Weights,
+    loras: Ideogram4LoraSet,
+    run_cfg: Ideogram4LoRATrainRunConfig,
+    samples_dir: String,
+    step: Int,
+    prompt_idx: Int,
+    ctx: DeviceContext,
+) raises:
+    comptime PACKED_CH = 128
+
+    # COND conditioning: a cached caption's llm_features [1,NT,53248] bf16. We
+    # pull it via cache.sample (the validated accessor); the clean/noise it also
+    # loads are unused here (cheap relative to the denoise).
+    var cond_index = prompt_idx % cache.len()
+    var cond_sample = cache.sample[NT, GH, GW](
+        cond_index, Float32(0.0), run_cfg.sample_seed, ctx
+    )
+    var cond_llm = cond_sample.llm_features[].clone(ctx)   # [1,NT,53248] bf16
+
+    # UNCOND conditioning: zeroed text features (CFG empty cond), same dtype.
+    var uncond_llm = zeros_device(
+        [1, NT, cond_llm.shape()[2]], cond_llm.dtype(), ctx
+    )
+
+    # t=1 init noise [1,128,GH,GW] F32, deterministic per (step, prompt).
+    var seed = run_cfg.sample_seed + UInt64(step * 1000 + prompt_idx)
+    var init_noise = randn([1, PACKED_CH, GH, GW], seed, STDtype.F32, ctx)
+
+    var latent = ideogram4_sample_resident[NT, GH, GW](
+        weights, loras, cond_llm, uncond_llm, init_noise,
+        run_cfg.sample_steps, run_cfg.sample_cfg, GH, GW, ctx,
+    )
+
+    var out_path = (
+        samples_dir + String("/step_") + String(step)
+        + String("_") + String(prompt_idx) + String(".png")
+    )
+    ideogram4_decode_latent_to_png[GH, GW](latent, out_path, ctx)
+    print(
+        "[Ideogram4-lora] sample step=", step, " prompt=", prompt_idx,
+        " cond_cache_idx=", cond_index, " -> ", out_path,
+    )
 
 
 def _load_or_build_loras(
