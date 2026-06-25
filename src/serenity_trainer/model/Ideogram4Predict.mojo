@@ -94,7 +94,15 @@ struct Ideogram4PackedInputs(Movable):
 #   position_ids : text rows = (cumsum(text_mask)-1).clamp(0) expanded to 3
 #                  (all-ones mask -> 0..NT-1), image rows = [t=0,h,w]+IMAGE_OFFSET,
 #                  h outer (tok//GW), w inner (tok%GW).
-# Assumes b=1 and text_mask all-ones (single training sample, no text padding).
+#
+# text_len: the NATURAL (pre-pad) token count of THIS sample's caption. When a
+# caption is shorter than the fixed NT bucket, positions [text_len, NT) are
+# right-padding. ai-toolkit pipeline.py:249 sets the indicator there to 0
+# (indicator[:, :nt] = text_mask_long * LLM_TOKEN_INDICATOR; pad -> 0), and the
+# encoder already zeroed those FEATURE rows (pipeline.py:156-157 stacked*text_mask
+# = our prepare-time zeroing). Default text_len = NT (all real, no padding) keeps
+# every existing all-real-text caller / the parity fixture byte-identical.
+# (b=1 single training sample.)
 # ──────────────────────────────────────────────────────────────────────────────
 def ideogram4_build_packed_inputs[
     NT: Int, GH: Int, GW: Int
@@ -102,9 +110,17 @@ def ideogram4_build_packed_inputs[
     noisy_latents: Tensor,   # [1, 128, GH, GW] F32
     llm_features: Tensor,    # [1, NT, 53248]  (bf16 / f32)
     ctx: DeviceContext,
+    text_len: Int = NT,      # natural token count; [text_len, NT) are pad rows
 ) raises -> Ideogram4PackedInputs:
     comptime NIMG = GH * GW
     comptime SEQ = NT + NIMG
+
+    # Clamp defensively: a caption can fill or exceed the bucket (then no pad).
+    var real_len = text_len
+    if real_len > NT:
+        real_len = NT
+    if real_len < 0:
+        real_len = 0
 
     # image_tokens = latents.permute(0,2,3,1).reshape(1, NIMG, 128)  (h outer, w inner)
     var img_perm = permute(noisy_latents, [0, 2, 3, 1], ctx)         # [1,GH,GW,128]
@@ -123,12 +139,20 @@ def ideogram4_build_packed_inputs[
     var llm_full = concat(1, ctx, llm_features, llm_zeros)           # [1,SEQ,53248]
 
     # position_ids: host-built F32 [1,SEQ,3].
+    # ai-toolkit pipeline.py:262 text_pos = (text_mask.cumsum(-1)-1).clamp(min=0):
+    #   real position i (i < real_len) -> i ; pad position (i >= real_len) holds
+    #   at the last real index (real_len-1, clamped to >=0). All-real (real_len==NT)
+    #   reproduces the old 0..NT-1 ramp.
     var pos_host = List[Float32]()
     for i in range(NT):
-        # text row [i,i,i]  (cumsum(all-ones)-1 == i)
-        pos_host.append(Float32(i))
-        pos_host.append(Float32(i))
-        pos_host.append(Float32(i))
+        var p = i
+        if i >= real_len:
+            p = real_len - 1
+        if p < 0:
+            p = 0
+        pos_host.append(Float32(p))
+        pos_host.append(Float32(p))
+        pos_host.append(Float32(p))
     for tok in range(NIMG):
         var h = tok // GW                                            # h outer
         var w = tok % GW                                             # w inner
@@ -138,10 +162,14 @@ def ideogram4_build_packed_inputs[
         pos_host.append(Float32(w + IDEOGRAM4_IMAGE_OFFSET))
     var position_ids = Tensor.from_host(pos_host^, [1, SEQ, 3], STDtype.F32, ctx)
 
-    # indicator: host-built F32 [1,SEQ]; text -> 3 (mask*LLM_TOKEN_INDICATOR), image -> 2.
+    # indicator: host-built F32 [1,SEQ]; text -> 3 (mask*LLM_TOKEN_INDICATOR),
+    # text-pad -> 0 (ai-toolkit pipeline.py:249: text_mask_long * 3), image -> 2.
     var ind_host = List[Float32]()
-    for _ in range(NT):
-        ind_host.append(Float32(IDEOGRAM4_LLM_TOKEN_INDICATOR))
+    for i in range(NT):
+        if i < real_len:
+            ind_host.append(Float32(IDEOGRAM4_LLM_TOKEN_INDICATOR))
+        else:
+            ind_host.append(Float32(0.0))
     for _ in range(NIMG):
         ind_host.append(Float32(IDEOGRAM4_OUTPUT_IMAGE_INDICATOR))
     var indicator = Tensor.from_host(ind_host^, [1, SEQ], STDtype.F32, ctx)

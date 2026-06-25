@@ -60,8 +60,13 @@ from serenity_trainer.model.Ideogram4LoRABlock import (
     Ideogram4StackLoraGrads,
     ideogram4_stack_lora_forward,
     ideogram4_stack_lora_backward,
+    ideogram4_stack_lora_backward_graph,
     ideogram4_stack_lora_forward_resident,
     ideogram4_stack_lora_backward_resident,
+    ideogram4_stack_lora_backward_graph_resident,
+)
+from serenity_trainer.trainer.Ideogram4StackTrain import (
+    IDEOGRAM4_V2_GRAPH_PATH,
 )
 from serenity_trainer.model.Ideogram4Predict import (
     ideogram4_build_packed_inputs,
@@ -385,13 +390,14 @@ def ideogram4_lora_train_forward[
     llm_features: Tensor,    # [1, NT, 53248]
     loras: Ideogram4LoraSet,
     ctx: DeviceContext,
+    text_len: Int = NT,      # natural caption length; pad rows get indicator 0
 ) raises -> Ideogram4LoRATrainForward:
     comptime NIMG = GH * GW
     comptime SEQ = NT + NIMG
 
     # packed transformer inputs (Ideogram4Predict.ideogram4_build_packed_inputs)
     var packed = ideogram4_build_packed_inputs[NT, GH, GW](
-        noisy_latents, llm_features, ctx
+        noisy_latents, llm_features, ctx, text_len
     )
 
     # model_t = 1 - t_flow
@@ -452,12 +458,13 @@ def ideogram4_lora_train_forward_resident[
     llm_features: Tensor,
     loras: Ideogram4LoraSet,
     ctx: DeviceContext,
+    text_len: Int = NT,      # natural caption length; pad rows get indicator 0
 ) raises -> Ideogram4LoRATrainForward:
     comptime NIMG = GH * GW
     comptime SEQ = NT + NIMG
 
     var packed = ideogram4_build_packed_inputs[NT, GH, GW](
-        noisy_latents, llm_features, ctx
+        noisy_latents, llm_features, ctx, text_len
     )
 
     var tv = List[Float32]()
@@ -620,6 +627,7 @@ def ideogram4_lora_train_compute_resident[
     lcfg: LeversConfig,
     mut loss_out: Float32,
     ctx: DeviceContext,
+    text_len: Int = NT,      # natural caption length; pad rows get indicator 0
 ) raises -> Ideogram4StackLoraGrads:
     """forward → loss (T1.A lever seam) → final backward → stack backward.
     Identical math to ideogram4_lora_train_step_resident minus the AdamW
@@ -630,7 +638,7 @@ def ideogram4_lora_train_compute_resident[
     comptime N = IDEOGRAM4_PACKED_CHANNELS * NIMG
 
     var fwd = ideogram4_lora_train_forward_resident[NT, GH, GW](
-        rw, noisy_latents, t_flow, llm_features, loras, ctx
+        rw, noisy_latents, t_flow, llm_features, loras, ctx, text_len
     )
 
     var target = ideogram4_flow_target(noise, clean, ctx)
@@ -641,12 +649,21 @@ def ideogram4_lora_train_compute_resident[
         ld.d_velocity, fwd.h, fwd.fscale, fwd.flw, ctx
     )
 
-    var grads = ideogram4_stack_lora_backward_resident[
-        SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
-        IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
-    ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, rw, loras, fwd.stack_fwd^, ctx)
-
-    return grads^
+    comptime if IDEOGRAM4_V2_GRAPH_PATH:
+        # P7: per-block graph-engine backward (resident weights stream); same
+        # conductor loop + arg list as the hand-chain. Bit gate:
+        # ideogram4_block_parity.
+        var grads = ideogram4_stack_lora_backward_graph_resident[
+            SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+            IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+        ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, rw, loras, fwd.stack_fwd^, ctx)
+        return grads^
+    else:
+        var grads = ideogram4_stack_lora_backward_resident[
+            SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+            IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+        ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, rw, loras, fwd.stack_fwd^, ctx)
+        return grads^
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -670,6 +687,7 @@ def ideogram4_lora_train_step[
     optimizer_step: Int,
     cfg: TrainConfig,
     ctx: DeviceContext,
+    text_len: Int = NT,      # natural caption length; pad rows get indicator 0
 ) raises -> Ideogram4LoRATrainResult:
     comptime NIMG = GH * GW
     comptime SEQ = NT + NIMG
@@ -677,7 +695,7 @@ def ideogram4_lora_train_step[
 
     # forward → velocity (+ cached tensors)
     var fwd = ideogram4_lora_train_forward[NT, GH, GW](
-        st, noisy_latents, t_flow, llm_features, loras, ctx
+        st, noisy_latents, t_flow, llm_features, loras, ctx, text_len
     )
 
     # flow target = noise - clean (Ideogram4Predict.ideogram4_flow_target)
@@ -698,17 +716,27 @@ def ideogram4_lora_train_step[
     )
 
     # stack LoRA backward → per-adapter grads
-    var grads = ideogram4_stack_lora_backward[
-        SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
-        IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
-    ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, st, loras, fwd.stack_fwd^, ctx)
-
     # AdamW update (REUSED — never hand-rolled)
-    var res = apply_ideogram4_lora_grads(
-        loras, opt_state, grads^, optimizer_step, cfg, ctx
-    )
-
-    return Ideogram4LoRATrainResult(loss, res.adapter_b_l1, True)
+    comptime if IDEOGRAM4_V2_GRAPH_PATH:
+        # P7: per-block graph-engine backward; same conductor loop + arg list as
+        # the hand-chain. Bit gate: ideogram4_block_parity.
+        var grads = ideogram4_stack_lora_backward_graph[
+            SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+            IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+        ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, st, loras, fwd.stack_fwd^, ctx)
+        var res = apply_ideogram4_lora_grads(
+            loras, opt_state, grads^, optimizer_step, cfg, ctx
+        )
+        return Ideogram4LoRATrainResult(loss, res.adapter_b_l1, True)
+    else:
+        var grads = ideogram4_stack_lora_backward[
+            SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+            IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+        ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, st, loras, fwd.stack_fwd^, ctx)
+        var res = apply_ideogram4_lora_grads(
+            loras, opt_state, grads^, optimizer_step, cfg, ctx
+        )
+        return Ideogram4LoRATrainResult(loss, res.adapter_b_l1, True)
 
 
 def ideogram4_lora_train_step_resident[
@@ -725,12 +753,13 @@ def ideogram4_lora_train_step_resident[
     optimizer_step: Int,
     cfg: TrainConfig,
     ctx: DeviceContext,
+    text_len: Int = NT,      # natural caption length; pad rows get indicator 0
 ) raises -> Ideogram4LoRATrainResult:
     # compute (default levers config == literal legacy loss path) + AdamW apply.
     var loss = Float32(0.0)
     var grads = ideogram4_lora_train_compute_resident[NT, GH, GW](
         rw, noisy_latents, clean, noise, t_flow, llm_features, loras,
-        LeversConfig.default(), loss, ctx,
+        LeversConfig.default(), loss, ctx, text_len,
     )
     var res = apply_ideogram4_lora_grads(
         loras, opt_state, grads^, optimizer_step, cfg, ctx

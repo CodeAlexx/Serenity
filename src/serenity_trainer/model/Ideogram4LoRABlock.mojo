@@ -14,3 +14,10 @@ from serenitymojo.models.ideogram4.block import (
     ideogram4_stack_lora_forward_resident, Ideogram4StackLoraGrads,
     ideogram4_stack_lora_backward, ideogram4_stack_lora_backward_resident,
 )
+# P7 autograd_v2 graph variant of the stack backward (separate file so the
+# import graph stays acyclic; see block_stack_graph.mojo header). Re-exported
+# here so trainer files import it alongside the hand-chain.
+from serenitymojo.models.ideogram4.block_stack_graph import (
+    ideogram4_stack_lora_backward_graph,
+    ideogram4_stack_lora_backward_graph_resident,
+)

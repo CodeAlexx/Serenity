@@ -16,12 +16,31 @@ from serenity_trainer.model.Ideogram4LoRABlock import (
     Ideogram4LoraSet,
     Ideogram4StackLoraGrads,
     ideogram4_stack_lora_backward,
+    ideogram4_stack_lora_backward_graph,
     ideogram4_stack_lora_forward,
 )
 from serenity_trainer.util.config.TrainConfig import TrainConfig
 from serenity_trainer.util.optimizer.adamw_extensions import adamw_step
 
 comptime TArc = ArcPointer[Tensor]
+
+# ── autograd_v2 GRAPH SWAP (P7 rollout, klein KLEIN_V2_GRAPH precedent) ───────
+# When IDEOGRAM4_V2_GRAPH_PATH is on, the per-block recompute + hand-chain
+# backward pair in the stack backward is driven by the autograd_v2 graph engine
+# (ideogram4_stack_lora_backward_graph — same conductor loop, same slot fan-in,
+# per-block coarse mini-graphs whose backward calls the hand-chain oracle;
+# SAME-PROCESS bit gate: autograd_v2/tests/ideogram4_block_parity.mojo).
+# ideogram4 is COARSE stage-1 = engine only, NO slab/capture (like Klein P6).
+# False = the previous hand-chain path (C13 gate-don't-delete: the hand-chain in
+# block.mojo stays compiled + reachable; flag default-OFF is byte-identical to
+# today).
+comptime IDEOGRAM4_V2_ENGINE = True
+# DEFAULT-ON (2026-06-25): all trainers must dispatch backward through autograd_v2
+# (Alex mandate). Gated by the per-block bit gate autograd_v2/tests/ideogram4_block_parity
+# (engine grad == hand-chain grad BIT-EQUAL, lead-verified). Hand-chain stays reachable
+# in the else branch (C13). End-to-end trainer N-step anchor pending the eri2 cache.
+comptime IDEOGRAM4_V2_GRAPH = True
+comptime IDEOGRAM4_V2_GRAPH_PATH = IDEOGRAM4_V2_ENGINE and IDEOGRAM4_V2_GRAPH
 
 
 struct Ideogram4LoraAdamState(Movable):
@@ -149,12 +168,23 @@ def train_ideogram4_stack_lora_step[
     var fwd = ideogram4_stack_lora_forward[S, Hidden, Heads, Dh, FF, Adaln](
         x_in, adaln_input, cosf, sinf, transformer_weights, loras, ctx
     )
-    var grads = ideogram4_stack_lora_backward[S, Hidden, Heads, Dh, FF, Adaln](
-        d_stack_out, adaln_input, cosf, sinf, transformer_weights, loras, fwd^, ctx
-    )
-    return apply_ideogram4_lora_grads(
-        loras, opt_state, grads^, optimizer_step, cfg, ctx
-    )
+    comptime if IDEOGRAM4_V2_GRAPH_PATH:
+        # P7: per-block graph-engine backward (same conductor loop, same slot
+        # fan-in, same arg list — drop-in for the hand-chain call below; bit
+        # gate = ideogram4_block_parity).
+        var grads = ideogram4_stack_lora_backward_graph[S, Hidden, Heads, Dh, FF, Adaln](
+            d_stack_out, adaln_input, cosf, sinf, transformer_weights, loras, fwd^, ctx
+        )
+        return apply_ideogram4_lora_grads(
+            loras, opt_state, grads^, optimizer_step, cfg, ctx
+        )
+    else:
+        var grads = ideogram4_stack_lora_backward[S, Hidden, Heads, Dh, FF, Adaln](
+            d_stack_out, adaln_input, cosf, sinf, transformer_weights, loras, fwd^, ctx
+        )
+        return apply_ideogram4_lora_grads(
+            loras, opt_state, grads^, optimizer_step, cfg, ctx
+        )
 
 
 def _l1_sum(x: Tensor, ctx: DeviceContext) raises -> Float32:

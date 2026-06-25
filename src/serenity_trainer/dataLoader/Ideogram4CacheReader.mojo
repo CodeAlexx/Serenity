@@ -43,6 +43,10 @@ struct Ideogram4TrainSample(Copyable, Movable):
     var noisy: TArc
     var llm_features: TArc
     var t_flow: Float32
+    # natural (pre-pad) caption token count; defaults to NT (all real) when the
+    # cache predates the text_len.<i> scalar. Passed to ideogram4_build_packed_inputs
+    # so the DiT indicator is 0 at text-pad positions (ai-toolkit pipeline.py:249).
+    var text_len: Int
     var index: Int
 
     def __init__(
@@ -52,6 +56,7 @@ struct Ideogram4TrainSample(Copyable, Movable):
         var noisy: TArc,
         var llm_features: TArc,
         t_flow: Float32,
+        text_len: Int,
         index: Int,
     ):
         self.clean = clean^
@@ -59,6 +64,7 @@ struct Ideogram4TrainSample(Copyable, Movable):
         self.noisy = noisy^
         self.llm_features = llm_features^
         self.t_flow = t_flow
+        self.text_len = text_len
         self.index = index
 
 
@@ -69,6 +75,10 @@ struct Ideogram4TrainCache(Movable):
     var noise_keys: List[String]
     var noisy_keys: List[String]
     var t_flow_keys: List[String]
+    # natural (pre-pad) caption token length per sample (text_len.<i> scalar,
+    # written by ideogram4_prepare_cache). Empty when the cache predates the fix;
+    # callers then default text_len to NT (all-real-text behavior).
+    var text_len_keys: List[String]
     # T1.D caption dropout: cached empty-caption features llm_uncond
     # [1,NT,53248] ("" = absent; written by ideogram4_prepare_cache when the
     # stage dir has uncond.txt from `ideogram4_stage_images.py --uncond`).
@@ -82,6 +92,7 @@ struct Ideogram4TrainCache(Movable):
         var noise_keys: List[String],
         var noisy_keys: List[String],
         var t_flow_keys: List[String],
+        var text_len_keys: List[String],
         var llm_uncond_key: String,
     ):
         self.src = src^
@@ -90,6 +101,7 @@ struct Ideogram4TrainCache(Movable):
         self.noise_keys = noise_keys^
         self.noisy_keys = noisy_keys^
         self.t_flow_keys = t_flow_keys^
+        self.text_len_keys = text_len_keys^
         self.llm_uncond_key = llm_uncond_key^
 
     @staticmethod
@@ -100,7 +112,8 @@ struct Ideogram4TrainCache(Movable):
         var noise = List[String]()
         var noisy = List[String]()
         var tflow = List[String]()
-        _discover_ideogram4_cache(src, clean, llm, noise, noisy, tflow)
+        var tlen = List[String]()
+        _discover_ideogram4_cache(src, clean, llm, noise, noisy, tflow, tlen)
         if len(clean) == 0:
             raise Error(
                 String("Ideogram4TrainCache: no samples in ") + path
@@ -115,11 +128,13 @@ struct Ideogram4TrainCache(Movable):
             raise Error("Ideogram4TrainCache: partial noisy keys are not supported")
         if len(tflow) != 0 and len(tflow) != len(clean):
             raise Error("Ideogram4TrainCache: partial t_flow keys are not supported")
+        if len(tlen) != 0 and len(tlen) != len(clean):
+            raise Error("Ideogram4TrainCache: partial text_len keys are not supported")
         var uncond_key = String("")
         if String("llm_uncond") in src.name_to_shard:
             uncond_key = String("llm_uncond")
         return Ideogram4TrainCache(
-            src^, clean^, llm^, noise^, noisy^, tflow^, uncond_key^
+            src^, clean^, llm^, noise^, noisy^, tflow^, tlen^, uncond_key^
         )
 
     def len(self) -> Int:
@@ -141,6 +156,19 @@ struct Ideogram4TrainCache(Movable):
         )
         _validate_llm_shape[NT](llm)
         return llm^
+
+    def uncond_text_len[NT: Int](self, ctx: DeviceContext) raises -> Int:
+        """Natural (pre-pad) token length of the uncond render; NT (all-real)
+        when the cache has no text_len_uncond scalar (predates the fix)."""
+        if String("text_len_uncond") not in self.src.name_to_shard:
+            return NT
+        var tl = Tensor.from_view(
+            self.src.tensor_view(String("text_len_uncond")), ctx
+        )
+        var tlh = tl.to_host(ctx)
+        if len(tlh) == 0:
+            return NT
+        return Int(tlh[0])
 
     def sample[NT: Int, GH: Int, GW: Int](
         self,
@@ -176,6 +204,14 @@ struct Ideogram4TrainCache(Movable):
             if len(tfh) > 0:
                 flow = tfh[0]
 
+        # natural caption length: read text_len.<i> if present, else NT (all-real).
+        var text_len = NT
+        if len(self.text_len_keys) == self.len():
+            var tl = Tensor.from_view(self.src.tensor_view(self.text_len_keys[index]), ctx)
+            var tlh = tl.to_host(ctx)
+            if len(tlh) > 0:
+                text_len = Int(tlh[0])
+
         var noise = _load_or_make_noise[GH, GW](
             self, index, clean, noise_seed, ctx
         )
@@ -189,6 +225,7 @@ struct Ideogram4TrainCache(Movable):
             TArc(noisy^),
             TArc(llm^),
             flow,
+            text_len,
             index,
         )
 
@@ -268,8 +305,9 @@ def _discover_ideogram4_cache(
     mut noise: List[String],
     mut noisy: List[String],
     mut tflow: List[String],
+    mut tlen: List[String],
 ) raises:
-    # Indexed cache: clean.<i>/llm.<i>, optional noise/noisy/t_flow.
+    # Indexed cache: clean.<i>/llm.<i>, optional noise/noisy/t_flow/text_len.
     var i = 0
     while True:
         var ckey = String("clean.") + String(i)
@@ -280,12 +318,15 @@ def _discover_ideogram4_cache(
             var nkey = String("noise.") + String(i)
             var xkey = String("noisy.") + String(i)
             var tkey = String("t_flow.") + String(i)
+            var tlkey = String("text_len.") + String(i)
             if nkey in src.name_to_shard:
                 noise.append(nkey)
             if xkey in src.name_to_shard:
                 noisy.append(xkey)
             if tkey in src.name_to_shard:
                 tflow.append(tkey)
+            if tlkey in src.name_to_shard:
+                tlen.append(tlkey)
             i += 1
         else:
             break
@@ -302,6 +343,8 @@ def _discover_ideogram4_cache(
             noisy.append(String("noisy"))
         if String("t_flow") in src.name_to_shard:
             tflow.append(String("t_flow"))
+        if String("text_len") in src.name_to_shard:
+            tlen.append(String("text_len"))
         return
 
     # Existing real Giger predict fixture.

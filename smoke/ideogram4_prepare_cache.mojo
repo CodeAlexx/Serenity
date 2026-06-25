@@ -34,6 +34,7 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.safetensors_writer import save_safetensors
 from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.tensor_algebra import mul
 from serenitymojo.registry.checkpoints import path_exists
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenity_trainer.model.Ideogram4VAE import Ideogram4VaeEncoder
@@ -88,6 +89,13 @@ def main() raises:
         # ── caption -> ids (pad/truncate NT) -> 13-tap features BF16 ──
         var prompt = _read_text(stage_dir + "/prompt." + String(i) + ".txt")
         var ids = tok.encode(prompt)
+        # natural_len = real token count BEFORE padding (capped at NT for truncation).
+        # ai-toolkit encodes at the caption's natural length then masks/pads later;
+        # we pad-to-NT before encode, so we record the real length and zero the pad
+        # feature rows below (matching ai-toolkit get_qwen3_vl_features stacked*text_mask).
+        var natural_len = len(ids)
+        if natural_len > NT:
+            natural_len = NT
         if len(ids) > NT:
             var cut = List[Int]()
             for j in range(NT):
@@ -96,13 +104,40 @@ def main() raises:
         while len(ids) < NT:
             ids.append(PAD_ID)
         var feats = ideogram4_encode_text(tenc, ids, ctx)
-        var llm = cast_tensor(feats, STDtype.BF16, ctx)
+        # Zero the encoder features at pad positions [natural_len, NT): build a
+        # [1,NT,1] mask (1.0 real / 0.0 pad) and broadcast-multiply. This is the
+        # ai-toolkit pipeline.py:156-157 `stacked * text_mask` step (the encoder
+        # itself never masked — ideogram_qwen3vl.mojo). Skip when no padding.
+        var feats_masked: Tensor
+        if natural_len < NT:
+            var mask_host = List[Float32]()
+            for j in range(NT):
+                if j < natural_len:
+                    mask_host.append(Float32(1.0))
+                else:
+                    mask_host.append(Float32(0.0))
+            var mask_f32 = Tensor.from_host(mask_host^, [1, NT, 1], STDtype.F32, ctx)
+            # mask must match feats dtype (BF16) — mul does NOT auto-cast; 1.0/0.0 exact in bf16
+            var mask = cast_tensor(mask_f32, STDtype.BF16, ctx)
+            feats_masked = mul(feats, mask, ctx)
+        else:
+            feats_masked = feats^
+        var llm = cast_tensor(feats_masked, STDtype.BF16, ctx)
 
         names.append(String("clean.") + String(i))
         tensors.append(TArc(clean^))
         names.append(String("llm.") + String(i))
         tensors.append(TArc(llm^))
-        print("[prepare] sample", i, "done (ids", len(ids), ")")
+        # text_len.<i> scalar: the natural (pre-pad) token count. The cache reader
+        # threads it to ideogram4_build_packed_inputs so the DiT indicator is 0 at
+        # pad positions (ai-toolkit pipeline.py:249) and pad position_ids hold at
+        # real_len-1. Absent => callers default text_len=NT (all-real).
+        var tl_host = List[Float32]()
+        tl_host.append(Float32(natural_len))
+        var tl = Tensor.from_host(tl_host^, [1], STDtype.F32, ctx)
+        names.append(String("text_len.") + String(i))
+        tensors.append(TArc(tl^))
+        print("[prepare] sample", i, "done (ids", len(ids), "real", natural_len, ")")
 
     # ── T1.D caption dropout: optional uncond features ──
     # Stage A `--uncond` writes <stage_dir>/uncond.txt (the empty-caption
@@ -113,6 +148,9 @@ def main() raises:
     if path_exists(uncond_path):
         var uprompt = _read_text(uncond_path)
         var uids = tok.encode(uprompt)
+        var u_natural = len(uids)
+        if u_natural > NT:
+            u_natural = NT
         if len(uids) > NT:
             var ucut = List[Int]()
             for j in range(NT):
@@ -121,10 +159,30 @@ def main() raises:
         while len(uids) < NT:
             uids.append(PAD_ID)
         var ufeats = ideogram4_encode_text(tenc, uids, ctx)
-        var ullm = cast_tensor(ufeats, STDtype.BF16, ctx)
+        # Zero pad feature rows for the uncond render too (same masking).
+        var ufeats_masked: Tensor
+        if u_natural < NT:
+            var umask_host = List[Float32]()
+            for j in range(NT):
+                if j < u_natural:
+                    umask_host.append(Float32(1.0))
+                else:
+                    umask_host.append(Float32(0.0))
+            var umask_f32 = Tensor.from_host(umask_host^, [1, NT, 1], STDtype.F32, ctx)
+            var umask = cast_tensor(umask_f32, STDtype.BF16, ctx)
+            ufeats_masked = mul(ufeats, umask, ctx)
+        else:
+            ufeats_masked = ufeats^
+        var ullm = cast_tensor(ufeats_masked, STDtype.BF16, ctx)
         names.append(String("llm_uncond"))
         tensors.append(TArc(ullm^))
-        print("[prepare] llm_uncond done (ids", len(uids), ")")
+        # text_len for the uncond render (read symmetrically by the dropout path).
+        var utl_host = List[Float32]()
+        utl_host.append(Float32(u_natural))
+        var utl = Tensor.from_host(utl_host^, [1], STDtype.F32, ctx)
+        names.append(String("text_len_uncond"))
+        tensors.append(TArc(utl^))
+        print("[prepare] llm_uncond done (ids", len(uids), "real", u_natural, ")")
 
     save_safetensors(names, tensors, out_path, ctx)
     print("[prepare] WROTE", out_path, "samples=", n)

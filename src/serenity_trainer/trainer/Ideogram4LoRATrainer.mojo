@@ -325,12 +325,16 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
         # cached empty-caption llm_uncond features (fail-loud if the cache
         # predates the --uncond stager).
         var llm_in = sample.llm_features.copy()
+        # natural caption length for the DiT pad indicator; uncond substitutes
+        # its own length when caption dropout fires.
+        var text_len_in = sample.text_len
         if caption_dropout_pick(
             UInt64(opt_step + local_step),
             run_cfg.noise_seed,
             drop_p,
         ):
             llm_in = ArcPointer[Tensor](cache.uncond[NT](ctx))
+            text_len_in = cache.uncond_text_len[NT](ctx)
 
         # forward + loss (T1.A lever seam inside) + backward — NO optimizer.
         var step_loss = Float32(0.0)
@@ -345,6 +349,7 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
             lcfg,
             step_loss,
             ctx,
+            text_len_in,
         )
         # Real gradient L1 for the progress line. The apply/levers telemetry
         # returns were stubbed (apply_ideogram4_lora_grads returned grad_b_l1=0.0,

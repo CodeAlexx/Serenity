@@ -36,12 +36,31 @@ import numpy as np
 from PIL import Image
 from safetensors.numpy import save_file
 
+# ai-toolkit (the production oracle) digests the caption before templating:
+# plain-text captions pass through unchanged, structured JSON is minified
+# (separators=(",",":")). The previous json.dumps({"high_level_description":...})
+# wrap injected ~30% extra JSON-scaffold tokens (measured 30→23 ids) that leaked
+# into the maskless DiT. Use ai-toolkit's exact digest.
+sys.path.insert(0, "/home/alex/ai-toolkit")
+from toolkit.ideogram_caption import digest_caption_string
+
 
 def render_prompt(caption: str) -> str:
-    """Caption -> minimal structured-JSON schema -> Qwen3-VL chat template.
-    The ONE render pipeline for real captions and the --uncond empty render."""
-    cap_json = json.dumps({"high_level_description": caption}, ensure_ascii=False)
-    return f"<|im_start|>user\n{cap_json}<|im_end|>\n<|im_start|>assistant\n"
+    """Caption -> ai-toolkit digest -> Qwen3-VL chat template.
+    The ONE render pipeline for real captions and the --uncond empty render.
+
+    Mirrors ai-toolkit extensions_built_in/diffusion_models/ideogram4/
+    ideogram4.py::get_prompt_embeds (522-526):
+      p = digest_caption_string(prompt)
+      apply_chat_template([{role:user, content:[{type:text, text:p}]}],
+                          add_generation_prompt=True, tokenize=False)
+    The Qwen3-VL chat_template.jinja for a single user text message with
+    add_generation_prompt=True (and no system message) expands EXACTLY to
+    "<|im_start|>user\\n{p}<|im_end|>\\n<|im_start|>assistant\\n" — no default
+    system prompt is injected. GATE-verified: this produces token-ids identical
+    to apply_chat_template (23 ids vs the json-wrap's 30)."""
+    p = digest_caption_string(caption)
+    return f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
 
 
 def main():
