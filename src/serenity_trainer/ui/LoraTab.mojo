@@ -1,4 +1,4 @@
-"""LoRA/OFT tab for the native Serenity Trainer trainer UI."""
+"""Adapter tab for the native Serenity Trainer trainer UI."""
 
 from mojoui.core.context import Context
 from mojoui.widgets.form import (
@@ -43,8 +43,8 @@ def render_lora_tab(mut ctx: Context, mut cfg: TrainerUIConfig, content_w: Int32
     var label_w = _label_w(ctx, cw)
     var val_w = value_w(cw - ctx.theme.padding * 2, label_w)
     ctx.layout_row(row2(cw, cw), _panel_h(ctx, 6))
-    begin_form_panel(ctx, String("LORA PARAMETERS"), String("Adapter type, rank, alpha, dropout"), ctx.theme.padding)
-    _ = select_string_row(ctx, label_w, val_w, String("PEFT Type"), String("peft_type_lora"), cfg.peft_options, cfg.peft_type, cfg.select_open_id)
+    begin_form_panel(ctx, String("ADAPTER PARAMETERS"), String("Network algorithm, rank, alpha, dropout"), ctx.theme.padding)
+    _ = select_string_row(ctx, label_w, val_w, String("Algorithm"), String("peft_type_lora"), cfg.peft_options, cfg.peft_type, cfg.select_open_id)
     field_row(ctx, label_w, val_w, String("LoRA Name"), cfg.lora_model_name.copy())
     _ = slider_row(ctx, label_w, val_w, String("LoRA Rank"), String("lora_rank"), cfg.lora_rank, 1.0, 256.0)
     _ = slider_row(ctx, label_w, val_w, String("LoRA Alpha"), String("lora_alpha"), cfg.lora_alpha, 1.0, 256.0)

@@ -135,6 +135,7 @@ from serenitymojo.offload.block_loader import Block
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.levers import (
     caption_dropout_pick, levers_loss_active, levers_loss_grad,
@@ -559,6 +560,7 @@ def main() raises:
         train_cfg = read_model_config(String(args[7]))
         has_config = True
         print("[config] ", String(args[7]))
+    require_lora_or_locon_linear(train_cfg, String("HiDream O1"))
 
     # argv wins for steps/lr/rank/out_dir when non-"-"; "-" defers to config.
     var steps: Int

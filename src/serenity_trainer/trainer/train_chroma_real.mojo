@@ -99,6 +99,7 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
 )
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -197,6 +198,7 @@ def _close_f32(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
 
 
 def validate_chroma_train_config(cfg: TrainConfig) raises:
+    require_lora_or_locon_linear(cfg, String("Chroma"))
     if cfg.checkpoint == String(""):
         raise Error("Chroma trainer config must set checkpoint")
     if not cfg.checkpoint.endswith(String(".safetensors")):

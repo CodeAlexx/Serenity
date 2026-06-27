@@ -11,7 +11,8 @@ precedent as the Chroma campaign builder deviation.
   via `scripts/serenity_terminal_launcher.sh`. The config JSON is written at
   launch by the UI (`trainer_ui_runner_train_config_json`) in the serenitymojo
   TrainConfig schema: arch dims verbatim from `serenitymojo/configs/<m>.json`,
-  recipe (lr/rank/alpha/steps/save_every/cache_dir/checkpoint) from the UI.
+  recipe (lr/rank/alpha/steps/save_every/cache_dir/checkpoint/network_algorithm)
+  from the UI.
   The runner re-validates every dim and pinned recipe value at startup — drift
   fails loud before any GPU work.
 - runner → UI: stdout is teed into the polled progress file
@@ -21,6 +22,22 @@ precedent as the Chroma campaign builder deviation.
 - Bridge scanners (`_find_token`/`_find_char`/`_token_end`) were rewritten to
   RAW-BYTE scanning: trainer stdout contains multi-byte UTF-8 ("—" banner) and
   String codepoint indexing at arbitrary byte offsets asserts mid-codepoint.
+
+## 2026-06-27 LyCORIS config update
+- The Algorithm dropdown now emits both `network_algorithm` and `adapter_algo`
+  into runner JSON. Supported values are plain `lora`, `locon`, `lokr`, and
+  `loha` from the UI surface; OFT remains visible as an old option but model
+  trainers reject it unless a future carrier is added.
+- LoCon uses the existing linear LoRA-compatible down/up path. The conv LoCon
+  primitive remains gated in mojodiffusion but is not threaded into conv-bearing
+  model stacks.
+- Klein is the only end-to-end LoKr carrier. Non-Klein LoKr and LoHa requests
+  fail loud before checkpoint load; LTX2 rejects any non-LoRA algorithm at UI
+  validation.
+- L2P now accepts the same config-file launch shape as the other config-driven
+  runners. The old positional `<steps>` form still works, but UI launches pass
+  `<config.json> <steps>` and the runner validates cache/checkpoint/dims before
+  creating a CUDA context.
 
 ## Pinned recipe constants (fail-loud at runner startup)
 - **SDXL**: rank=16, alpha=16, lr=1e-4, clip=1.0 (comptime).

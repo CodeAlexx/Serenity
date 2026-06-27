@@ -95,6 +95,7 @@ from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
 )
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -201,6 +202,7 @@ def qwen_patchified_out_channels(cfg: TrainConfig) -> Int:
 
 
 def validate_qwen_train_config(cfg: TrainConfig) raises:
+    require_lora_or_locon_linear(cfg, String("Qwen-Image"))
     # The hot stack functions are still comptime-specialized for the 512px
     # Qwen-Image bucket. Fail here instead of silently using mismatched metadata.
     if cfg.checkpoint == String(""):

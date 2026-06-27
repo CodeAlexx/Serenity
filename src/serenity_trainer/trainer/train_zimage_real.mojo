@@ -151,7 +151,10 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 )
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON, TRAIN_OPTIMIZER_ADAMW,
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOCON,
 )
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -423,8 +426,8 @@ def validate_zimage_full_ft_config(cfg: TrainConfig) raises:
 # group on its own host-AdamW; the compiled LoRA recipe pins below do NOT
 # apply — controlnet uses cfg.lr directly, ControlNet-LR class).
 def validate_zimage_controlnet_config(cfg: TrainConfig) raises:
-    if cfg.adapter_algo != 0:
-        raise Error("Z-Image controlnet training requires adapter_algo=0 (lora config shape, adapters unused)")
+    if cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error("Z-Image controlnet training requires network_algorithm=lora (adapters unused)")
     if cfg.checkpoint == String(""):
         raise Error("Z-Image controlnet config must set checkpoint transformer dir")
     if cfg.n_heads != H or cfg.head_dim != Dh or cfg.d_model != D:
@@ -455,7 +458,7 @@ def validate_zimage_controlnet_config(cfg: TrainConfig) raises:
 
 
 def validate_zimage_train_config(cfg: TrainConfig) raises:
-    if cfg.adapter_algo == 1:
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
         if cfg.controlnet_layers > 0:
             raise Error("Z-Image full-FT + controlnet is not a supported combination")
         validate_zimage_full_ft_config(cfg)
@@ -464,11 +467,13 @@ def validate_zimage_train_config(cfg: TrainConfig) raises:
     if cfg.controlnet_layers > 0:
         validate_zimage_controlnet_config(cfg)
         return
-    if cfg.adapter_algo != 0:
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[Z-Image-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
         raise Error(
-            String("Z-Image trainer: adapter_algo ")
-            + String(cfg.adapter_algo)
-            + String(" is not wired (0=lora, 1=full are supported)")
+            String("Z-Image trainer: network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired (supported here: lora, locon, full)")
         )
     if cfg.checkpoint == String(""):
         raise Error("Z-Image trainer config must set checkpoint transformer dir")
@@ -2716,7 +2721,7 @@ def main() raises:
 
     # T2.C: full-rank finetune is its own runtime driver (validated above by
     # validate_zimage_full_ft_config); the LoRA path below is untouched (C13).
-    if train_cfg.adapter_algo == 1:
+    if train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
         if resume_state != String("") and resume_state != String("-"):
             raise Error("zimage full-FT v1: LoRA resume state does not apply")
         if train_cfg.only_cache:

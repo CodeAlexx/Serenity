@@ -131,7 +131,12 @@ from serenitymojo.offload.plan import build_klein_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.train_config import (
     TrainConfig, TRAIN_OPTIMIZER_ADAMW,
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOHA, TRAIN_ADAPTER_ALGO_DORA,
+    TRAIN_ADAPTER_ALGO_LOKR, TRAIN_ADAPTER_ALGO_OFT,
+    TRAIN_ADAPTER_ALGO_BOFT, TRAIN_ADAPTER_ALGO_LOCON,
 )
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -709,7 +714,7 @@ def main() raises:
     validate_klein_train_config(cfg)
     # T2.G: LoKr (adapter_algo==4) routes the adapter set through the Kronecker
     # carrier path. Default (0) leaves every branch below byte-unchanged.
-    var lokr_active = cfg.adapter_algo == 4
+    var lokr_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
     var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
     var output_lora_path = String("")
@@ -854,7 +859,7 @@ def main() raises:
     # full-delta weights through the stack is a flagged follow-up; we fail loud
     # rather than silently train the wrong thing. Default (0) leaves the proven
     # LoRA path byte-unchanged.
-    if cfg.adapter_algo == 1:
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
         raise Error(
             "adapter_algo=1 (LyCORIS Full) selected: the Full adapter primitive "
             + "+ .diff.weight save ship in training/full_adapter.mojo, but the "
@@ -862,7 +867,7 @@ def main() raises:
             + "weights through the stack is a tracked follow-up. Use adapter_algo=0 "
             + "(plain LoRA) for now."
         )
-    elif cfg.adapter_algo == 2:
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
         # adapter_algo==2 selects LyCORIS LoHa. The LoHa PRIMITIVE (4-factor
         # forward/backward/AdamW) + hada_w1/w2 + .alpha save convention ship in
         # training/loha_adapter.mojo + training/loha_save.mojo and are gated by
@@ -880,7 +885,7 @@ def main() raises:
             + "2-factor A/B only — wiring the 4-factor LoHa delta through the stack "
             + "is a tracked follow-up. Use adapter_algo=0 (plain LoRA) for now."
         )
-    elif cfg.adapter_algo == 3:
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA:
         # adapter_algo==3 selects DoRA (weight-decomposed LoRA). The DoRA
         # PRIMITIVE (effective-weight fwd, 3-grad bwd over lora_down/lora_up/
         # magnitude, AdamW) + lora_down/lora_up/.dora_scale/.alpha save convention
@@ -901,7 +906,7 @@ def main() raises:
             + "magnitude/direction WP_dora through the stack is a tracked "
             + "follow-up. Use adapter_algo=0 (plain LoRA) for now."
         )
-    elif cfg.adapter_algo == 4:
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
         # adapter_algo==4: LyCORIS LoKr e2e TRAINING (T2.G 2026-06-11,
         # SimpleTuner-parity). LoKr masters (training/lokr_adapter.mojo,
         # upstream lycoris_lora 3.4.0 semantics: factorization(dim,factor),
@@ -938,7 +943,7 @@ def main() raises:
             " init_lokr_norm=", cfg.init_lokr_norm,
             " rank=", cfg.lora_rank, " alpha=", cfg.lora_alpha,
         )
-    elif cfg.adapter_algo == 5:
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
         # adapter_algo==5 selects Diag-OFT (Orthogonal Fine-Tuning). The OFT
         # PRIMITIVE (exact-Cayley R=(I+Q)⁻¹(I-Q) per output block, W_eff=R@W
         # forward, analytic d_S backward through the Cayley + skew chain, AdamW)
@@ -959,7 +964,7 @@ def main() raises:
             + "multiplicative block-diagonal rotation through the stack is a "
             + "tracked follow-up. Use adapter_algo=0 (plain LoRA) for now."
         )
-    elif cfg.adapter_algo == 6:
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
         # adapter_algo==6 selects BOFT (Butterfly OFT). The BOFT PRIMITIVE
         # (m-stage butterfly product of block-diagonal exact-Cayley rotations
         # with butterfly permutation between stages, analytic per-stage d_S
@@ -981,8 +986,16 @@ def main() raises:
             + "additive-LoRA-only — wiring the butterfly rotation chain through "
             + "the stack is a tracked follow-up. Use adapter_algo=0 (plain LoRA) for now."
         )
-    elif cfg.adapter_algo != 0:
-        raise Error(String("unknown adapter_algo ") + String(cfg.adapter_algo) + " (0=LoRA, 1=Full, 2=LoHa, 3=DoRA, 4=LoKr, 5=OFT, 6=BOFT)")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[Klein-locon] network_algorithm=locon: Klein has linear targets only; using the LoRA-compatible down/up path")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("unknown adapter_algo ")
+            + String(cfg.adapter_algo)
+            + String(" (")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String("; supported here: lora, locon, lokr)")
+        )
 
     # ── build LoRA set (OneTrainer split slots: 12 double + 2 single) ─────────
     var lora = build_klein_lora_set(

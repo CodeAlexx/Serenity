@@ -651,7 +651,7 @@ def _gate_capability_warnings() raises:
            trainer_ui_ignored_lever_summary(kl) == String(""),
            String("summary='") + trainer_ui_ignored_lever_summary(kl) + String("'"))
 
-    # decorative widgets are unsupported EVERYWHERE (masked / full-FT / PEFT)
+    # masked / full-FT are still decorative; adapter algorithm is emitted.
     kl.masked_training = True
     kl.training_method_index = 1  # Fine Tune
     kl.peft_type = String("LOKR")
@@ -660,7 +660,7 @@ def _gate_capability_warnings() raises:
            _contains(s_kl, String("klein ignores: "))
            and _contains(s_kl, String("masked_training"))
            and _contains(s_kl, String("training_method"))
-           and _contains(s_kl, String("peft_type")),
+           and not _contains(s_kl, String("network_algorithm")),
            String("summary='") + s_kl + String("'"))
 
     # zimage fully supported set stays silent too
@@ -673,9 +673,8 @@ def _gate_capability_warnings() raises:
            trainer_ui_ignored_lever_summary(zi) == String(""),
            String("summary='") + trainer_ui_ignored_lever_summary(zi) + String("'"))
 
-    # UI wave 2 item 3: decorative widgets are EXCLUDED from every runner
-    # emission — flipping them must not change the runner config at all
-    # (so they cannot silently no-op inside a launch).
+    # Masked/training_method/aspect remain excluded from runner emission, but
+    # network_algorithm/adapter_algo are now real runner keys.
     var kl2 = TrainerUIConfig()
     kl2.model_type_index = 1
     trainer_ui_apply_model_preset(kl2, True)
@@ -686,19 +685,21 @@ def _gate_capability_warnings() raises:
     kl2.peft_type = String("LOKR")
     kl2.aspect_ratio_bucketing = False
     var flipped_json = trainer_ui_runner_train_config_json(kl2)
-    _check(String("decorative-excluded-klein"), base_json == flipped_json,
-           String("emission changed when only decorative widgets flipped"))
-    for token_i in range(4):
+    _check(String("network-algorithm-emitted-klein"),
+           _contains(base_json, String("\"network_algorithm\": \"lora\""))
+           and _contains(base_json, String("\"adapter_algo\": \"lora\""))
+           and _contains(flipped_json, String("\"network_algorithm\": \"lokr\""))
+           and _contains(flipped_json, String("\"adapter_algo\": \"lokr\"")),
+           String("base=lora flipped=lokr"))
+    for token_i in range(3):
         var token = String("masked")
         if token_i == 1:
-            token = String("adapter_algo")
-        elif token_i == 2:
             token = String("aspect")
-        elif token_i == 3:
+        elif token_i == 2:
             token = String("peft")
         _check(String("decorative-key-absent"),
                not _contains(base_json, token.copy()),
-               String("token '") + token + String("' leaked into klein emission"))
+               String("token '") + token + String("' absent"))
 
 
 def main() raises:

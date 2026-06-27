@@ -144,6 +144,21 @@ def _timestep_distribution_int(s: String) raises -> Int:
     raise Error(String("JSON config: unknown timestep_distribution '") + s + "'")
 
 
+def _adapter_algo_int(s: String) raises -> Int:
+    if s == "lora" or s == "LORA":
+        return 0
+    elif s == "locon" or s == "LOCON" or s == "lycoris" or s == "LYCORIS":
+        return 7
+    elif s == "loha" or s == "LOHA":
+        return 2
+    elif s == "lokr" or s == "LOKR":
+        return 4
+    raise Error(
+        String("JSON config: unknown adapter algorithm '") + s
+        + "' (expected lora|locon|loha|lokr)"
+    )
+
+
 # Serenity nests beta1/beta2/epsilon/weight_decay under "optimizer".
 def _parse_optimizer(mut cur: _Cursor, mut cfg: TrainConfig) raises:
     cur.expect(0x7B)
@@ -241,6 +256,11 @@ def read_train_config(json_path: String) raises -> TrainConfig:
             cfg.lora_rank = Int(_read_scalar(cur).num)
         elif key == "lora_alpha":
             cfg.lora_alpha = Float32(_read_scalar(cur).num)
+        elif key == "network_algorithm" or key == "adapter_algo" or key == "algo":
+            var sc = _read_scalar(cur)
+            if not sc.is_string:
+                raise Error("JSON config: network_algorithm/adapter_algo/algo must be a string")
+            cfg.adapter_algo = _adapter_algo_int(sc.s)
         elif key == "timestep_distribution":
             var sc = _read_scalar(cur)
             if not sc.is_string:

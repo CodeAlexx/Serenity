@@ -99,6 +99,7 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
 )
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -212,6 +213,7 @@ def sd35_checkpoint_from_train_config(cfg: TrainConfig) -> String:
 
 
 def validate_sd35_train_config(cfg: TrainConfig) raises:
+    require_lora_or_locon_linear(cfg, String("SD3.5"))
     if (
         cfg.name != String("STABLE_DIFFUSION_35")
         and cfg.name != String("sd35")

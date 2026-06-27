@@ -125,6 +125,13 @@ Copy serenitymojo `models/<model>/*` → `serenity-trainer/src/serenity_trainer/
   BIT-EXACT; klein flags-off anchors in-class (0.5414 exact/0.2155/0.7810).
   Rebuild the deployed klein runner post-T2.G (it was built from the
   in-flight tree, LoKr default-off).
+- **2026-06-27 LyCORIS selector delivery:** serenity-trainer now emits
+  `network_algorithm` and `adapter_algo` for config-driven runners. The shared
+  reader accepts `lora`, `locon`/`lycoris`, `loha`, and `lokr` (plus legacy
+  full/dora/oft/boft ids in mojodiffusion). Production routing is guarded:
+  LoCon uses the linear LoRA-compatible path, Klein remains the only LoKr
+  end-to-end trainer, LoHa is primitive/save-format only, and LTX2 rejects
+  non-LoRA at UI validation.
 - Detail ledgers: mojodiffusion serenitymojo/docs/TIER1_PARITY_CAMPAIGN_
   2026-06-11.md + TIER2_PARITY_CAMPAIGN_2026-06-11.md; UI audit:
   docs/UI_AUDIT_2026-06-12.md.

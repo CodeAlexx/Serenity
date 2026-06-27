@@ -87,6 +87,7 @@ from serenitymojo.models.dit.anima_contract import (
 from serenitymojo.training.schedule import sample_timestep_sigmoid
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.train_config import TrainConfig, GRADIENT_CHECKPOINTING_ON
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -192,6 +193,7 @@ def _parse_nonnegative_int(s: String) raises -> Int:
 
 
 def validate_anima_train_config(cfg: TrainConfig) raises:
+    require_lora_or_locon_linear(cfg, String("Anima"))
     if cfg.name != String("anima") and cfg.name != String("ANIMA"):
         raise Error(String("Anima trainer config requires model_type=anima/ANIMA, got ") + cfg.name)
     if cfg.checkpoint == String(""):

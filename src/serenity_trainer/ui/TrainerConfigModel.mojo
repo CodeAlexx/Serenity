@@ -455,6 +455,7 @@ struct TrainerUIConfig(Movable):
 
         self.peft_options = List[String]()
         self.peft_options.append(String("LORA"))
+        self.peft_options.append(String("LOCON"))
         self.peft_options.append(String("LOKR"))
         self.peft_options.append(String("LOHA"))
         self.peft_options.append(String("OFT"))
@@ -977,6 +978,8 @@ def trainer_ui_validate(cfg: TrainerUIConfig) -> String:
         return String("LoRA rank must be >= 1")
     if cfg.learning_rate <= 0.0:
         return String("Learning rate must be > 0")
+    if cfg.backend_target == String("ltx2") and trainer_ui_network_algorithm(cfg) != String("lora"):
+        return String("LyCORIS adapters are disabled for LTX2")
     return String("Ready")
 
 
@@ -990,8 +993,23 @@ def trainer_ui_validate(cfg: TrainerUIConfig) -> String:
 #   chroma/ernie/anima/sdxl/l2p: ZERO hits for ema_enabled /
 #     caption_dropout_prob / levers_* — the recipe-tail keys are parsed by
 #     read_model_config but NEVER READ by those trainers.
-#   masked_training / training_method (full-FT) / peft_type: consumed by NO
-#   runner — decorative until wired (snapshot-only, excluded from emission).
+#   masked_training / training_method (full-FT): consumed by NO runner.
+#
+# network_algorithm is emitted into runner configs. LoCon maps to the
+# linear-LoRA-compatible LyCORIS path unless a model wires conv adapters;
+# non-LoRA algorithms still fail loud in runners that have no real math path.
+
+
+def trainer_ui_network_algorithm(cfg: TrainerUIConfig) -> String:
+    if cfg.peft_type == String("LOCON"):
+        return String("locon")
+    if cfg.peft_type == String("LOKR"):
+        return String("lokr")
+    if cfg.peft_type == String("LOHA"):
+        return String("loha")
+    if cfg.peft_type == String("OFT"):
+        return String("oft")
+    return String("lora")
 
 
 def trainer_ui_supported_lever_keys(target: String) -> List[String]:
@@ -1008,6 +1026,16 @@ def trainer_ui_supported_lever_keys(target: String) -> List[String]:
         keys.append(String("min_snr_gamma_flow"))
         keys.append(String("ema"))
         keys.append(String("caption_dropout"))
+        keys.append(String("network_algorithm"))
+    elif (
+        target == String("chroma")
+        or target == String("ernie")
+        or target == String("anima")
+        or target == String("sdxl")
+        or target == String("l2p")
+        or target == String("qwen")
+    ):
+        keys.append(String("network_algorithm"))
     return keys^
 
 
@@ -1032,7 +1060,7 @@ def trainer_ui_active_lever_keys(cfg: TrainerUIConfig) -> List[String]:
     if cfg.training_method_index != 0:
         keys.append(String("training_method"))
     if cfg.peft_type != String("LORA"):
-        keys.append(String("peft_type"))
+        keys.append(String("network_algorithm"))
     return keys^
 
 
@@ -1069,6 +1097,8 @@ def _runner_recipe_json(cfg: TrainerUIConfig) -> String:
         rank = 1
     return (
         String("  \"learning_rate\": ") + String(cfg.learning_rate) + String(",\n")
+        + String("  \"network_algorithm\": \"") + trainer_ui_network_algorithm(cfg) + String("\",\n")
+        + String("  \"adapter_algo\": \"") + trainer_ui_network_algorithm(cfg) + String("\",\n")
         + String("  \"lora_rank\": ") + String(rank) + String(",\n")
         + String("  \"lora_alpha\": ") + String(cfg.lora_alpha) + String(",\n")
         + String("  \"timestep_shift\": ") + String(cfg.timestep_shift) + String(",\n")
@@ -1429,6 +1459,7 @@ def trainer_ui_config_json_snapshot(cfg: TrainerUIConfig) -> String:
         + String("\"layer_filter\":\"") + cfg.layer_filter.copy() + String("\",")
         + String("\"layer_filter_regex\":") + String(cfg.layer_filter_regex) + String(",")
         + String("\"peft_type\":\"") + cfg.peft_type.copy() + String("\",")
+        + String("\"network_algorithm\":\"") + trainer_ui_network_algorithm(cfg) + String("\",")
         + String("\"lora_model_name\":\"") + cfg.lora_model_name.copy() + String("\",")
         + String("\"lora_rank\":") + String(cfg.lora_rank) + String(",")
         + String("\"lora_alpha\":") + String(cfg.lora_alpha) + String(",")

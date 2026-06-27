@@ -86,6 +86,9 @@ from serenitymojo.models.l2p.local_decoder_train import (
 from serenitymojo.models.dit.zimage_l2p_local_decoder import ZImageL2PLocalDecoderGate
 from serenitymojo.training.klein_dataset import L2PCache
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 
 
 # ── arch (Z-Image L2P; IDENTICAL body to Z-Image base) ───────────────────────
@@ -181,6 +184,64 @@ def _absum_l2p[dt: DType](v: List[Scalar[dt]]) -> Float32:
         var x = Float32(v[i])
         s += x if x >= 0.0 else -x
     return s
+
+
+def _parse_nonnegative_int_l2p(s: String) raises -> Int:
+    if s.byte_length() == 0:
+        raise Error("train_l2p_real: expected non-negative integer")
+    var out = 0
+    var bs = s.as_bytes()
+    for i in range(s.byte_length()):
+        if bs[i] < 0x30 or bs[i] > 0x39:
+            raise Error(String("train_l2p_real: expected non-negative integer, got ") + s)
+        out = out * 10 + Int(bs[i] - 0x30)
+    return out
+
+
+def _close_l2p(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
+    var d = a - b
+    if d < Float32(0.0):
+        d = -d
+    return d <= tol
+
+
+def validate_l2p_train_config(cfg: TrainConfig) raises:
+    require_lora_or_locon_linear(cfg, String("L2P"))
+    if cfg.name != String("l2p") and cfg.name != String("zimage_l2p"):
+        raise Error(String("L2P trainer config requires model_type=l2p, got ") + cfg.name)
+    if cfg.checkpoint == String(""):
+        raise Error("L2P trainer config must set checkpoint")
+    if cfg.dataset_cache_dir == String("") and cfg.cache_dir == String(""):
+        raise Error("L2P trainer config must set cache_dir")
+    if cfg.n_heads != H:
+        raise Error(String("L2P config num_heads ") + String(cfg.n_heads) + String(" != H ") + String(H))
+    if cfg.head_dim != Dh:
+        raise Error(String("L2P config head_dim ") + String(cfg.head_dim) + String(" != Dh ") + String(Dh))
+    if cfg.d_model != D:
+        raise Error(String("L2P config inner_dim ") + String(cfg.d_model) + String(" != D ") + String(D))
+    if cfg.in_channels != PIX_C:
+        raise Error(String("L2P config in_channels ") + String(cfg.in_channels) + String(" != PIX_C ") + String(PIX_C))
+    if cfg.joint_attention_dim != CAP_DIM:
+        raise Error(String("L2P config joint_attention_dim ") + String(cfg.joint_attention_dim) + String(" != CAP_DIM ") + String(CAP_DIM))
+    if cfg.out_channels != PIX_C:
+        raise Error(String("L2P config out_channels ") + String(cfg.out_channels) + String(" != PIX_C ") + String(PIX_C))
+    if cfg.num_double != 0 or cfg.num_single != MAIN_DEPTH:
+        raise Error(
+            String("L2P trainer requires num_double=0 num_single=")
+            + String(MAIN_DEPTH)
+            + String("; got double=") + String(cfg.num_double)
+            + String(" single=") + String(cfg.num_single)
+        )
+    if cfg.mlp_hidden != F:
+        raise Error(String("L2P config mlp_hidden ") + String(cfg.mlp_hidden) + String(" != F ") + String(F))
+    if cfg.lora_rank != RANK:
+        raise Error(String("L2P trainer is compiled for lora_rank=") + String(RANK))
+    if not _close_l2p(cfg.lora_alpha, ALPHA):
+        raise Error("L2P trainer lora_alpha does not match compiled constant")
+    if not _close_l2p(cfg.lr, LR, Float32(1.0e-9)):
+        raise Error("L2P trainer learning_rate does not match compiled constant")
+    if not _close_l2p(cfg.max_grad_norm, CLIP_GRAD_NORM):
+        raise Error("L2P trainer max_grad_norm does not match compiled constant")
 
 
 def _global_norm_l2p(grads: ZImageLoraGrads, start: Int, end: Int) -> Float64:
@@ -458,23 +519,41 @@ def _train_one_step_l2p(
 def main() raises:
     var ctx = DeviceContext()
     var a = argv()
-    var run_steps = 5
+    var arg_base = 1
+    var has_config = False
+    var train_cfg = TrainConfig.default()
     if len(a) >= 2:
-        var v = 0
-        var bs = String(a[1]).as_bytes()
-        for i in range(String(a[1]).byte_length()):
-            v = v * 10 + Int(bs[i] - 0x30)
-        run_steps = v
+        var first = String(a[1])
+        if first.endswith(String(".json")):
+            train_cfg = read_model_config(first)
+            has_config = True
+            arg_base = 2
+            validate_l2p_train_config(train_cfg)
+
+    var run_steps = 5
+    if has_config and train_cfg.max_steps > 0:
+        run_steps = train_cfg.max_steps
+    if len(a) > arg_base:
+        run_steps = _parse_nonnegative_int_l2p(String(a[arg_base]))
     var start_step = 0
-    if len(a) >= 3:
-        var v2 = 0
-        var bs2 = String(a[2]).as_bytes()
-        for i in range(String(a[2]).byte_length()):
-            v2 = v2 * 10 + Int(bs2[i] - 0x30)
-        start_step = v2
+    if len(a) > arg_base + 1:
+        start_step = _parse_nonnegative_int_l2p(String(a[arg_base + 1]))
     var resume_state = String("")
-    if len(a) >= 4:
-        resume_state = String(a[3])
+    if len(a) > arg_base + 2:
+        resume_state = String(a[arg_base + 2])
+    if run_steps < 1:
+        raise Error("train_l2p_real: run_steps must be >= 1")
+    if start_step > run_steps:
+        raise Error("train_l2p_real: start_step cannot exceed run_steps")
+
+    var ckpt_path = String(CHECKPOINT_PATH)
+    var cache_dir = String(CACHE_DIR)
+    if has_config:
+        ckpt_path = train_cfg.checkpoint.copy()
+        if train_cfg.dataset_cache_dir != String(""):
+            cache_dir = train_cfg.dataset_cache_dir.copy()
+        elif train_cfg.cache_dir != String(""):
+            cache_dir = train_cfg.cache_dir.copy()
 
     print("=== Z-Image L2P REAL LoRA training loop (ai-toolkit faithful) ===")
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " F=", F)
@@ -484,12 +563,12 @@ def main() raises:
     print("  bucket: 512x512 -> N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S)
     print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR,
           " timestep=UNIFORM UNSHIFTED")
-    print("  checkpoint:", CHECKPOINT_PATH)
-    print("  cache:", CACHE_DIR)
+    print("  checkpoint:", ckpt_path)
+    print("  cache:", cache_dir)
     print("  head: REAL FROZEN local_decoder (MicroDiffusionModel U-Net) fwd+bwd")
 
     # ── cache first: fail before loading the ~19 GB checkpoint ───────────────
-    var cache = L2PCache(String(CACHE_DIR))
+    var cache = L2PCache(cache_dir.copy())
     print("[cache] samples:", cache.count())
     var k0 = cache.peek_key(0, ctx)
     print("[cache] first entry: C=", k0.c, " H=", k0.h, " W=", k0.w, " cap_seq=", k0.seq)
@@ -498,7 +577,7 @@ def main() raises:
 
     # ── load checkpoint ───────────────────────────────────────────────────────
     print("[load] opening single-file checkpoint")
-    var st = SafeTensors.open(String(CHECKPOINT_PATH))
+    var st = SafeTensors.open(ckpt_path.copy())
     print("[load] tensors in checkpoint:", st.count())
     print("[load] aux (embedders + adaLN per block)")
     var aux = load_l2p_real_aux(st, NUM_NR, MAIN_DEPTH, ctx)
@@ -523,7 +602,7 @@ def main() raises:
 
     # ── FROZEN local_decoder (load BF16 gate, cast convs to F32 once) ─────────
     print("[load] local_decoder (MicroDiffusionModel U-Net, FROZEN)")
-    var dec_gate = ZImageL2PLocalDecoderGate.load(String(CHECKPOINT_PATH), ctx)
+    var dec_gate = ZImageL2PLocalDecoderGate.load(ckpt_path.copy(), ctx)
     var dec = l2p_decoder_f32_from_gate(dec_gate, ctx)
 
     # ── LoRA set ──────────────────────────────────────────────────────────────

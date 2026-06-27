@@ -194,8 +194,7 @@ def render_training_tab(mut ctx: Context, mut cfg: TrainerUIConfig, content_w: I
     _ = select_string_row(ctx, label_w, val_w, String("Preset"), String("layer_filter_preset"), cfg.layer_filter_preset_options, cfg.layer_filter_preset, cfg.select_open_id)
     field_row(ctx, label_w, val_w, String("Filter"), cfg.layer_filter.copy())
     _ = toggle_row(ctx, label_w, val_w, String("Regex"), String("Enabled"), cfg.layer_filter_regex)
-    # PEFT selector is decorative: adapter_algo is never emitted to any
-    # runner (UI always trains plain LoRA). Marked until LoKr/LoHa/OFT land.
-    _ = select_string_row(ctx, label_w, val_w, String("PEFT [LORA only]"), String("peft_type_training"), cfg.peft_options, cfg.peft_type, cfg.select_open_id)
+    # This selector is emitted as network_algorithm/adapter_algo in runner JSON.
+    _ = select_string_row(ctx, label_w, val_w, String("Algorithm"), String("peft_type_training"), cfg.peft_options, cfg.peft_type, cfg.select_open_id)
     field_row(ctx, label_w, val_w, String("Target"), String("transformer blocks"))
     end_form_panel(ctx)

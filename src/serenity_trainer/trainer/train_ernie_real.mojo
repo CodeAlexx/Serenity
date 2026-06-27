@@ -77,6 +77,7 @@ from serenitymojo.models.ernie.ernie_stack_lora import (
 )
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import TrainConfig
+from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -435,6 +436,7 @@ def _step_lora_path(save_path: String, step: Int) -> String:
 
 
 def validate_ernie_train_config(cfg: TrainConfig) raises:
+    require_lora_or_locon_linear(cfg, String("ERNIE"))
     if cfg.name != String("ernie_image"):
         raise Error(String("ERNIE trainer config requires model_type=ernie_image, got ") + cfg.name)
     if cfg.checkpoint == String(""):

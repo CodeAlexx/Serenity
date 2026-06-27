@@ -52,6 +52,9 @@ struct TrainConfig(Copyable, Movable):
     # LoRA
     var lora_rank: Int
     var lora_alpha: Float32
+    # 0=lora, 2=loha, 4=lokr, 7=locon. Kept aligned with serenitymojo's
+    # production TrainConfig ids so local smoke/config paths do not drift.
+    var adapter_algo: Int
 
     # rng
     var seed: UInt32
@@ -104,6 +107,7 @@ struct TrainConfig(Copyable, Movable):
             min_snr_gamma=Float32(5.0),
             lora_rank=16,
             lora_alpha=Float32(16.0),
+            adapter_algo=0,
             seed=UInt32(0),
             # noising-schedule defaults mirror Serenity TrainConfig.py:1020-1025
             timestep_distribution=TSDIST_UNIFORM,
