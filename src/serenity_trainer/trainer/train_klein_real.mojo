@@ -179,6 +179,14 @@ from serenitymojo.training.lokr_stack import (
     klein_lokr_clip_grads, klein_lokr_adamw_step, klein_lokr_trainable_l1,
     klein_lokr_zero_leg_l1, save_klein_lokr, klein_lokr_apply_perturbed_init,
 )
+# LoHa (adapter_algo==2): Hadamard delta → r_eff=r² carrier through the SAME stack.
+from serenitymojo.training.loha_stack import (
+    KleinLoHaSet, KleinLoHaGrads, build_klein_loha_set, empty_klein_loha_set,
+    klein_loha_carrier_lists, lokr_loha_carrier_total_bytes,
+    klein_loha_chain_all, klein_loha_grad_norm, klein_loha_clip_grads,
+    klein_loha_adamw_step, klein_loha_trainable_l1, klein_loha_zero_leg_l1,
+    save_klein_loha,
+)
 
 
 # ── config file (binding rule 2026-05-31: arch + recipe come from the FILE) ──
@@ -715,6 +723,10 @@ def main() raises:
     # T2.G: LoKr (adapter_algo==4) routes the adapter set through the Kronecker
     # carrier path. Default (0) leaves every branch below byte-unchanged.
     var lokr_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    # Both LoKr and LoHa drive the SHARED carrier path (host AdamW on masters +
+    # per-step carrier re-upload + hand-chain backward); only build/chain/save differ.
+    var carrier_active = lokr_active or loha_active
     var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
     var output_lora_path = String("")
@@ -836,7 +848,7 @@ def main() raises:
     # Byte-identical weights (same pinned block store bytes) → loss unchanged.
     # T2.G: LoKr runs pin NOTHING — the carrier adapter set takes the VRAM
     # headroom the pinned blocks would use (full_matrix carriers especially).
-    var resident_budget_bytes = 0 if lokr_active else RESIDENT_BUDGET_BYTES
+    var resident_budget_bytes = 0 if carrier_active else RESIDENT_BUDGET_BYTES
     var pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
     print(
         "  resident blocks pinned:", pinned_blocks, "of",
@@ -868,22 +880,26 @@ def main() raises:
             + "(plain LoRA) for now."
         )
     elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
-        # adapter_algo==2 selects LyCORIS LoHa. The LoHa PRIMITIVE (4-factor
-        # forward/backward/AdamW) + hada_w1/w2 + .alpha save convention ship in
-        # training/loha_adapter.mojo + training/loha_save.mojo and are gated by
-        # loha_adapter_smoke.mojo (parity + 4-factor grad-flow + save round-trip,
-        # incl. a deliberate dead-factor abort). The Klein stack
-        # forward/backward (klein_stack_lora_*) is HARDWIRED to the 2-factor
-        # KleinLoraSet A/B path across the offloaded-scratch arms, so swapping
-        # every adapted linear onto the 4-factor LoHa delta is a larger
-        # follow-up. We fail loud rather than silently train the wrong thing.
-        raise Error(
-            "adapter_algo=2 (LyCORIS LoHa) selected: the LoHa adapter primitive "
-            + "(4-factor fwd/bwd/AdamW) + hada_w1/w2 + .alpha save ship in "
-            + "training/loha_adapter.mojo + training/loha_save.mojo and are gated "
-            + "by loha_adapter_smoke.mojo, but the Klein stack forward/backward is "
-            + "2-factor A/B only — wiring the 4-factor LoHa delta through the stack "
-            + "is a tracked follow-up. Use adapter_algo=0 (plain LoRA) for now."
+        # adapter_algo==2: LyCORIS LoHa e2e TRAINING (2026-06-27). The Hadamard
+        # delta (w1a@w1b)⊙(w2a@w2b) has rank ≤ r², so it factors into a SMALL
+        # (a,b) carrier (r_eff=r², training/loha_stack.mojo) that trains through
+        # the EXISTING stack — NO 4-factor stack rewrite. Host AdamW on the
+        # masters; save in the upstream lycoris hada_w1/w2 + .alpha convention.
+        # Proven: klein_stack_loha_real_smoke + loha_carrier_parity.
+        # CONSTRAINTS this wave (fail loud, mirroring LoKr's honest scope):
+        if cfg.grad_accum_steps > 1:
+            raise Error("adapter_algo=2 (LoHa): grad_accum_steps>1 not wired this wave")
+        if cfg.ema_enabled:
+            raise Error("adapter_algo=2 (LoHa): EMA shadows not wired this wave")
+        if levers_optimizer_active(cfg):
+            raise Error("adapter_algo=2 (LoHa): levers optimizers not wired (host AdamW only)")
+        if resume_lora != String(""):
+            raise Error("adapter_algo=2 (LoHa): resume/init_lora warm-start not wired this wave")
+        # In-process sampling loads PEFT LoRA; the LoHa product file is lycoris-format.
+        runtime_sample_enabled = False
+        print(
+            "[Klein-loha] LoHa training: targets=", cfg.lokr_targets,
+            " rank=", cfg.lora_rank, " alpha=", cfg.lora_alpha,
         )
     elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA:
         # adapter_algo==3 selects DoRA (weight-decomposed LoRA). The DoRA
@@ -1028,6 +1044,7 @@ def main() raises:
     # delta (lokr_stack.mojo L1/L2/L3). The LoKr masters own init, optimizer
     # state and the saved checkpoint.
     var lokr_masters = empty_klein_lokr_set()
+    var loha_masters = empty_klein_loha_set()
     if lokr_active:
         lokr_masters = build_klein_lokr_set(
             cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
@@ -1061,6 +1078,26 @@ def main() raises:
             cfg.num_double, cfg.num_single, cfg.lora_rank,
         )
         print("[Klein-lokr] carrier set materialized:", len(lora.dbl), "double-slot +", len(lora.sgl), "single-slot")
+    if loha_active:
+        loha_masters = build_klein_loha_set(
+            cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            cfg.lora_rank, cfg.lora_alpha, cfg.lokr_targets,
+            SEED_BASE * UInt64(53) + UInt64(11),
+        )
+        var loha_bytes = lokr_loha_carrier_total_bytes(loha_masters)
+        print("[Klein-loha] carrier device bytes:", loha_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if loha_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("adapter_algo=2 (LoHa): carrier set needs ")
+                + String(loha_bytes) + " bytes on device (> budget "
+                + String(LOKR_CARRIER_MAX_DEVICE_BYTES) + ")."
+            )
+        var loha_carriers = klein_loha_carrier_lists(loha_masters, cfg.d_model, cfg.mlp_hidden)
+        lora = KleinLoraSet(
+            loha_carriers[0].copy(), loha_carriers[1].copy(),
+            cfg.num_double, cfg.num_single, cfg.lora_rank,
+        )
+        print("[Klein-loha] carrier set materialized:", len(lora.dbl), "double-slot +", len(lora.sgl), "single-slot")
 
     # v2 engine: persistent device OT-AdamW state (dbl + sgl lists) + a
     # resident device LoRA set viewing the live param buffers. Built ONCE
@@ -1071,7 +1108,7 @@ def main() raises:
     var dbl_state: LoraAdamWOTDeviceState
     var sgl_state: LoraAdamWOTDeviceState
     var resident_lora_dev: KleinLoraDeviceSet
-    if lokr_active:
+    if carrier_active:
         var dummy = build_klein_lora_set(1, 1, 8, 8, 1, Float32(1.0))
         dbl_state = lora_adamw_ot_device_state_init(dummy.dbl, ctx)
         sgl_state = lora_adamw_ot_device_state_init(dummy.sgl, ctx)
@@ -1297,9 +1334,9 @@ def main() raises:
         base.final_shift = mods[3].copy()
         base.final_scale = mods[4].copy()
         var lora_dev: KleinLoraDeviceSet
-        if lokr_active:
-            # LoKr: the host carrier set is re-materialized after every master
-            # AdamW step, so it is re-uploaded per step (the pre-v2 path).
+        if carrier_active:
+            # Carrier (LoKr/LoHa): the host carrier set is re-materialized after
+            # every master AdamW step, so it is re-uploaded per step (pre-v2 path).
             lora_dev = klein_lora_set_to_device(lora, ctx)
         else:
             comptime if KLEIN_V2_ENGINE:
@@ -1368,7 +1405,7 @@ def main() raises:
                 # T2.G: LoKr keeps the C13-gated hand-chain (per-step fresh
                 # carrier device sets; the graph arm is validated on the
                 # resident plain-LoRA set only).
-                if lokr_active:
+                if carrier_active:
                     g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
                         lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
                         loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
@@ -1460,10 +1497,10 @@ def main() raises:
         # adapter's TOTAL |d_A|+|d_B| == 0 at step>=1 (a truly dead branch).
         # (LoKr: untargeted slots are deliberate zero carriers — warn suppressed.)
         for i in range(nd):
-            if (not lokr_active) and _abs_sum(g.dbl_d_a[i]) + _abs_sum(g.dbl_d_b[i]) == 0.0:
+            if (not carrier_active) and _abs_sum(g.dbl_d_a[i]) + _abs_sum(g.dbl_d_b[i]) == 0.0:
                 print("[Klein-lora] dead_adapter step=", k, " idx=", i, " kind=double")
         for i in range(ns):
-            if (not lokr_active) and _abs_sum(g.sgl_d_a[i]) + _abs_sum(g.sgl_d_b[i]) == 0.0:
+            if (not carrier_active) and _abs_sum(g.sgl_d_a[i]) + _abs_sum(g.sgl_d_b[i]) == 0.0:
                 print("[Klein-lora] dead_adapter step=", k, " idx=", nd + i, " kind=single")
 
         # ── global-norm grad clip across ALL LoRA grads (EDv2 default-ON) ──────
@@ -1471,7 +1508,7 @@ def main() raises:
         # carrier grads pass through unclipped, mirroring ST clipping the
         # actual lycoris trainables.)
         var clip_scale = Float32(1.0)
-        if (not lokr_active) and grad_norm > Float64(cfg.max_grad_norm):
+        if (not carrier_active) and grad_norm > Float64(cfg.max_grad_norm):
             clip_scale = cfg.max_grad_norm / Float32(grad_norm)
             for i in range(nd):
                 _scale_inplace(g.dbl_d_a[i], clip_scale)
@@ -1531,6 +1568,34 @@ def main() raises:
                 " master_grad_norm=", Float32(mnorm),
                 " factor_l1=", klein_lokr_trainable_l1(lokr_masters),
                 " zero_leg_l1=", klein_lokr_zero_leg_l1(lokr_masters),
+            )
+        elif loha_active:
+            # LoHa carrier optimizer path (mirrors LoKr): chain carrier grads →
+            # 4-factor master grads, clip masters, host AdamW, re-materialize.
+            var mg = klein_loha_chain_all(
+                loha_masters, g.dbl_d_a, g.dbl_d_b, g.sgl_d_a, g.sgl_d_b
+            )
+            var mnorm = klein_loha_grad_norm(mg)
+            grad_norm = mnorm
+            if mnorm > Float64(cfg.max_grad_norm):
+                clip_scale = cfg.max_grad_norm / Float32(mnorm)
+                klein_loha_clip_grads(mg, clip_scale)
+            klein_loha_adamw_step(
+                loha_masters, mg, optimizer_step, step_lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            var loha_carriers_k = klein_loha_carrier_lists(
+                loha_masters, cfg.d_model, cfg.mlp_hidden
+            )
+            lora = KleinLoraSet(
+                loha_carriers_k[0].copy(), loha_carriers_k[1].copy(),
+                cfg.num_double, cfg.num_single, cfg.lora_rank,
+            )
+            print(
+                "[Klein-loha] step=", k,
+                " master_grad_norm=", Float32(mnorm),
+                " factor_l1=", klein_loha_trainable_l1(loha_masters),
+                " zero_leg_l1=", klein_loha_zero_leg_l1(loha_masters),
             )
         elif levers_optimizer_active(cfg):
             levers_optimizer_step_host(
@@ -1615,6 +1680,12 @@ def main() raises:
                 # is not wired — fail-loud at startup).
                 var nmods = save_klein_lokr(lokr_masters, ckpt, ctx)
                 print("[Klein-lokr] save step=", k, " path=", ckpt, " modules=", nmods)
+                board.log_text(String("events/save"), k, ckpt)
+            elif loha_active:
+                # LoHa product file in the upstream lycoris hada_w1/w2 + .alpha
+                # key convention. No optimizer-state sidecar this wave.
+                var nmods = save_klein_loha(loha_masters, ckpt, ctx)
+                print("[Klein-loha] save step=", k, " path=", ckpt, " modules=", nmods)
                 board.log_text(String("events/save"), k, ckpt)
             else:
                 var npairs = save_klein_lora(lora, ckpt, ctx)
