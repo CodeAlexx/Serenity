@@ -49,11 +49,12 @@ struct TrainConfig(Copyable, Movable):
     var loss_weight_kind: Int
     var min_snr_gamma: Float32
 
-    # LoRA
+    # LoRA / LyCORIS. Values align with serenitymojo.training.train_config:
+    # 0=lora, 2=loha, 3=dora, 4=lokr, 5=oft, 6=boft, 7=locon.
+    # BOFT is parsed as an explicit error by TrainConfigReader; the value is
+    # documented here only so stale numeric configs remain unambiguous.
     var lora_rank: Int
     var lora_alpha: Float32
-    # 0=lora, 2=loha, 4=lokr, 7=locon. Kept aligned with serenitymojo's
-    # production TrainConfig ids so local smoke/config paths do not drift.
     var adapter_algo: Int
 
     # rng

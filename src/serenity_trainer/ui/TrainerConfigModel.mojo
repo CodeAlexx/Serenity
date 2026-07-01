@@ -25,6 +25,13 @@ comptime SERENITY_KLEIN_VAE = "/home/alex/.serenity/models/vaes/flux2-vae.safete
 comptime SERENITY_KLEIN_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/klein9b_alina_samples.json"
 comptime SERENITY_IDEOGRAM4_BASE = "/home/alex/.serenity/models/ideogram-4-fp8"
 comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/trainings/ideogram4_giger_cache/cache.safetensors"
+# Krea-2 Raw — trainer lives in mojodiffusion because it is the shared
+# model/runtime vertical; Serenity launches it as a live trainer binary.
+comptime SERENITY_KREA2_CHECKPOINT = "/home/alex/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494/raw.safetensors"
+comptime SERENITY_KREA2_VAE = "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots/75e0b4be04f60ec59a75f475837eced720f823b6/vae"
+comptime SERENITY_KREA2_CACHE = "/home/alex/eri2_stage_512/cache.safetensors"
+comptime SERENITY_KREA2_WORKSPACE = "/home/alex/trainings/krea2_eri2_lora"
+comptime SERENITY_KREA2_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/krea2_samples.json"
 # HiDream-O1 — serenitymojo train_hidream_o1_real (P4 of
 # HIDREAM_O1_TRAINING_CAMPAIGN.md). Weights dir is COMPTIME in the trainer
 # (MODEL_DIR) — base_model_name is carried for display/config only. The data
@@ -352,6 +359,8 @@ struct TrainerUIConfig(Movable):
         self.model_type_options.append(String("WAN_22_VIDEO"))
         # HiDream-O1 appended LAST so existing option indices stay stable.
         self.model_type_options.append(String("HIDREAM_O1"))
+        # Krea-2 appended LAST so existing option indices stay stable.
+        self.model_type_options.append(String("KREA_2"))
         self.model_type_index = 1
         self.model_type_open = False
 
@@ -369,6 +378,8 @@ struct TrainerUIConfig(Movable):
         self.architecture_options.append(String("Wan2.2 T2V 14B"))
         # HiDream-O1 appended LAST so existing option indices stay stable.
         self.architecture_options.append(String("HiDream O1"))
+        # Krea-2 appended LAST so existing option indices stay stable.
+        self.architecture_options.append(String("Krea 2 Raw"))
         self.architecture_index = 1
         self.architecture_open = False
 
@@ -382,6 +393,11 @@ struct TrainerUIConfig(Movable):
         # .mojo via the levers optimizer dispatch). Appended LAST so existing
         # option indices stay stable.
         self.optimizer_options.append(String("SCHEDULE_FREE_ADAMW"))
+        # ai-toolkit Automagic3 (serenitymojo training/automagic3.mojo via the
+        # levers optimizer dispatch). Appended LAST so existing option indices
+        # stay stable. Emits "AUTOMAGIC3" verbatim into the runner config
+        # (io/train_config_reader.mojo _optimizer_int -> TRAIN_OPTIMIZER_AUTOMAGIC3).
+        self.optimizer_options.append(String("AUTOMAGIC3"))
         self.optimizer_index = 1
         self.optimizer_open = False
 
@@ -458,6 +474,7 @@ struct TrainerUIConfig(Movable):
         self.peft_options.append(String("LOCON"))
         self.peft_options.append(String("LOKR"))
         self.peft_options.append(String("LOHA"))
+        self.peft_options.append(String("DORA"))
         self.peft_options.append(String("OFT"))
 
         self.sample_sampler_options = List[String]()
@@ -759,6 +776,8 @@ def _arch_index_for_model_type(model_type_index: Int32) -> Int32:
         return 10
     if model_type_index == 11:  # HIDREAM_O1
         return 11
+    if model_type_index == 12:  # KREA_2
+        return 12
     return -1  # STABLE_DIFFUSION_35: no trainable runner yet
 
 
@@ -786,6 +805,8 @@ def _model_type_for_arch_index(architecture_index: Int32) -> Int32:
         return 10
     if architecture_index == 11:  # HiDream O1
         return 11
+    if architecture_index == 12:  # Krea 2 Raw
+        return 12
     return -1
 
 
@@ -824,6 +845,8 @@ def trainer_ui_apply_model_preset(mut cfg: TrainerUIConfig, prefer_model_type: B
         cfg.model_arch = String("ideogram4")
         cfg.sample_sampler = String("Ideogram4 FlowMatch")
         cfg.sampler_preset = String("V4_DEFAULT_20")
+        cfg.samples = List[TrainerUISample]()
+        cfg.samples.append(TrainerUISample(String("{\"caption\":\"gigerver3 biomechanical portrait, intricate organic machinery, sharp focus\"}"), String(""), 42))
     elif arch == 3:
         # SDXL — serenitymojo train_sdxl_real (eps-pred conv-UNet LoRA).
         # Recipe defaults mirror serenitymojo/configs/sdxl.json.
@@ -958,6 +981,36 @@ def trainer_ui_apply_model_preset(mut cfg: TrainerUIConfig, prefer_model_type: B
         cfg.lora_rank = 32.0
         cfg.lora_alpha = 32.0
         cfg.timestep_shift = 3.0
+    elif arch == 12:
+        # Krea-2 Raw — mojodiffusion train_krea2.mojo (512px Eri2 cache,
+        # fp8-resident base, inline sampler uses cached conditioning by default).
+        cfg.backend_target = String("krea2")
+        cfg.model_type_index = 12
+        cfg.architecture_index = 12
+        cfg.run_name = String("eri2_krea2_lora")
+        cfg.base_model_name = String(SERENITY_KREA2_CHECKPOINT)
+        cfg.vae_override = String(SERENITY_KREA2_VAE)
+        cfg.cache_dir = String(SERENITY_KREA2_CACHE)
+        cfg.workspace_dir = String(SERENITY_KREA2_WORKSPACE)
+        cfg.sample_output_dir = String(SERENITY_KREA2_WORKSPACE) + String("/samples")
+        cfg.model_arch = String("krea2_raw")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.sampler_preset = String("KREA2_20")
+        cfg.learning_rate = 0.0001
+        cfg.lora_rank = 64.0
+        cfg.lora_alpha = 64.0
+        cfg.peft_type = String("LORA")
+        cfg.timestep_shift = 1.0
+        cfg.quantized_resident = String("fp8_e4m3")
+        cfg.sample_cfg = 1.0
+        cfg.sample_steps = 20.0
+        cfg.sample_after = 500.0
+        cfg.max_train_steps = 2000.0
+        cfg.save_every = 40.0
+        cfg.save_filename_prefix = String("eri2_krea2")
+        cfg.frames = String("1")
+        cfg.resolution = String("512")
+        cfg.text_encoder_sequence_length = String("384")
 
 
 def trainer_ui_total_steps(cfg: TrainerUIConfig) -> Int32:
@@ -990,6 +1043,8 @@ def trainer_ui_validate(cfg: TrainerUIConfig) -> String:
 #   klein/zimage  (serenitymojo train_<m>_real): levers_loss_grad,
 #     levers_optimizer_*, cfg.ema_enabled, cfg.caption_dropout_prob — ALL six.
 #   hidream/ideogram4: same six (T1 fan-out + Ideogram4LiveTrainer argv 10/11).
+#   krea2: loss/optimizer/network_algorithm are consumed by train_krea2; EMA
+#     and caption_dropout are not consumed and should still warn if enabled.
 #   chroma/ernie/anima/sdxl/l2p: ZERO hits for ema_enabled /
 #     caption_dropout_prob / levers_* — the recipe-tail keys are parsed by
 #     read_model_config but NEVER READ by those trainers.
@@ -1007,6 +1062,8 @@ def trainer_ui_network_algorithm(cfg: TrainerUIConfig) -> String:
         return String("lokr")
     if cfg.peft_type == String("LOHA"):
         return String("loha")
+    if cfg.peft_type == String("DORA"):
+        return String("dora")
     if cfg.peft_type == String("OFT"):
         return String("oft")
     return String("lora")
@@ -1026,6 +1083,12 @@ def trainer_ui_supported_lever_keys(target: String) -> List[String]:
         keys.append(String("min_snr_gamma_flow"))
         keys.append(String("ema"))
         keys.append(String("caption_dropout"))
+        keys.append(String("network_algorithm"))
+    elif target == String("krea2"):
+        keys.append(String("optimizer"))
+        keys.append(String("warmup"))
+        keys.append(String("loss_fn"))
+        keys.append(String("min_snr_gamma_flow"))
         keys.append(String("network_algorithm"))
     elif (
         target == String("chroma")
@@ -1148,6 +1211,34 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + String("  \"num_heads\": 32,\n  \"head_dim\": 128,\n")
             + String("  \"mlp_hidden\": 12288,\n  \"timestep_dim\": 256,\n")
             + String("  \"rope_theta\": 2000,\n")
+            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
+            + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
+            + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
+            + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
+            + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("krea2"):
+        # Krea-2 Raw — mojodiffusion train_krea2.mojo. It has the same
+        # TrainConfig reader as the config-driven runners, but the live argv is
+        # `<cache.safetensors> <steps> <config.json>` because the cache is
+        # positional in the Krea2 trainer.
+        return (
+            String("{\n  \"model_type\": \"krea2\",\n")
+            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"vae\": \"") + String(SERENITY_KREA2_VAE) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_KREA2_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"inner_dim\": 6144,\n  \"in_channels\": 64,\n")
+            + String("  \"joint_attention_dim\": 2560,\n  \"out_channels\": 64,\n")
+            + String("  \"num_double\": 0,\n  \"num_single\": 28,\n")
+            + String("  \"num_heads\": 48,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 16384,\n  \"timestep_dim\": 256,\n")
+            + String("  \"rope_theta\": 1000,\n")
+            + String("  \"quantized_resident\": \"") + cfg.quantized_resident.copy() + String("\",\n")
+            + String("  \"workspace_dir\": \"") + cfg.workspace_dir.copy() + String("\",\n")
+            + String("  \"save_filename_prefix\": \"") + cfg.save_filename_prefix.copy() + String("\",\n")
             + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")

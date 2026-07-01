@@ -11,7 +11,8 @@ from serenitymojo.models.ideogram4.block import (
     Ideogram4BlockActs, Ideogram4BlockOut, ideogram4_block_lora_forward,
     Ideogram4BlockLoraGrads, Ideogram4BlockBwd, ideogram4_block_lora_backward,
     Ideogram4StackForward, ideogram4_stack_lora_forward,
-    ideogram4_stack_lora_forward_resident, Ideogram4StackLoraGrads,
+    ideogram4_stack_lora_forward_resident,
+    ideogram4_stack_lora_forward_resident_nosave, Ideogram4StackLoraGrads,
     ideogram4_stack_lora_backward, ideogram4_stack_lora_backward_resident,
 )
 # P7 autograd_v2 graph variant of the stack backward (separate file so the

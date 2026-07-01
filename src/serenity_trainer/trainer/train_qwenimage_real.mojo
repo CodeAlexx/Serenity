@@ -76,8 +76,37 @@ from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
     build_qwen_lora_set, save_qwen_lora, save_qwen_lora_state,
     qwenimage_stack_lora_forward_offload,
     qwenimage_stack_lora_backward_offload,
+    build_qwen_direct_dora_set_from_offload,
+    qwenimage_stack_direct_dora_forward_offload,
+    qwenimage_stack_direct_dora_backward_offload,
+    qwenimage_stack_direct_oft_forward_offload,
+    qwenimage_stack_direct_oft_backward_offload,
     qwen_offload_lora_adamw_step,
     DBL_SLOTS,
+)
+from serenitymojo.models.qwenimage.qwenimage_lycoris_stack import (
+    QwenLoKrSet, empty_qwen_lokr_set, build_qwen_lokr_set,
+    qwen_lokr_carrier_set, qwen_lokr_carrier_total_bytes,
+    qwen_lokr_chain_all, qwen_lokr_adamw_step, qwen_lokr_grad_norm,
+    qwen_lokr_clip_grads, qwen_lokr_zero_leg_l1, save_qwen_lokr,
+    QwenLoHaSet, empty_qwen_loha_set, build_qwen_loha_set,
+    qwen_loha_carrier_set, qwen_loha_carrier_total_bytes,
+    qwen_loha_chain_all, qwen_loha_adamw_step, qwen_loha_grad_norm,
+    qwen_loha_clip_grads, qwen_loha_zero_leg_l1, save_qwen_loha,
+)
+from serenitymojo.models.qwenimage.qwenimage_direct_lycoris_stack import (
+    QWEN_DIRECT_24_GIB,
+    empty_qwen_direct_dora_set, empty_qwen_direct_oft_set,
+    build_qwen_direct_oft_set,
+    qwen_direct_dense_carrier_bytes,
+    qwen_direct_dora_preflight,
+    qwen_direct_oft_preflight,
+    qwen_direct_dora_grad_norm, qwen_direct_dora_clip_grads,
+    qwen_direct_dora_adamw_step, qwen_direct_dora_zero_leg_l1,
+    qwen_direct_dora_trainable_bytes, save_qwen_direct_dora,
+    qwen_direct_oft_grad_norm, qwen_direct_oft_clip_grads,
+    qwen_direct_oft_adamw_step, qwen_direct_oft_vec_l1,
+    qwen_direct_oft_trainable_bytes, save_qwen_direct_oft,
 )
 from serenitymojo.models.dit.qwenimage_dit import (
     QwenImageConfig, build_qwenimage_rope_tables,
@@ -94,8 +123,13 @@ from serenitymojo.training.schedule import (
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOCON, TRAIN_ADAPTER_ALGO_LOHA,
+    TRAIN_ADAPTER_ALGO_DORA, TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
-from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -111,6 +145,7 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_ONLY,
     ot_lr_for_optimizer_step,
     ot_sample_cadence_from_train_config,
+    ot_sampling_enabled,
     ot_should_save_before_sample,
     ot_state_path_for_lora,
     ot_step_lora_path,
@@ -202,7 +237,28 @@ def qwen_patchified_out_channels(cfg: TrainConfig) -> Int:
 
 
 def validate_qwen_train_config(cfg: TrainConfig) raises:
-    require_lora_or_locon_linear(cfg, String("Qwen-Image"))
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[QwenImage-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
+        print("[QwenImage-lokr] network_algorithm=lokr: using carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
+        print("[QwenImage-loha] network_algorithm=loha: using carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA or cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
+        print(
+            String("[QwenImage-direct] network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(": using direct W_eff stack dispatch; sample cadence must be disabled")
+        )
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("Qwen-Image trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("Qwen-Image trainer: full finetune is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("Qwen-Image trainer: network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+        )
     # The hot stack functions are still comptime-specialized for the 512px
     # Qwen-Image bucket. Fail here instead of silently using mismatched metadata.
     if cfg.checkpoint == String(""):
@@ -263,6 +319,10 @@ def qwen_sample_cadence_from_train_config(
     return ot_sample_cadence_from_train_config(cfg_path, cfg)
 
 
+def qwen_sampling_enabled(cadence: SampleCadence) -> Bool:
+    return ot_sampling_enabled(cadence)
+
+
 def qwen_should_save_before_sample(
     cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
 ) raises -> Bool:
@@ -275,6 +335,34 @@ def qwen_state_path_for_lora(lora_path: String) -> String:
 
 def _step_lora_path(base_path: String, step: Int) -> String:
     return ot_step_lora_path(base_path, step)
+
+
+def _substr(s: String, start: Int, end: Int) -> String:
+    var out = String("")
+    var i = 0
+    for ch in s.codepoint_slices():
+        if i >= start and i < end:
+            out += String(ch)
+        i += 1
+    return out^
+
+
+def _dirname(path: String) -> String:
+    var last = -1
+    var i = 0
+    for ch in path.codepoint_slices():
+        if String(ch) == String("/"):
+            last = i
+        i += 1
+    if last <= 0:
+        return String(".")
+    return _substr(path, 0, last)
+
+
+def _mkdir_parent(path: String) raises:
+    var parent_dir = _dirname(path)
+    if parent_dir != String("."):
+        makedirs(parent_dir, exist_ok=True)
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -491,6 +579,15 @@ def main() raises:
     var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
     var sample_cadence = qwen_sample_cadence_from_train_config(cfg_path, train_cfg)
+    var sample_enabled = qwen_sampling_enabled(sample_cadence)
+    var direct_algo_requested = (
+        train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+        or train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    )
+    if sample_enabled and direct_algo_requested:
+        raise Error(
+            "QwenImage direct DoRA/OFT sample-during-training is not wired; disable sample cadence for this runtime gate"
+        )
     var offload_cfg = qwen_offload_config_from_train_config(train_cfg)
     if run_steps <= 0:
         run_steps = train_cfg.max_steps
@@ -502,6 +599,7 @@ def main() raises:
     var output_lora_path = String(LORA_DIR) + String("/qwenimage_lora_smoke.safetensors")
     if train_cfg.output_model_destination != String(""):
         output_lora_path = train_cfg.output_model_destination.copy()
+    _mkdir_parent(output_lora_path)
 
     print("=== Qwen-Image REAL LoRA training loop (block-swap offload) ===")
     print("  config:", cfg_path)
@@ -527,7 +625,7 @@ def main() raises:
     print("  ckpt:", train_cfg.checkpoint)
     print("  cache:", cache_dir)
 
-    if should_sample_completed_step(sample_cadence, 0):
+    if sample_enabled and should_sample_completed_step(sample_cadence, 0):
         print("[cadence] step 0 sample due; fires after the first completed step (sampler is wired)")
     var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
     print("[cadence] next sample completed_step=", next_sample)
@@ -591,16 +689,124 @@ def main() raises:
     var sin_h = rope[1].to_host(ctx)
     print("[load] Qwen-Image 3-axis RoPE tables built (S*H x Dh//2)")
 
+    var lokr_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var dora_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var direct_active = dora_active or oft_active
+    var carrier_active = lokr_active or loha_active
+    var lycoris_active = carrier_active or direct_active
+    var direct_targets = train_cfg.lokr_targets
+    var direct_oft_block_size = 4
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
     var lora = build_qwen_lora_set(
-        train_cfg.num_double,
+        0,
         train_cfg.d_model,
         train_cfg.mlp_hidden,
         train_cfg.lora_rank,
         train_cfg.lora_alpha,
     )
-    var n_adapters = train_cfg.num_double * Int(DBL_SLOTS)
-    print("[lora] adapters:", n_adapters, " (", DBL_SLOTS, "x", NUM_DOUBLE, "double)")
+    var n_adapters = 0
+    if not direct_active:
+        lora = build_qwen_lora_set(
+            train_cfg.num_double,
+            train_cfg.d_model,
+            train_cfg.mlp_hidden,
+            train_cfg.lora_rank,
+            train_cfg.lora_alpha,
+        )
+        n_adapters = train_cfg.num_double * Int(DBL_SLOTS)
+    var lokr_masters = empty_qwen_lokr_set()
+    var loha_masters = empty_qwen_loha_set()
+    var dora_masters = empty_qwen_direct_dora_set()
+    var oft_masters = empty_qwen_direct_oft_set()
+    if lokr_active:
+        lokr_masters = build_qwen_lokr_set(
+            train_cfg.num_double, train_cfg.d_model, train_cfg.mlp_hidden,
+            train_cfg.lora_rank, train_cfg.lora_alpha,
+            train_cfg.lokr_factor, train_cfg.lokr_factor_attn,
+            train_cfg.lokr_factor_ff,
+            train_cfg.lokr_decompose_both, train_cfg.lokr_full_matrix,
+            direct_targets, UInt64(700001),
+        )
+        var carrier_bytes = qwen_lokr_carrier_total_bytes(
+            lokr_masters, train_cfg.d_model, train_cfg.mlp_hidden
+        )
+        print("[QwenImage-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("Qwen-Image LoKr: carrier set needs ")
+                + String(carrier_bytes)
+                + String(" bytes (> budget). Use a smaller lokr_factor/rank or restrict lokr_targets.")
+            )
+        lora = qwen_lokr_carrier_set(lokr_masters, train_cfg.d_model, train_cfg.mlp_hidden)
+        print("[QwenImage-lokr] carrier set materialized:", len(lora.dbl), "adapters")
+    elif loha_active:
+        loha_masters = build_qwen_loha_set(
+            train_cfg.num_double, train_cfg.d_model, train_cfg.mlp_hidden,
+            train_cfg.lora_rank, train_cfg.lora_alpha,
+            direct_targets, UInt64(800001),
+        )
+        var carrier_bytes = qwen_loha_carrier_total_bytes(
+            loha_masters, train_cfg.d_model, train_cfg.mlp_hidden
+        )
+        print("[QwenImage-loha] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("Qwen-Image LoHa: carrier set needs ")
+                + String(carrier_bytes)
+                + String(" bytes (> budget). Reduce lora_rank or restrict lokr_targets.")
+        )
+        lora = qwen_loha_carrier_set(loha_masters, train_cfg.d_model, train_cfg.mlp_hidden)
+        print("[QwenImage-loha] carrier set materialized:", len(lora.dbl), "adapters")
+    elif dora_active:
+        var dense_bytes = qwen_direct_dense_carrier_bytes(
+            train_cfg.num_double, train_cfg.d_model, train_cfg.mlp_hidden,
+            direct_targets,
+        )
+        var direct_bytes = qwen_direct_dora_preflight(
+            train_cfg.num_double, train_cfg.d_model, train_cfg.mlp_hidden,
+            train_cfg.lora_rank, direct_targets, QWEN_DIRECT_24_GIB,
+            False,
+        )
+        print("[QwenImage-dora] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " budget:", QWEN_DIRECT_24_GIB)
+        print("[QwenImage-dora] initializing DoRA magnitudes from streamed Qwen block weights ...")
+        dora_masters = build_qwen_direct_dora_set_from_offload(
+            loader, train_cfg.num_double, train_cfg.d_model, train_cfg.mlp_hidden,
+            Int(Dh), train_cfg.lora_rank, train_cfg.lora_alpha, direct_targets,
+            train_cfg.seed * UInt64(61) + UInt64(7200), False, ctx,
+        )
+        print("[QwenImage-dora] trainable bytes:", qwen_direct_dora_trainable_bytes(dora_masters),
+              " slots:", len(dora_masters.ad))
+    elif oft_active:
+        var dense_bytes = qwen_direct_dense_carrier_bytes(
+            train_cfg.num_double, train_cfg.d_model, train_cfg.mlp_hidden,
+            direct_targets,
+        )
+        var direct_bytes = qwen_direct_oft_preflight(
+            train_cfg.num_double, train_cfg.d_model, train_cfg.mlp_hidden,
+            direct_oft_block_size, direct_targets, QWEN_DIRECT_24_GIB,
+        )
+        print("[QwenImage-oft] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " block_size:", direct_oft_block_size,
+              " budget:", QWEN_DIRECT_24_GIB)
+        oft_masters = build_qwen_direct_oft_set(
+            train_cfg.num_double, train_cfg.d_model, train_cfg.mlp_hidden,
+            direct_oft_block_size, direct_targets,
+        )
+        print("[QwenImage-oft] trainable bytes:", qwen_direct_oft_trainable_bytes(oft_masters),
+              " slots:", len(oft_masters.ad))
+    if dora_active:
+        print("[QwenImage-dora] direct block slots:", len(dora_masters.ad),
+              " (", DBL_SLOTS, "x", NUM_DOUBLE, "double)")
+    elif oft_active:
+        print("[QwenImage-oft] direct block slots:", len(oft_masters.ad),
+              " (", DBL_SLOTS, "x", NUM_DOUBLE, "double)")
+    else:
+        print("[lora] adapters:", n_adapters, " (", DBL_SLOTS, "x", NUM_DOUBLE, "double)")
 
     var files: List[String]
     var have_cache = True
@@ -615,7 +821,27 @@ def main() raises:
     var b_absum_init = Float32(0.0)
     for i in range(n_adapters):
         b_absum_init += _absum(lora.dbl[i].b)
-    print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+    if carrier_active:
+        print("[lora] carrier LoRA-B |.|_1 at init =", b_absum_init)
+    elif dora_active:
+        print("[QwenImage-dora] direct trainable L1 at init =", qwen_direct_dora_zero_leg_l1(dora_masters))
+    elif oft_active:
+        print("[QwenImage-oft] direct trainable L1 at init =", qwen_direct_oft_vec_l1(oft_masters))
+    else:
+        print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+    var carrier_zero_init = Float64(0.0)
+    if lokr_active:
+        carrier_zero_init = qwen_lokr_zero_leg_l1(lokr_masters)
+        print("[QwenImage-lokr] zero-leg L1 at init =", carrier_zero_init)
+    elif loha_active:
+        carrier_zero_init = qwen_loha_zero_leg_l1(loha_masters)
+        print("[QwenImage-loha] zero-leg L1 at init =", carrier_zero_init)
+    elif dora_active:
+        carrier_zero_init = qwen_direct_dora_zero_leg_l1(dora_masters)
+        print("[QwenImage-dora] zero-leg L1 at init =", carrier_zero_init)
+    elif oft_active:
+        carrier_zero_init = qwen_direct_oft_vec_l1(oft_masters)
+        print("[QwenImage-oft] vec L1 at init =", carrier_zero_init)
 
     # ── sample-during-training setup ─────────────────────────────────────────
     # Sampling is WIRED (see _qwen_run_sample): denoise the CURRENT base + streamed
@@ -707,6 +933,124 @@ def main() raises:
             ctx,
         )
 
+        if dora_active:
+            var fwd_dora = qwenimage_stack_direct_dora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                base, loader, dora_masters, direct_targets,
+                cos_h.copy(), sin_h.copy(),
+                norm_out_w, norm_out_b,
+                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+            )
+
+            var nout_dora = len(fwd_dora.out)
+            var d_loss_dora = List[Float32]()
+            var sse_dora = 0.0
+            var inv_n_dora = Float32(2.0) / Float32(nout_dora)
+            for i in range(nout_dora):
+                var diff = fwd_dora.out[i] - target[i]
+                sse_dora += Float64(diff) * Float64(diff)
+                d_loss_dora.append(inv_n_dora * diff)
+            var loss_dora = Float32(sse_dora / Float64(nout_dora))
+            if k == 1:
+                first_loss = loss_dora
+            last_loss = loss_dora
+
+            var grads_dora = qwenimage_stack_direct_dora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss_dora,
+                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                base, loader, dora_masters, direct_targets,
+                cos_h.copy(), sin_h.copy(),
+                norm_out_w, norm_out_b,
+                fwd_dora,
+                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+            )
+            var dnorm = qwen_direct_dora_grad_norm(grads_dora.grads)
+            if dnorm > Float64(train_cfg.max_grad_norm):
+                qwen_direct_dora_clip_grads(grads_dora.grads, train_cfg.max_grad_norm / Float32(dnorm))
+            var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+            qwen_direct_dora_adamw_step(
+                dora_masters, grads_dora.grads, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
+
+            var t1_dora = perf_counter_ns()
+            var secs_dora = Float64(t1_dora - t0) / 1.0e9
+            print_trainer_progress(
+                String("QwenImage-dora"), k, run_steps, 1,
+                loss_dora, dnorm, secs_dora, 0.0,
+                Float64(t1_dora - train_start) / 1.0e9,
+            )
+            print("[QwenImage-dora] step=", k, " grad_norm=", Float32(dnorm),
+                  " zero_leg_l1=", qwen_direct_dora_zero_leg_l1(dora_masters))
+            if grads_dora.nonfinite_grads != 0:
+                print("[QwenImage-dora] warning nonfinite_grads=", grads_dora.nonfinite_grads)
+
+            if train_cfg.save_every > 0 and k % train_cfg.save_every == 0:
+                var ckpt_path = _step_lora_path(output_lora_path, k)
+                var nmods = save_qwen_direct_dora(dora_masters, ckpt_path, ctx)
+                print("[checkpoint] saved QwenImage-dora step=", k,
+                      " modules=", nmods, " path=", ckpt_path)
+            continue
+
+        if oft_active:
+            var fwd_oft = qwenimage_stack_direct_oft_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                base, loader, oft_masters, direct_targets,
+                cos_h.copy(), sin_h.copy(),
+                norm_out_w, norm_out_b,
+                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+            )
+
+            var nout_oft = len(fwd_oft.out)
+            var d_loss_oft = List[Float32]()
+            var sse_oft = 0.0
+            var inv_n_oft = Float32(2.0) / Float32(nout_oft)
+            for i in range(nout_oft):
+                var diff = fwd_oft.out[i] - target[i]
+                sse_oft += Float64(diff) * Float64(diff)
+                d_loss_oft.append(inv_n_oft * diff)
+            var loss_oft = Float32(sse_oft / Float64(nout_oft))
+            if k == 1:
+                first_loss = loss_oft
+            last_loss = loss_oft
+
+            var grads_oft = qwenimage_stack_direct_oft_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss_oft,
+                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                base, loader, oft_masters, direct_targets,
+                cos_h.copy(), sin_h.copy(),
+                norm_out_w, norm_out_b,
+                fwd_oft,
+                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+            )
+            var onorm = qwen_direct_oft_grad_norm(grads_oft.grads)
+            if onorm > Float64(train_cfg.max_grad_norm):
+                qwen_direct_oft_clip_grads(grads_oft.grads, train_cfg.max_grad_norm / Float32(onorm))
+            var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+            qwen_direct_oft_adamw_step(
+                oft_masters, grads_oft.grads, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
+
+            var t1_oft = perf_counter_ns()
+            var secs_oft = Float64(t1_oft - t0) / 1.0e9
+            print_trainer_progress(
+                String("QwenImage-oft"), k, run_steps, 1,
+                loss_oft, onorm, secs_oft, 0.0,
+                Float64(t1_oft - train_start) / 1.0e9,
+            )
+            print("[QwenImage-oft] step=", k, " grad_norm=", Float32(onorm),
+                  " vec_l1=", qwen_direct_oft_vec_l1(oft_masters))
+            if grads_oft.nonfinite_grads != 0:
+                print("[QwenImage-oft] warning nonfinite_grads=", grads_oft.nonfinite_grads)
+
+            if train_cfg.save_every > 0 and k % train_cfg.save_every == 0:
+                var ckpt_path = _step_lora_path(output_lora_path, k)
+                var nmods = save_qwen_direct_oft(oft_masters, ckpt_path, ctx)
+                print("[checkpoint] saved QwenImage-oft step=", k,
+                      " modules=", nmods, " path=", ckpt_path)
+            continue
+
         # ── forward (offload, full 60-block depth) -> pred [N_IMG, OUT_CH] ──
         var fwd = qwenimage_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
             noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
@@ -746,10 +1090,35 @@ def main() raises:
 
         # ── AdamW ──
         var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-        qwen_offload_lora_adamw_step(
-            lora, grads, k, step_lr, ctx,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
-        )
+        if lokr_active:
+            var mg = qwen_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
+            var mnorm = qwen_lokr_grad_norm(mg)
+            if mnorm > Float64(train_cfg.max_grad_norm):
+                qwen_lokr_clip_grads(mg, train_cfg.max_grad_norm / Float32(mnorm))
+            qwen_lokr_adamw_step(
+                lokr_masters, mg, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
+            lora = qwen_lokr_carrier_set(lokr_masters, train_cfg.d_model, train_cfg.mlp_hidden)
+            print("[QwenImage-lokr] step=", k, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", qwen_lokr_zero_leg_l1(lokr_masters))
+        elif loha_active:
+            var mg = qwen_loha_chain_all(loha_masters, grads.d_a, grads.d_b)
+            var mnorm = qwen_loha_grad_norm(mg)
+            if mnorm > Float64(train_cfg.max_grad_norm):
+                qwen_loha_clip_grads(mg, train_cfg.max_grad_norm / Float32(mnorm))
+            qwen_loha_adamw_step(
+                loha_masters, mg, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
+            lora = qwen_loha_carrier_set(loha_masters, train_cfg.d_model, train_cfg.mlp_hidden)
+            print("[QwenImage-loha] step=", k, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", qwen_loha_zero_leg_l1(loha_masters))
+        else:
+            qwen_offload_lora_adamw_step(
+                lora, grads, k, step_lr, ctx,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -764,18 +1133,28 @@ def main() raises:
         var saved_this_step = False
         if train_cfg.save_every > 0 and k % train_cfg.save_every == 0:
             var ckpt_path = _step_lora_path(output_lora_path, k)
-            _ = save_qwen_lora(lora, ckpt_path, ctx)
-            var ckpt_state = qwen_state_path_for_lora(ckpt_path)
-            _ = save_qwen_lora_state(lora, ckpt_state, ctx)
+            if lokr_active:
+                _ = save_qwen_lokr(lokr_masters, ckpt_path, ctx)
+            elif loha_active:
+                _ = save_qwen_loha(loha_masters, ckpt_path, ctx)
+            else:
+                _ = save_qwen_lora(lora, ckpt_path, ctx)
+                var ckpt_state = qwen_state_path_for_lora(ckpt_path)
+                _ = save_qwen_lora_state(lora, ckpt_state, ctx)
             saved_this_step = True
-            print("[checkpoint] saved step=", k, " state=", ckpt_state)
+            print("[checkpoint] saved step=", k, " path=", ckpt_path)
         if should_sample_completed_step(sample_cadence, k):
             if qwen_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var pre_sample_path = _step_lora_path(output_lora_path, k)
-                _ = save_qwen_lora(lora, pre_sample_path, ctx)
-                var pre_sample_state = qwen_state_path_for_lora(pre_sample_path)
-                _ = save_qwen_lora_state(lora, pre_sample_state, ctx)
-                print("[checkpoint] saved before sample step=", k, " state=", pre_sample_state)
+                if lokr_active:
+                    _ = save_qwen_lokr(lokr_masters, pre_sample_path, ctx)
+                elif loha_active:
+                    _ = save_qwen_loha(loha_masters, pre_sample_path, ctx)
+                else:
+                    _ = save_qwen_lora(lora, pre_sample_path, ctx)
+                    var pre_sample_state = qwen_state_path_for_lora(pre_sample_path)
+                    _ = save_qwen_lora_state(lora, pre_sample_state, ctx)
+                print("[checkpoint] saved before sample step=", k, " path=", pre_sample_path)
             print(
                 "[cadence] sample due at completed_step=", k,
                 " sample_file=", sample_cadence.sample_definition_file_name,
@@ -801,12 +1180,44 @@ def main() raises:
     var b_absum_final = Float32(0.0)
     for i in range(n_adapters):
         b_absum_final += _absum(lora.dbl[i].b)
-    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
+    var trains: Bool
+    var carrier_zero_final = Float64(0.0)
+    if lokr_active:
+        carrier_zero_final = qwen_lokr_zero_leg_l1(lokr_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif loha_active:
+        carrier_zero_final = qwen_loha_zero_leg_l1(loha_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif dora_active:
+        carrier_zero_final = qwen_direct_dora_zero_leg_l1(dora_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif oft_active:
+        carrier_zero_final = qwen_direct_oft_vec_l1(oft_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    else:
+        trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
     if trains and (last_loss == last_loss):
-        print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
-              "; loss", first_loss, "->", last_loss,
-              (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        _ = save_qwen_lora(lora, output_lora_path, ctx)
-        _ = save_qwen_lora_state(lora, qwen_state_path_for_lora(output_lora_path), ctx)
+        if lycoris_active:
+            print("RESULT: REAL run OK — LyCORIS trainable grew ",
+                  carrier_zero_init, " -> ", carrier_zero_final,
+                  "; loss", first_loss, "->", last_loss,
+                  (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        else:
+            print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
+                  "; loss", first_loss, "->", last_loss,
+                  (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        if lokr_active:
+            _ = save_qwen_lokr(lokr_masters, output_lora_path, ctx)
+        elif loha_active:
+            _ = save_qwen_loha(loha_masters, output_lora_path, ctx)
+        elif dora_active:
+            var nmods = save_qwen_direct_dora(dora_masters, output_lora_path, ctx)
+            print("[QwenImage-dora] save final modules=", nmods, " path=", output_lora_path)
+        elif oft_active:
+            var nmods = save_qwen_direct_oft(oft_masters, output_lora_path, ctx)
+            print("[QwenImage-oft] save final modules=", nmods, " path=", output_lora_path)
+        else:
+            _ = save_qwen_lora(lora, output_lora_path, ctx)
+            _ = save_qwen_lora_state(lora, qwen_state_path_for_lora(output_lora_path), ctx)
     else:
         print("RESULT: FAIL trains=", trains)

@@ -63,11 +63,37 @@ from serenitymojo.models.chroma.weights import load_chroma_stack_base
 from serenitymojo.models.chroma.chroma_stack_lora import (
     ChromaStackBase,
     chroma_stack_lora_forward_offload, chroma_stack_lora_backward_offload,
+    build_chroma_direct_dora_set_from_offload, build_chroma_direct_oft_set_for_stack,
+    chroma_stack_direct_dora_forward_offload, chroma_stack_direct_dora_backward_offload,
+    chroma_stack_direct_oft_forward_offload, chroma_stack_direct_oft_backward_offload,
     save_chroma_lora, save_chroma_lora_state,
 )
 from serenitymojo.models.flux.flux_stack_lora import (
     FluxLoraSet, FluxLoraGradSet, build_flux_lora_set,
     flux_lora_adamw_step, total_adapters,
+)
+from serenitymojo.models.flux.flux_lycoris_stack import (
+    FluxLoKrSet, empty_flux_lokr_set, build_flux_lokr_set,
+    flux_lokr_carrier_set, flux_lokr_carrier_total_bytes,
+    flux_lokr_chain_all, flux_lokr_adamw_step, flux_lokr_grad_norm,
+    flux_lokr_clip_grads, flux_lokr_zero_leg_l1, save_flux_lokr,
+    FluxLoHaSet, empty_flux_loha_set, build_flux_loha_set,
+    flux_loha_carrier_set, flux_loha_carrier_total_bytes,
+    flux_loha_chain_all, flux_loha_adamw_step, flux_loha_grad_norm,
+    flux_loha_clip_grads, flux_loha_zero_leg_l1, save_flux_loha,
+)
+from serenitymojo.models.flux.flux_direct_lycoris_stack import (
+    FLUX_DIRECT_24_GIB,
+    empty_flux_direct_dora_set, empty_flux_direct_oft_set,
+    flux_direct_dense_carrier_bytes,
+    flux_direct_dora_preflight,
+    flux_direct_oft_preflight,
+    flux_direct_dora_grad_norm, flux_direct_dora_clip_grads,
+    flux_direct_dora_adamw_step, flux_direct_dora_zero_leg_l1,
+    flux_direct_dora_trainable_bytes, save_flux_direct_dora,
+    flux_direct_oft_grad_norm, flux_direct_oft_clip_grads,
+    flux_direct_oft_adamw_step, flux_direct_oft_vec_l1,
+    flux_direct_oft_trainable_bytes, save_flux_direct_oft,
 )
 from serenitymojo.models.flux.lora_block import DBL_STREAM_SLOTS, SGL_SLOTS
 from serenitymojo.models.dit.flux1_dit import build_flux1_rope_tables
@@ -98,8 +124,13 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 )
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOCON, TRAIN_ADAPTER_ALGO_LOHA,
+    TRAIN_ADAPTER_ALGO_DORA, TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
-from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -198,7 +229,28 @@ def _close_f32(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
 
 
 def validate_chroma_train_config(cfg: TrainConfig) raises:
-    require_lora_or_locon_linear(cfg, String("Chroma"))
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[Chroma-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
+        print("[Chroma-lokr] network_algorithm=lokr: using block-projection carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
+        print("[Chroma-loha] network_algorithm=loha: using block-projection carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA or cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
+        print(
+            String("[Chroma-direct] network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(": using direct W_eff stack dispatch; sample cadence must be disabled")
+        )
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("Chroma trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("Chroma trainer: full finetune is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("Chroma trainer: network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+        )
     if cfg.checkpoint == String(""):
         raise Error("Chroma trainer config must set checkpoint")
     if not cfg.checkpoint.endswith(String(".safetensors")):
@@ -489,6 +541,14 @@ def main() raises:
     var cache_dir = chroma_cache_dir_from_train_config(train_cfg)
     var sample_cadence = chroma_sample_cadence_from_train_config(cfg_path, train_cfg)
     var sample_enabled = chroma_sampling_enabled(sample_cadence)
+    var direct_algo_requested = (
+        train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+        or train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    )
+    if sample_enabled and direct_algo_requested:
+        raise Error(
+            "Chroma direct DoRA/OFT sample-during-training is not wired; disable sample cadence for this runtime gate"
+        )
 
     print("=== Chroma (chroma1-hd) REAL LoRA training loop (block-swap offload) ===")
     print("  config:", cfg_path)
@@ -541,11 +601,103 @@ def main() raises:
     print("[load] chroma 3-axis rope tables built (S*H x Dh/2)")
 
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
-    var lora = build_flux_lora_set(NUM_DOUBLE, NUM_SINGLE, D, FMLP, RANK, ALPHA)
-    var n_adapters = total_adapters(lora)
-    print("[lora] adapters:", n_adapters,
-          " (", DBL_STREAM_SLOTS * 2, "x", NUM_DOUBLE, "double +",
-          SGL_SLOTS, "x", NUM_SINGLE, "single)")
+    var lokr_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var dora_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var direct_active = dora_active or oft_active
+    var carrier_active = lokr_active or loha_active
+    var lycoris_active = carrier_active or direct_active
+    var direct_targets = 1 if train_cfg.lokr_targets == 1 else 2
+    var direct_oft_block_size = 4
+    var lora = build_flux_lora_set(0, 0, D, FMLP, RANK, ALPHA)
+    var n_adapters = 0
+    if not direct_active:
+        lora = build_flux_lora_set(NUM_DOUBLE, NUM_SINGLE, D, FMLP, RANK, ALPHA)
+        n_adapters = total_adapters(lora)
+    var lokr_masters = empty_flux_lokr_set()
+    var loha_masters = empty_flux_loha_set()
+    var dora_masters = empty_flux_direct_dora_set()
+    var oft_masters = empty_flux_direct_oft_set()
+    if lokr_active:
+        lokr_masters = build_flux_lokr_set(
+            NUM_DOUBLE, NUM_SINGLE, D, FMLP,
+            RANK, ALPHA,
+            train_cfg.lokr_factor, train_cfg.lokr_factor_attn,
+            train_cfg.lokr_factor_ff,
+            train_cfg.lokr_decompose_both, train_cfg.lokr_full_matrix,
+            direct_targets,
+            UInt64(910701),
+        )
+        var carrier_bytes = flux_lokr_carrier_total_bytes(lokr_masters, D, FMLP)
+        print("[Chroma-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("Chroma LoKr: carrier set needs ")
+                + String(carrier_bytes)
+                + String(" bytes (> budget). Use a smaller lokr_factor/rank or restrict lokr_targets.")
+            )
+        lora = flux_lokr_carrier_set(lokr_masters, D, FMLP)
+        print("[Chroma-lokr] carrier set materialized:", len(lora.ad), "adapters")
+    elif loha_active:
+        loha_masters = build_flux_loha_set(
+            NUM_DOUBLE, NUM_SINGLE, D, FMLP,
+            RANK, ALPHA,
+            direct_targets,
+            UInt64(910801),
+        )
+        var carrier_bytes = flux_loha_carrier_total_bytes(loha_masters, D, FMLP)
+        print("[Chroma-loha] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("Chroma LoHa: carrier set needs ")
+                + String(carrier_bytes)
+                + String(" bytes (> budget). Reduce lora_rank or restrict lokr_targets.")
+        )
+        lora = flux_loha_carrier_set(loha_masters, D, FMLP)
+        print("[Chroma-loha] carrier set materialized:", len(lora.ad), "adapters")
+    elif dora_active:
+        var dense_bytes = flux_direct_dense_carrier_bytes(NUM_DOUBLE, NUM_SINGLE, D, FMLP, direct_targets)
+        var direct_bytes = flux_direct_dora_preflight(
+            NUM_DOUBLE, NUM_SINGLE, D, FMLP, RANK, direct_targets, FLUX_DIRECT_24_GIB, False,
+        )
+        print("[Chroma-dora] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " budget:", FLUX_DIRECT_24_GIB)
+        print("[Chroma-dora] initializing DoRA magnitudes from streamed Chroma block weights ...")
+        dora_masters = build_chroma_direct_dora_set_from_offload(
+            loader, NUM_DOUBLE, NUM_SINGLE, D, FMLP,
+            RANK, ALPHA, direct_targets, train_cfg.seed * UInt64(59) + UInt64(7100),
+            False, ctx,
+        )
+        print("[Chroma-dora] trainable bytes:", flux_direct_dora_trainable_bytes(dora_masters),
+              " slots:", len(dora_masters.ad))
+    elif oft_active:
+        var dense_bytes = flux_direct_dense_carrier_bytes(NUM_DOUBLE, NUM_SINGLE, D, FMLP, direct_targets)
+        var direct_bytes = flux_direct_oft_preflight(
+            NUM_DOUBLE, NUM_SINGLE, D, FMLP, direct_oft_block_size, direct_targets, FLUX_DIRECT_24_GIB,
+        )
+        print("[Chroma-oft] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " block_size:", direct_oft_block_size,
+              " budget:", FLUX_DIRECT_24_GIB)
+        oft_masters = build_chroma_direct_oft_set_for_stack(
+            NUM_DOUBLE, NUM_SINGLE, D, FMLP, direct_oft_block_size, direct_targets,
+        )
+        print("[Chroma-oft] trainable bytes:", flux_direct_oft_trainable_bytes(oft_masters),
+              " slots:", len(oft_masters.ad))
+    if dora_active:
+        print("[Chroma-dora] direct block slots:", len(dora_masters.ad),
+              " (", DBL_STREAM_SLOTS * 2, "x", NUM_DOUBLE, "double +",
+              SGL_SLOTS, "x", NUM_SINGLE, "single)")
+    elif oft_active:
+        print("[Chroma-oft] direct block slots:", len(oft_masters.ad),
+              " (", DBL_STREAM_SLOTS * 2, "x", NUM_DOUBLE, "double +",
+              SGL_SLOTS, "x", NUM_SINGLE, "single)")
+    else:
+        print("[lora] adapters:", n_adapters,
+              " (", DBL_STREAM_SLOTS * 2, "x", NUM_DOUBLE, "double +",
+              SGL_SLOTS, "x", NUM_SINGLE, "single)")
 
     var files = _list_cache(cache_dir)
     print("[cache] samples:", len(files))
@@ -553,7 +705,27 @@ def main() raises:
     var b_absum_init = Float32(0.0)
     for i in range(n_adapters):
         b_absum_init += _absum(lora.ad[i].b)
-    print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+    if carrier_active:
+        print("[lora] carrier LoRA-B |.|_1 at init =", b_absum_init)
+    elif dora_active:
+        print("[Chroma-dora] direct trainable L1 at init =", flux_direct_dora_zero_leg_l1(dora_masters))
+    elif oft_active:
+        print("[Chroma-oft] direct trainable L1 at init =", flux_direct_oft_vec_l1(oft_masters))
+    else:
+        print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+    var carrier_zero_init = Float64(0.0)
+    if lokr_active:
+        carrier_zero_init = flux_lokr_zero_leg_l1(lokr_masters)
+        print("[Chroma-lokr] zero-leg L1 at init =", carrier_zero_init)
+    elif loha_active:
+        carrier_zero_init = flux_loha_zero_leg_l1(loha_masters)
+        print("[Chroma-loha] zero-leg L1 at init =", carrier_zero_init)
+    elif dora_active:
+        carrier_zero_init = flux_direct_dora_zero_leg_l1(dora_masters)
+        print("[Chroma-dora] zero-leg L1 at init =", carrier_zero_init)
+    elif oft_active:
+        carrier_zero_init = flux_direct_oft_vec_l1(oft_masters)
+        print("[Chroma-oft] vec L1 at init =", carrier_zero_init)
 
     # samples dir for sample-during-training PNGs (created once if enabled).
     var samples_dir = String(LORA_DIR) + String("/samples")
@@ -622,6 +794,120 @@ def main() raises:
         var pooled_tensor = _pooled_modulation_tensor(approx, t_model, ctx)
         var pooled = _host_f32_for_step_math(pooled_tensor, ctx)
 
+        if dora_active:
+            var fwd_dora = chroma_stack_direct_dora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), pooled.copy(), MOD_INDEX,
+                base, loader, dora_masters, NUM_DOUBLE, NUM_SINGLE, direct_targets,
+                cos.copy(), sin.copy(),
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+
+            var nout_dora = len(fwd_dora.out)
+            var d_loss_dora = List[Float32]()
+            var sse_dora = 0.0
+            var inv_n_dora = Float32(2.0) / Float32(nout_dora)
+            for i in range(nout_dora):
+                var diff = fwd_dora.out[i] - target[i]
+                sse_dora += Float64(diff) * Float64(diff)
+                d_loss_dora.append(inv_n_dora * diff)
+            var loss_dora = Float32(sse_dora / Float64(nout_dora))
+            if k == 1:
+                first_loss = loss_dora
+            last_loss = loss_dora
+
+            var grads_dora = chroma_stack_direct_dora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss_dora, noisy.copy(), txt_tokens.copy(),
+                base, loader, dora_masters, NUM_DOUBLE, NUM_SINGLE, direct_targets,
+                cos.copy(), sin.copy(), fwd_dora,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+            var dnorm = flux_direct_dora_grad_norm(grads_dora.grads)
+            if dnorm > Float64(train_cfg.max_grad_norm):
+                flux_direct_dora_clip_grads(grads_dora.grads, train_cfg.max_grad_norm / Float32(dnorm))
+            var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+            flux_direct_dora_adamw_step(
+                dora_masters, grads_dora.grads, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+
+            var t1_dora = perf_counter_ns()
+            var secs_dora = Float64(t1_dora - t0) / 1.0e9
+            print_trainer_progress(
+                String("Chroma-dora"), k, run_steps, 1,
+                loss_dora, dnorm, secs_dora, 0.0,
+                Float64(t1_dora - train_start) / 1.0e9,
+            )
+            print("[Chroma-dora] step=", k, " grad_norm=", Float32(dnorm),
+                  " zero_leg_l1=", flux_direct_dora_zero_leg_l1(dora_masters))
+            if grads_dora.nonfinite_lora_grads != 0:
+                print("[Chroma-dora] warning nonfinite_lora_grads=", grads_dora.nonfinite_lora_grads)
+
+            if chroma_should_save_checkpoint(train_cfg, k):
+                var save_path = _step_lora_path(
+                    chroma_output_lora_path_from_train_config(train_cfg, run_steps), k
+                )
+                var nmods = save_flux_direct_dora(dora_masters, save_path, ctx)
+                print("[Chroma-dora] save step=", k, " modules=", nmods, " path=", save_path)
+            continue
+
+        if oft_active:
+            var fwd_oft = chroma_stack_direct_oft_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), pooled.copy(), MOD_INDEX,
+                base, loader, oft_masters, NUM_DOUBLE, NUM_SINGLE, direct_targets,
+                cos.copy(), sin.copy(),
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+
+            var nout_oft = len(fwd_oft.out)
+            var d_loss_oft = List[Float32]()
+            var sse_oft = 0.0
+            var inv_n_oft = Float32(2.0) / Float32(nout_oft)
+            for i in range(nout_oft):
+                var diff = fwd_oft.out[i] - target[i]
+                sse_oft += Float64(diff) * Float64(diff)
+                d_loss_oft.append(inv_n_oft * diff)
+            var loss_oft = Float32(sse_oft / Float64(nout_oft))
+            if k == 1:
+                first_loss = loss_oft
+            last_loss = loss_oft
+
+            var grads_oft = chroma_stack_direct_oft_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss_oft, noisy.copy(), txt_tokens.copy(),
+                base, loader, oft_masters, NUM_DOUBLE, NUM_SINGLE, direct_targets,
+                cos.copy(), sin.copy(), fwd_oft,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+            var onorm = flux_direct_oft_grad_norm(grads_oft.grads)
+            if onorm > Float64(train_cfg.max_grad_norm):
+                flux_direct_oft_clip_grads(grads_oft.grads, train_cfg.max_grad_norm / Float32(onorm))
+            var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+            flux_direct_oft_adamw_step(
+                oft_masters, grads_oft.grads, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+
+            var t1_oft = perf_counter_ns()
+            var secs_oft = Float64(t1_oft - t0) / 1.0e9
+            print_trainer_progress(
+                String("Chroma-oft"), k, run_steps, 1,
+                loss_oft, onorm, secs_oft, 0.0,
+                Float64(t1_oft - train_start) / 1.0e9,
+            )
+            print("[Chroma-oft] step=", k, " grad_norm=", Float32(onorm),
+                  " vec_l1=", flux_direct_oft_vec_l1(oft_masters))
+            if grads_oft.nonfinite_lora_grads != 0:
+                print("[Chroma-oft] warning nonfinite_lora_grads=", grads_oft.nonfinite_lora_grads)
+
+            if chroma_should_save_checkpoint(train_cfg, k):
+                var save_path = _step_lora_path(
+                    chroma_output_lora_path_from_train_config(train_cfg, run_steps), k
+                )
+                var nmods = save_flux_direct_oft(oft_masters, save_path, ctx)
+                print("[Chroma-oft] save step=", k, " modules=", nmods, " path=", save_path)
+            continue
+
         # ── forward (offload, full depth) -> velocity [N_IMG, OUT_CH] ──
         var fwd = chroma_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
             noisy.copy(), txt_tokens.copy(), pooled.copy(), MOD_INDEX,
@@ -655,11 +941,38 @@ def main() raises:
 
         # ── AdamW ──
         var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-        flux_lora_adamw_step(
-            lora, grads, k, step_lr, ctx,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
-            train_cfg.weight_decay,
-        )
+        if lokr_active:
+            var mg = flux_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
+            var mnorm = flux_lokr_grad_norm(mg)
+            if mnorm > Float64(CLIP_GRAD_NORM):
+                flux_lokr_clip_grads(mg, CLIP_GRAD_NORM / Float32(mnorm))
+            flux_lokr_adamw_step(
+                lokr_masters, mg, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            lora = flux_lokr_carrier_set(lokr_masters, D, FMLP)
+            print("[Chroma-lokr] step=", k, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", flux_lokr_zero_leg_l1(lokr_masters))
+        elif loha_active:
+            var mg = flux_loha_chain_all(loha_masters, grads.d_a, grads.d_b)
+            var mnorm = flux_loha_grad_norm(mg)
+            if mnorm > Float64(CLIP_GRAD_NORM):
+                flux_loha_clip_grads(mg, CLIP_GRAD_NORM / Float32(mnorm))
+            flux_loha_adamw_step(
+                loha_masters, mg, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            lora = flux_loha_carrier_set(loha_masters, D, FMLP)
+            print("[Chroma-loha] step=", k, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", flux_loha_zero_leg_l1(loha_masters))
+        else:
+            flux_lora_adamw_step(
+                lora, grads, k, step_lr, ctx,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -676,20 +989,30 @@ def main() raises:
             var save_path = _step_lora_path(
                 chroma_output_lora_path_from_train_config(train_cfg, run_steps), k
             )
-            _ = save_chroma_lora(lora, save_path, ctx)
-            var state_path = save_path + String(".state.safetensors")
-            _ = save_chroma_lora_state(lora, state_path, ctx)
+            if lokr_active:
+                _ = save_flux_lokr(lokr_masters, save_path, ctx)
+            elif loha_active:
+                _ = save_flux_loha(loha_masters, save_path, ctx)
+            else:
+                _ = save_chroma_lora(lora, save_path, ctx)
+                var state_path = save_path + String(".state.safetensors")
+                _ = save_chroma_lora_state(lora, state_path, ctx)
+                print("[Chroma-lora] save_state step=", k, " path=", state_path)
             saved_this_step = True
-            print("[Chroma-lora] save_state step=", k, " path=", state_path)
         if sample_enabled and should_sample_completed_step(sample_cadence, k):
             if chroma_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var sample_path = _step_lora_path(
                     chroma_output_lora_path_from_train_config(train_cfg, run_steps), k
                 )
-                _ = save_chroma_lora(lora, sample_path, ctx)
-                var sample_state = sample_path + String(".state.safetensors")
-                _ = save_chroma_lora_state(lora, sample_state, ctx)
-                print("[Chroma-lora] save_before_sample step=", k, " path=", sample_state)
+                if lokr_active:
+                    _ = save_flux_lokr(lokr_masters, sample_path, ctx)
+                elif loha_active:
+                    _ = save_flux_loha(loha_masters, sample_path, ctx)
+                else:
+                    _ = save_chroma_lora(lora, sample_path, ctx)
+                    var sample_state = sample_path + String(".state.safetensors")
+                    _ = save_chroma_lora_state(lora, sample_state, ctx)
+                    print("[Chroma-lora] save_before_sample step=", k, " path=", sample_state)
             # Sample from the CURRENT frozen base + streamed blocks + LIVE LoRA.
             # v1 conditioning: this step's cached caption T5 embeds (txt_tokens)
             # as COND, zeros as UNCOND. See chroma_sample_resident.mojo header.
@@ -708,14 +1031,44 @@ def main() raises:
     for i in range(n_adapters):
         b_absum_final += _absum(lora.ad[i].b)
     var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
+    var carrier_zero_final = Float64(0.0)
+    if lokr_active:
+        carrier_zero_final = flux_lokr_zero_leg_l1(lokr_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif loha_active:
+        carrier_zero_final = flux_loha_zero_leg_l1(loha_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif dora_active:
+        carrier_zero_final = flux_direct_dora_zero_leg_l1(dora_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif oft_active:
+        carrier_zero_final = flux_direct_oft_vec_l1(oft_masters)
+        trains = carrier_zero_final > carrier_zero_init
     if trains and (last_loss == last_loss):
-        print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
-              "; loss", first_loss, "->", last_loss,
-              (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        if lycoris_active:
+            print("RESULT: REAL run OK — LyCORIS trainable grew ",
+                  carrier_zero_init, " -> ", carrier_zero_final,
+                  "; loss", first_loss, "->", last_loss,
+                  (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        else:
+            print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
+                  "; loss", first_loss, "->", last_loss,
+                  (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         var lora_out = chroma_output_lora_path_from_train_config(train_cfg, run_steps)
-        _ = save_chroma_lora(lora, lora_out, ctx)
-        var state_out = lora_out + String(".state.safetensors")
-        _ = save_chroma_lora_state(lora, state_out, ctx)
-        print("[Chroma-lora] save_state step=", run_steps, " path=", state_out)
+        if lokr_active:
+            _ = save_flux_lokr(lokr_masters, lora_out, ctx)
+        elif loha_active:
+            _ = save_flux_loha(loha_masters, lora_out, ctx)
+        elif dora_active:
+            var nmods = save_flux_direct_dora(dora_masters, lora_out, ctx)
+            print("[Chroma-dora] save final modules=", nmods, " path=", lora_out)
+        elif oft_active:
+            var nmods = save_flux_direct_oft(oft_masters, lora_out, ctx)
+            print("[Chroma-oft] save final modules=", nmods, " path=", lora_out)
+        else:
+            _ = save_chroma_lora(lora, lora_out, ctx)
+            var state_out = lora_out + String(".state.safetensors")
+            _ = save_chroma_lora_state(lora, state_out, ctx)
+            print("[Chroma-lora] save_state step=", run_steps, " path=", state_out)
     else:
         print("RESULT: FAIL trains=", trains)

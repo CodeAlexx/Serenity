@@ -21,6 +21,7 @@ from serenity_trainer.ui.TrainerRuntimeBridge import (
 from serenity_trainer.ui.TrainerConfigModel import (
     TrainerUIConfig,
     trainer_ui_apply_model_preset,
+    trainer_ui_runner_train_config_json,
 )
 
 
@@ -200,6 +201,10 @@ def test_ideogram4_launch_argv_contract() raises:
         _contains(cmd0, String(" 0.0 '-'")),
         "default-off launch carries argv10=0.0 argv11='-' (got: " + cmd0 + ")",
     )
+    _expect(
+        _contains(cmd0, String(" '-' 500 20 7.0 42")),
+        "default launch carries sample argv12-15 (got: " + cmd0 + ")",
+    )
 
     cfg.loss_fn = String("huber")
     var cmd1 = _live_runner_command(cfg, rt)
@@ -209,6 +214,10 @@ def test_ideogram4_launch_argv_contract() raises:
             String(" 0.0 'target/serenity_ideogram4_train_config.json'"),
         ),
         "levers-on launch delivers the levers JSON path (got: " + cmd1 + ")",
+    )
+    _expect(
+        _contains(cmd1, String("'target/serenity_ideogram4_train_config.json' 500 20 7.0 42")),
+        "levers-on launch preserves sample argv12-15 (got: " + cmd1 + ")",
     )
 
 
@@ -272,6 +281,46 @@ def test_hidream_launch_argv_contract() raises:
     )
 
 
+def test_krea2_launch_argv_contract() raises:
+    # Krea2 is config-backed but not a `<config.json> <steps>` runner. The
+    # mojodiffusion train_krea2 argv contract is:
+    #   <cache.safetensors> <steps> <train_config.json>
+    var cfg = TrainerUIConfig()
+    cfg.model_type_index = 12  # KREA_2
+    trainer_ui_apply_model_preset(cfg, True)
+    var rt = TrainerUIRuntime()
+    var cmd = _live_runner_command(cfg, rt)
+    _expect(
+        _contains(cmd, String("target/serenity_krea2_live_trainer")),
+        "krea2 runner path in command",
+    )
+    _expect(
+        _contains(
+            cmd,
+            String(
+                "'/home/alex/eri2_stage_512/cache.safetensors'"
+                " 2000 'target/serenity_krea2_train_config.json'"
+            ),
+        ),
+        "krea2 launch is <cache> <steps> <config> (got: " + cmd + ")",
+    )
+    _expect(
+        _contains(cmd, String("/home/alex/trainings/krea2_eri2_lora/samples")),
+        "krea2 workspace/sample mkdir is present (got: " + cmd + ")",
+    )
+    _expect(
+        not _contains(cmd, String("'target/serenity_krea2_train_config.json' 2000")),
+        "krea2 must not use the config-runner argv shape (got: " + cmd + ")",
+    )
+
+    var json = trainer_ui_runner_train_config_json(cfg)
+    _expect(_contains(json, String("\"model_type\": \"krea2\"")), "krea2 config model_type")
+    _expect(_contains(json, String("\"quantized_resident\": \"fp8_e4m3\"")), "krea2 fp8 resident")
+    _expect(_contains(json, String("\"validation_prompts_file\": \"/home/alex/mojodiffusion/serenitymojo/configs/krea2_samples.json\"")), "krea2 sample prompt file")
+    _expect(_contains(json, String("\"workspace_dir\": \"/home/alex/trainings/krea2_eri2_lora\"")), "krea2 workspace")
+    _expect(_contains(json, String("\"lora_rank\": 64")), "krea2 rank")
+
+
 def test_system_metrics_refresh() raises:
     var rt = TrainerUIRuntime()
     trainer_ui_refresh_system_metrics(rt)
@@ -292,5 +341,6 @@ def main() raises:
     test_ideogram4_launch_argv_contract()
     test_klein_launch_argv_contract()
     test_hidream_launch_argv_contract()
+    test_krea2_launch_argv_contract()
     test_system_metrics_refresh()
     print("PASS: trainer runtime bridge parser")

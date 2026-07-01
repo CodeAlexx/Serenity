@@ -90,8 +90,27 @@ Image tokens `NIMG = gh·gw`. Text tokens `NT` = caption length. `SEQ = NT + NIM
 | 256 | 32 | 16 | 256 | 907 |
 | 512 | 64 | 32 | 1024 | 1675 |
 | 1024 | 128 | 64 | 4096 | 4747 |
+| 2048 | 256 | 128 | 16384 | 17035 |
 
-## Not yet wired (extend here)
+## Inline sampler status
+
+2026-07-01: inline sampling is wired for JSON prompts at 512, 1024, and 2048
+square output. Prompt JSON is encoded once with Qwen3-VL before the resident
+transformer/optimizer load, then the sampler denoises from the live resident
+base plus in-place LoRA weights.
+
+The 2048 path uses a no-save resident sampler stack and Ideogram's forward-only
+cuDNN SDPA path for the transformer, then decodes with a 5x5 low-memory VAE tile
+path. A one-step training run with a loaded LoRA and 20 denoise steps completed
+cleanly:
+
+- Output: `/home/alex/mojodiffusion/output/ideogram4_inline_samples_2k_inline/samples/step_1_0.png`
+- Dimensions: 2048x2048 RGB PNG, 13 MB.
+- Loss: `0.7676716`, grad norm `246.01508`.
+- Runtime: `485.7009262230713 s/step` including the 20-step 2048 sample.
+- Sampler log showed `decode tiled VAE 5x5 lowmem`; the image was visually inspected.
+
+## Open extensions
 
 - **Global-target LoRA** (7): input_proj, llm_cond_proj, t_embedding.mlp_in/out,
   adaln_proj, final_layer.adaln_modulation, final_layer.linear. The step trains
@@ -99,7 +118,3 @@ Image tokens `NIMG = gh·gw`. Text tokens `NT` = caption length. `SEQ = NT + NIM
   these means LoRA-wrapping those Linears in the embed/final paths + their
   backward (final_layer.linear already has a final-linear LoRA in
   `trainer/Ideogram4TrainCore.mojo`).
-- **DataLoader cache loop + train-loop driver** — run the DATA PATH over the 70
-  giger samples → shards, then loop TRAIN STEP, emitting the UI progress line
-  (`[ideogram4-lora] step X/Y | epoch | loss | grad_norm | Ns/step | elapsed | ETA`)
-  and honoring the JSONL command file. See `TENETS.md` §8 for the UI seam.

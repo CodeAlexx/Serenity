@@ -66,6 +66,32 @@ from serenitymojo.models.sd35.sd35_stack_lora import (
     build_sd35_lora_set, sd35_lora_adamw_step,
     save_sd35_lora, save_sd35_lora_state, total_adapters,
     sd35_stack_lora_forward_offload, sd35_stack_lora_backward_offload,
+    SD35_DIRECT_24_GIB,
+    empty_sd35_direct_dora_set, empty_sd35_direct_oft_set,
+    sd35_direct_dense_carrier_bytes,
+    sd35_direct_dora_preflight, sd35_direct_oft_preflight,
+    build_sd35_direct_dora_set_from_offload,
+    build_sd35_direct_oft_set_for_stack,
+    sd35_direct_dora_trainable_bytes, sd35_direct_oft_trainable_bytes,
+    sd35_stack_direct_dora_forward_offload,
+    sd35_stack_direct_dora_backward_offload,
+    sd35_stack_direct_oft_forward_offload,
+    sd35_stack_direct_oft_backward_offload,
+    sd35_direct_dora_grad_norm, sd35_direct_dora_clip_grads,
+    sd35_direct_dora_adamw_step, sd35_direct_dora_zero_leg_l1,
+    sd35_direct_oft_grad_norm, sd35_direct_oft_clip_grads,
+    sd35_direct_oft_adamw_step, sd35_direct_oft_vec_l1,
+    save_sd35_direct_dora, save_sd35_direct_oft,
+)
+from serenitymojo.models.sd35.sd35_lycoris_stack import (
+    SD35LoKrSet, empty_sd35_lokr_set, build_sd35_lokr_set,
+    sd35_lokr_carrier_set, sd35_lokr_carrier_total_bytes,
+    sd35_lokr_chain_all, sd35_lokr_adamw_step, sd35_lokr_grad_norm,
+    sd35_lokr_clip_grads, sd35_lokr_zero_leg_l1, save_sd35_lokr,
+    SD35LoHaSet, empty_sd35_loha_set, build_sd35_loha_set,
+    sd35_loha_carrier_set, sd35_loha_carrier_total_bytes,
+    sd35_loha_chain_all, sd35_loha_adamw_step, sd35_loha_grad_norm,
+    sd35_loha_clip_grads, sd35_loha_zero_leg_l1, save_sd35_loha,
 )
 from serenitymojo.offload.plan import build_sd35_large_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
@@ -98,8 +124,13 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 )
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOCON, TRAIN_ADAPTER_ALGO_LOHA,
+    TRAIN_ADAPTER_ALGO_DORA, TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
-from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -147,6 +178,7 @@ comptime VAE_SCALE = Float32(1.5305)
 comptime NUM_TRAIN_TIMESTEPS = 1000
 comptime CLIP_GRAD_NORM = Float32(1.0)
 comptime SEED_BASE = UInt64(42)
+comptime SD35_OFT_BLOCK_SIZE = 4
 
 comptime FIXED_SIGMA_SMOKE = True
 comptime FIXED_SIGMA_IDX = 500
@@ -213,7 +245,26 @@ def sd35_checkpoint_from_train_config(cfg: TrainConfig) -> String:
 
 
 def validate_sd35_train_config(cfg: TrainConfig) raises:
-    require_lora_or_locon_linear(cfg, String("SD3.5"))
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[SD35-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
+        print("[SD35-lokr] network_algorithm=lokr: using carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
+        print("[SD35-loha] network_algorithm=loha: using carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA:
+        print("[SD35-dora] network_algorithm=dora: using direct W_eff stack dispatch with streamed base-weight init")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
+        print("[SD35-oft] network_algorithm=oft: using direct W_eff stack dispatch with OneTrainer-OFT block_size=4")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("SD3.5 trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("SD3.5 trainer: full finetune is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("SD3.5 trainer: network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+        )
     if (
         cfg.name != String("STABLE_DIFFUSION_35")
         and cfg.name != String("sd35")
@@ -284,6 +335,34 @@ def sd35_output_lora_path_from_train_config(cfg: TrainConfig, completed_step: In
     return ot_output_lora_path_from_train_config(
         cfg, String(LORA_DIR), String("sd35_lora"), completed_step
     )
+
+
+def _substr(s: String, start: Int, end: Int) -> String:
+    var out = String("")
+    var i = 0
+    for ch in s.codepoint_slices():
+        if i >= start and i < end:
+            out += String(ch)
+        i += 1
+    return out^
+
+
+def _dirname(path: String) -> String:
+    var last = -1
+    var i = 0
+    for ch in path.codepoint_slices():
+        if String(ch) == String("/"):
+            last = i
+        i += 1
+    if last <= 0:
+        return String(".")
+    return _substr(path, 0, last)
+
+
+def _mkdir_parent(path: String) raises:
+    var parent_dir = _dirname(path)
+    if parent_dir != String("."):
+        makedirs(parent_dir, exist_ok=True)
 
 
 def sd35_sample_cadence_from_train_config(
@@ -687,6 +766,11 @@ def main() raises:
     var cache_dir = sd35_cache_dir_from_train_config(train_cfg)
     var sample_cadence = sd35_sample_cadence_from_train_config(cfg_path, train_cfg)
     var sample_enabled = sd35_sampling_enabled(sample_cadence)
+    var dora_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var direct_active = dora_active or oft_active
+    if direct_active and sample_enabled:
+        raise Error("SD3.5 direct DoRA/OFT sample-during-training is not wired; disable sample cadence for this runtime gate")
 
     print("=== SD3.5-Large REAL LoRA training loop (block-swap offload) ===")
     print("  config:", cfg_path)
@@ -740,6 +824,73 @@ def main() raises:
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
     var lora = build_sd35_lora_set(NUM_JOINT, D, FMLP, RANK, ALPHA)
     var n_adapters = total_adapters(lora)
+    var lokr_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var carrier_active = lokr_active or loha_active
+    var lokr_masters = empty_sd35_lokr_set()
+    var loha_masters = empty_sd35_loha_set()
+    var dora_masters = empty_sd35_direct_dora_set()
+    var oft_masters = empty_sd35_direct_oft_set()
+    if dora_active:
+        var dense_bytes = sd35_direct_dense_carrier_bytes(NUM_JOINT, D, FMLP, train_cfg.lokr_targets)
+        var direct_bytes = sd35_direct_dora_preflight(
+            NUM_JOINT, D, FMLP, RANK, train_cfg.lokr_targets,
+            SD35_DIRECT_24_GIB, False,
+        )
+        print("[SD35-dora] dense carrier bytes would be:", dense_bytes,
+              " direct trainable-state preflight bytes:", direct_bytes,
+              " budget:", SD35_DIRECT_24_GIB)
+        dora_masters = build_sd35_direct_dora_set_from_offload(
+            loader, NUM_JOINT, D, FMLP, Dh, RANK, ALPHA,
+            train_cfg.lokr_targets, UInt64(350003), False, ctx,
+        )
+        print("[SD35-dora] direct slots:", len(dora_masters.ad),
+              " trainable bytes:", sd35_direct_dora_trainable_bytes(dora_masters))
+    elif oft_active:
+        var dense_bytes = sd35_direct_dense_carrier_bytes(NUM_JOINT, D, FMLP, train_cfg.lokr_targets)
+        var direct_bytes = sd35_direct_oft_preflight(
+            NUM_JOINT, D, FMLP, SD35_OFT_BLOCK_SIZE,
+            train_cfg.lokr_targets, SD35_DIRECT_24_GIB,
+        )
+        print("[SD35-oft] dense carrier bytes would be:", dense_bytes,
+              " direct trainable-state preflight bytes:", direct_bytes,
+              " budget:", SD35_DIRECT_24_GIB)
+        oft_masters = build_sd35_direct_oft_set_for_stack(
+            NUM_JOINT, D, FMLP, SD35_OFT_BLOCK_SIZE, train_cfg.lokr_targets,
+        )
+        print("[SD35-oft] direct slots:", len(oft_masters.ad),
+              " trainable bytes:", sd35_direct_oft_trainable_bytes(oft_masters))
+    elif lokr_active:
+        lokr_masters = build_sd35_lokr_set(
+            NUM_JOINT, D, FMLP, RANK, ALPHA,
+            train_cfg.lokr_factor, train_cfg.lokr_factor_attn,
+            train_cfg.lokr_factor_ff,
+            train_cfg.lokr_decompose_both, train_cfg.lokr_full_matrix,
+            train_cfg.lokr_targets, UInt64(350001),
+        )
+        var carrier_bytes = sd35_lokr_carrier_total_bytes(lokr_masters, D, FMLP)
+        print("[SD35-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("SD3.5 LoKr: carrier set needs ") + String(carrier_bytes)
+                + String(" bytes (> budget). Use a smaller lokr_factor/rank or restrict lokr_targets.")
+            )
+        lora = sd35_lokr_carrier_set(lokr_masters, D, FMLP)
+        print("[SD35-lokr] carrier set materialized:", len(lora.ad), "adapters")
+    elif loha_active:
+        loha_masters = build_sd35_loha_set(
+            NUM_JOINT, D, FMLP, RANK, ALPHA,
+            train_cfg.lokr_targets, UInt64(350002),
+        )
+        var carrier_bytes = sd35_loha_carrier_total_bytes(loha_masters, D, FMLP)
+        print("[SD35-loha] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("SD3.5 LoHa: carrier set needs ") + String(carrier_bytes)
+                + String(" bytes (> budget). Reduce lora_rank or restrict lokr_targets.")
+            )
+        lora = sd35_loha_carrier_set(loha_masters, D, FMLP)
+        print("[SD35-loha] carrier set materialized:", len(lora.ad), "adapters")
     print("[lora] adapters:", n_adapters, " (8 per joint block x", NUM_JOINT, "blocks)")
 
     var files = _list_cache(cache_dir)
@@ -748,7 +899,25 @@ def main() raises:
     var b_absum_init = Float32(0.0)
     for i in range(n_adapters):
         b_absum_init += _absum(lora.ad[i].b)
-    print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+    if carrier_active:
+        print("[lora] carrier LoRA-B |.|_1 at init =", b_absum_init)
+    elif direct_active:
+        print("[lora] direct DoRA/OFT run: LoRA carrier state is bypassed")
+    else:
+        print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+    var carrier_zero_init = Float64(0.0)
+    if lokr_active:
+        carrier_zero_init = sd35_lokr_zero_leg_l1(lokr_masters)
+        print("[SD35-lokr] zero-leg L1 at init =", carrier_zero_init)
+    elif loha_active:
+        carrier_zero_init = sd35_loha_zero_leg_l1(loha_masters)
+        print("[SD35-loha] zero-leg L1 at init =", carrier_zero_init)
+    elif dora_active:
+        carrier_zero_init = sd35_direct_dora_zero_leg_l1(dora_masters)
+        print("[SD35-dora] zero-leg L1 at init =", carrier_zero_init)
+    elif oft_active:
+        carrier_zero_init = sd35_direct_oft_vec_l1(oft_masters)
+        print("[SD35-oft] vec L1 at init =", carrier_zero_init)
 
     var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
     print("[cadence] next sample completed_step=", next_sample)
@@ -759,6 +928,8 @@ def main() raises:
         makedirs(samples_dir, exist_ok=True)
         print("[cadence] sample-during-training WIRED -> ", samples_dir,
               " (", SAMPLE_STEPS, "-step CFG=", SAMPLE_CFG, " v1 cond=cached-caption)")
+    var output_lora_path = sd35_output_lora_path_from_train_config(train_cfg, run_steps)
+    _mkdir_parent(output_lora_path)
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -813,6 +984,118 @@ def main() raises:
             noisy.append(noise[i] * sig + latent_packed[i] * (Float32(1.0) - sig))
             target.append(noise[i] - latent_packed[i])
 
+        if dora_active:
+            var fwd_dora = sd35_stack_direct_dora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
+                base, loader, dora_masters, NUM_JOINT, train_cfg.lokr_targets,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                EPS, QK_EPS, ctx,
+            )
+            var nout_d = len(fwd_dora.out)
+            var d_loss_d = List[Float32]()
+            var sse_d = 0.0
+            var inv_n_d = Float32(2.0) / Float32(nout_d)
+            for i in range(nout_d):
+                var diff = fwd_dora.out[i] - target[i]
+                sse_d += Float64(diff) * Float64(diff)
+                d_loss_d.append(inv_n_d * diff)
+            var loss_d = Float32(sse_d / Float64(nout_d))
+            if k == 1:
+                first_loss = loss_d
+            last_loss = loss_d
+
+            var dg = sd35_stack_direct_dora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss_d, noisy.copy(), txt_tokens.copy(),
+                base, loader, dora_masters, fwd_dora,
+                NUM_JOINT, train_cfg.lokr_targets,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                EPS, QK_EPS, ctx,
+            )
+            var mnorm = sd35_direct_dora_grad_norm(dg.grads)
+            if mnorm > Float64(CLIP_GRAD_NORM):
+                sd35_direct_dora_clip_grads(dg.grads, CLIP_GRAD_NORM / Float32(mnorm))
+            var step_lr_d = ot_lr_for_optimizer_step(train_cfg, k)
+            sd35_direct_dora_adamw_step(
+                dora_masters, dg.grads, k, step_lr_d,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+
+            var t1_d = perf_counter_ns()
+            var secs_d = Float64(t1_d - t0) / 1.0e9
+            print_trainer_progress(
+                String("SD35-dora"), k, run_steps, 1,
+                loss_d, mnorm, secs_d, 0.0,
+                Float64(t1_d - train_start) / 1.0e9,
+            )
+            print("[SD35-dora] step=", k, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", sd35_direct_dora_zero_leg_l1(dora_masters))
+            if dg.nonfinite_grads != 0:
+                print("[SD35-dora] warning nonfinite=", dg.nonfinite_grads)
+            if sd35_should_save_checkpoint(train_cfg, k):
+                var save_path_d = _step_lora_path(
+                    sd35_output_lora_path_from_train_config(train_cfg, run_steps), k
+                )
+                _ = save_sd35_direct_dora(dora_masters, save_path_d, ctx)
+                print("[SD35-dora] save step=", k, " path=", save_path_d)
+            continue
+
+        if oft_active:
+            var fwd_oft = sd35_stack_direct_oft_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
+                base, loader, oft_masters, NUM_JOINT, train_cfg.lokr_targets,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                EPS, QK_EPS, ctx,
+            )
+            var nout_o = len(fwd_oft.out)
+            var d_loss_o = List[Float32]()
+            var sse_o = 0.0
+            var inv_n_o = Float32(2.0) / Float32(nout_o)
+            for i in range(nout_o):
+                var diff = fwd_oft.out[i] - target[i]
+                sse_o += Float64(diff) * Float64(diff)
+                d_loss_o.append(inv_n_o * diff)
+            var loss_o = Float32(sse_o / Float64(nout_o))
+            if k == 1:
+                first_loss = loss_o
+            last_loss = loss_o
+
+            var og = sd35_stack_direct_oft_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss_o, noisy.copy(), txt_tokens.copy(),
+                base, loader, oft_masters, fwd_oft,
+                NUM_JOINT, train_cfg.lokr_targets,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                EPS, QK_EPS, ctx,
+            )
+            var onorm = sd35_direct_oft_grad_norm(og.grads)
+            if onorm > Float64(CLIP_GRAD_NORM):
+                sd35_direct_oft_clip_grads(og.grads, CLIP_GRAD_NORM / Float32(onorm))
+            var step_lr_o = ot_lr_for_optimizer_step(train_cfg, k)
+            sd35_direct_oft_adamw_step(
+                oft_masters, og.grads, k, step_lr_o,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+
+            var t1_o = perf_counter_ns()
+            var secs_o = Float64(t1_o - t0) / 1.0e9
+            print_trainer_progress(
+                String("SD35-oft"), k, run_steps, 1,
+                loss_o, onorm, secs_o, 0.0,
+                Float64(t1_o - train_start) / 1.0e9,
+            )
+            print("[SD35-oft] step=", k, " master_grad_norm=", Float32(onorm),
+                  " vec_l1=", sd35_direct_oft_vec_l1(oft_masters))
+            if og.nonfinite_grads != 0:
+                print("[SD35-oft] warning nonfinite=", og.nonfinite_grads)
+            if sd35_should_save_checkpoint(train_cfg, k):
+                var save_path_o = _step_lora_path(
+                    sd35_output_lora_path_from_train_config(train_cfg, run_steps), k
+                )
+                _ = save_sd35_direct_oft(oft_masters, save_path_o, ctx)
+                print("[SD35-oft] save step=", k, " path=", save_path_o)
+            continue
+
         # ── forward (offload, full depth) -> velocity [N_IMG, OUT_CH] ──
         var fwd = sd35_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
             noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
@@ -848,11 +1131,38 @@ def main() raises:
 
         # ── AdamW ──
         var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-        sd35_lora_adamw_step(
-            lora, grads, k, step_lr, ctx,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
-            train_cfg.weight_decay,
-        )
+        if lokr_active:
+            var mg = sd35_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
+            var mnorm = sd35_lokr_grad_norm(mg)
+            if mnorm > Float64(CLIP_GRAD_NORM):
+                sd35_lokr_clip_grads(mg, CLIP_GRAD_NORM / Float32(mnorm))
+            sd35_lokr_adamw_step(
+                lokr_masters, mg, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            lora = sd35_lokr_carrier_set(lokr_masters, D, FMLP)
+            print("[SD35-lokr] step=", k, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", sd35_lokr_zero_leg_l1(lokr_masters))
+        elif loha_active:
+            var mg = sd35_loha_chain_all(loha_masters, grads.d_a, grads.d_b)
+            var mnorm = sd35_loha_grad_norm(mg)
+            if mnorm > Float64(CLIP_GRAD_NORM):
+                sd35_loha_clip_grads(mg, CLIP_GRAD_NORM / Float32(mnorm))
+            sd35_loha_adamw_step(
+                loha_masters, mg, k, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            lora = sd35_loha_carrier_set(loha_masters, D, FMLP)
+            print("[SD35-loha] step=", k, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", sd35_loha_zero_leg_l1(loha_masters))
+        else:
+            sd35_lora_adamw_step(
+                lora, grads, k, step_lr, ctx,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -869,20 +1179,30 @@ def main() raises:
             var save_path = _step_lora_path(
                 sd35_output_lora_path_from_train_config(train_cfg, run_steps), k
             )
-            _ = save_sd35_lora(lora, save_path, ctx)
-            var state_path = save_path + String(".state.safetensors")
-            _ = save_sd35_lora_state(lora, state_path, ctx)
+            if lokr_active:
+                _ = save_sd35_lokr(lokr_masters, save_path, ctx)
+            elif loha_active:
+                _ = save_sd35_loha(loha_masters, save_path, ctx)
+            else:
+                _ = save_sd35_lora(lora, save_path, ctx)
+                var state_path = save_path + String(".state.safetensors")
+                _ = save_sd35_lora_state(lora, state_path, ctx)
             saved_this_step = True
-            print("[SD35-lora] save_state step=", k, " path=", state_path)
+            print("[SD35-lora] save step=", k, " path=", save_path)
         if sample_enabled and should_sample_completed_step(sample_cadence, k):
             if sd35_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var sample_path = _step_lora_path(
                     sd35_output_lora_path_from_train_config(train_cfg, run_steps), k
                 )
-                _ = save_sd35_lora(lora, sample_path, ctx)
-                var sample_state = sample_path + String(".state.safetensors")
-                _ = save_sd35_lora_state(lora, sample_state, ctx)
-                print("[SD35-lora] save_before_sample step=", k, " path=", sample_state)
+                if lokr_active:
+                    _ = save_sd35_lokr(lokr_masters, sample_path, ctx)
+                elif loha_active:
+                    _ = save_sd35_loha(loha_masters, sample_path, ctx)
+                else:
+                    _ = save_sd35_lora(lora, sample_path, ctx)
+                    var sample_state = sample_path + String(".state.safetensors")
+                    _ = save_sd35_lora_state(lora, sample_state, ctx)
+                print("[SD35-lora] save_before_sample step=", k, " path=", sample_path)
             # Geometry/contract preflight (fail-loud on bad prompts), then the real
             # v1 sample-during-training run: denoise from the CURRENT frozen base +
             # streamed joint blocks + LIVE LoRA, decode, write the PNG.
@@ -903,15 +1223,45 @@ def main() raises:
     var b_absum_final = Float32(0.0)
     for i in range(n_adapters):
         b_absum_final += _absum(lora.ad[i].b)
-    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
+    var trains: Bool
+    var carrier_zero_final = Float64(0.0)
+    if lokr_active:
+        carrier_zero_final = sd35_lokr_zero_leg_l1(lokr_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif loha_active:
+        carrier_zero_final = sd35_loha_zero_leg_l1(loha_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif dora_active:
+        carrier_zero_final = sd35_direct_dora_zero_leg_l1(dora_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    elif oft_active:
+        carrier_zero_final = sd35_direct_oft_vec_l1(oft_masters)
+        trains = carrier_zero_final > carrier_zero_init
+    else:
+        trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
     if trains and (last_loss == last_loss):
-        print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
-              "; loss", first_loss, "->", last_loss,
-              (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        if carrier_active or direct_active:
+            print("RESULT: REAL run OK — LyCORIS zero-leg grew ",
+                  carrier_zero_init, " -> ", carrier_zero_final,
+                  "; loss", first_loss, "->", last_loss,
+                  (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+        else:
+            print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
+                  "; loss", first_loss, "->", last_loss,
+                  (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         var lora_out = sd35_output_lora_path_from_train_config(train_cfg, run_steps)
-        _ = save_sd35_lora(lora, lora_out, ctx)
-        var state_out = lora_out + String(".state.safetensors")
-        _ = save_sd35_lora_state(lora, state_out, ctx)
-        print("[SD35-lora] save_state step=", run_steps, " path=", state_out)
+        if lokr_active:
+            _ = save_sd35_lokr(lokr_masters, lora_out, ctx)
+        elif loha_active:
+            _ = save_sd35_loha(loha_masters, lora_out, ctx)
+        elif dora_active:
+            _ = save_sd35_direct_dora(dora_masters, lora_out, ctx)
+        elif oft_active:
+            _ = save_sd35_direct_oft(oft_masters, lora_out, ctx)
+        else:
+            _ = save_sd35_lora(lora, lora_out, ctx)
+            var state_out = lora_out + String(".state.safetensors")
+            _ = save_sd35_lora_state(lora, state_out, ctx)
+            print("[SD35-lora] save_state step=", run_steps, " path=", state_out)
     else:
         print("RESULT: FAIL trains=", trains)

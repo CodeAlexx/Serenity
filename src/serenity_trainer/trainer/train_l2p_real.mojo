@@ -65,6 +65,7 @@ from serenitymojo.ops.cast import cast_tensor
 
 from serenitymojo.models.zimage.weights import ZImageBlockWeights
 from serenitymojo.models.zimage.block import ZImageModVecs
+from serenitymojo.models.zimage.zimage_stack import ZImageStackForward
 from serenitymojo.models.zimage.lora_block import ZIMAGE_SLOTS
 from serenitymojo.models.zimage.zimage_stack_lora import (
     ZImageLoraSet, ZImageLoraGrads, build_zimage_lora_set,
@@ -73,6 +74,37 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
     zimage_stack_lora_backward_main_device_nofinal,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
     save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
+    ZIMAGE_DIRECT_24_GIB,
+    empty_zimage_direct_dora_set, empty_zimage_direct_oft_set,
+    zimage_direct_dense_carrier_bytes,
+    zimage_direct_dora_preflight, zimage_direct_oft_preflight,
+    build_zimage_direct_dora_set_from_main_blocks,
+    build_zimage_direct_oft_set_for_main_blocks,
+    zimage_stack_direct_dora_forward_main_device,
+    zimage_stack_direct_oft_forward_main_device,
+    zimage_stack_direct_dora_backward_main_device_nofinal,
+    zimage_stack_direct_oft_backward_main_device_nofinal,
+    zimage_direct_dora_grad_norm, zimage_direct_dora_clip_grads,
+    zimage_direct_dora_adamw_step, zimage_direct_dora_zero_leg_l1,
+    zimage_direct_dora_trainable_bytes, save_zimage_direct_dora,
+    zimage_direct_oft_grad_norm, zimage_direct_oft_clip_grads,
+    zimage_direct_oft_adamw_step, zimage_direct_oft_vec_l1,
+    zimage_direct_oft_trainable_bytes, save_zimage_direct_oft,
+)
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectOFTSet,
+)
+from serenitymojo.models.zimage.zimage_lokr_stack import (
+    ZImageLoKrSet, empty_zimage_lokr_set, build_zimage_lokr_set,
+    zimage_lokr_carrier_lists, zimage_lokr_carrier_total_bytes,
+    zimage_lokr_chain_all, zimage_lokr_adamw_step, zimage_lokr_grad_norm,
+    zimage_lokr_clip_grads, zimage_lokr_zero_leg_l1, save_zimage_lokr,
+)
+from serenitymojo.models.zimage.zimage_loha_stack import (
+    ZImageLoHaSet, empty_zimage_loha_set, build_zimage_loha_set,
+    zimage_loha_carrier_lists, zimage_loha_carrier_total_bytes,
+    zimage_loha_chain_all, zimage_loha_adamw_step, zimage_loha_grad_norm,
+    zimage_loha_clip_grads, zimage_loha_zero_leg_l1, save_zimage_loha,
 )
 from serenitymojo.models.l2p.weights import (
     L2PRealAux, load_l2p_real_aux, load_l2p_block_weights_prefixed,
@@ -87,8 +119,19 @@ from serenitymojo.models.dit.zimage_l2p_local_decoder import ZImageL2PLocalDecod
 from serenitymojo.training.klein_dataset import L2PCache
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.io.train_config_reader import read_model_config
-from serenitymojo.training.train_config import TrainConfig
-from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
+from serenitymojo.training.train_config import (
+    TrainConfig,
+    TRAIN_ADAPTER_ALGO_LORA,
+    TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOHA,
+    TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_DORA,
+    TRAIN_ADAPTER_ALGO_OFT,
+    TRAIN_ADAPTER_ALGO_BOFT,
+    TRAIN_ADAPTER_ALGO_LOCON,
+)
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 
 
 # ── arch (Z-Image L2P; IDENTICAL body to Z-Image base) ───────────────────────
@@ -146,6 +189,7 @@ comptime LORA_DIR = "/home/alex/mojodiffusion/output/alina_l2p"
 # Adapter slice: NR+CR blocks are allocated; only MAIN blocks are trained.
 comptime TRAIN_ADAPTER_START = (NUM_NR + NUM_CR) * ZIMAGE_SLOTS
 comptime N_ADAPTERS_TOTAL = (NUM_NR + NUM_CR + MAIN_DEPTH) * ZIMAGE_SLOTS
+comptime L2P_OFT_BLOCK_SIZE = 4
 
 
 # ── host math helpers ─────────────────────────────────────────────────────────
@@ -206,7 +250,28 @@ def _close_l2p(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
 
 
 def validate_l2p_train_config(cfg: TrainConfig) raises:
-    require_lora_or_locon_linear(cfg, String("L2P"))
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[L2P-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
+        print("[L2P-lokr] network_algorithm=lokr: using main-layer carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
+        print("[L2P-loha] network_algorithm=loha: using main-layer carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA or cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
+        print(
+            String("[L2P-") + adapter_algo_name(cfg.adapter_algo)
+            + String("] network_algorithm=") + adapter_algo_name(cfg.adapter_algo)
+            + String(": using direct main-layer W_eff substitution; BOFT remains excluded")
+        )
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("L2P trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("L2P trainer: full finetune is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("L2P trainer: adapter algorithm ")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+        )
     if cfg.name != String("l2p") and cfg.name != String("zimage_l2p"):
         raise Error(String("L2P trainer config requires model_type=l2p, got ") + cfg.name)
     if cfg.checkpoint == String(""):
@@ -323,6 +388,21 @@ def _train_one_step_l2p(
     cr_blocks: List[ZImageBlockWeights],
     main_blocks: List[ZImageBlockWeights],
     mut lora: ZImageLoraSet,
+    lokr_active: Bool,
+    loha_active: Bool,
+    dora_active: Bool,
+    oft_active: Bool,
+    mut lokr_masters: ZImageLoKrSet,
+    mut loha_masters: ZImageLoHaSet,
+    mut direct_dora: FlatDirectDoRASet,
+    mut direct_oft: FlatDirectOFTSet,
+    direct_targets: Int,
+    step_lr: Float32,
+    max_grad_norm: Float32,
+    beta1: Float32,
+    beta2: Float32,
+    optimizer_eps: Float32,
+    weight_decay: Float32,
     train_start_ns: UInt,
     ctx: DeviceContext,
 ) raises -> L2PStepResult:
@@ -431,14 +511,34 @@ def _train_one_step_l2p(
     var lora_dev = zimage_lora_set_to_device(lora, ctx)
     var t_lora = perf_counter_ns()
 
-    var fwd = zimage_stack_lora_forward_main_device[H, Dh, N_IMG, N_TXT, S](
-        x_t_host.copy(), cap_seq.copy(),
-        nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora_dev,
-        f_scale_zeros.copy(),
-        ident_w, zero_b,
-        x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
-        D, F, D, EPS, FINAL_EPS, ctx,
-    )
+    var fwd: ZImageStackForward
+    if dora_active:
+        fwd = zimage_stack_direct_dora_forward_main_device[H, Dh, N_IMG, N_TXT, S](
+            x_t_host.copy(), cap_seq.copy(),
+            nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, direct_dora,
+            direct_targets, f_scale_zeros.copy(),
+            ident_w, zero_b,
+            x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
+            D, F, D, EPS, FINAL_EPS, ctx,
+        )
+    elif oft_active:
+        fwd = zimage_stack_direct_oft_forward_main_device[H, Dh, N_IMG, N_TXT, S](
+            x_t_host.copy(), cap_seq.copy(),
+            nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, direct_oft,
+            direct_targets, f_scale_zeros.copy(),
+            ident_w, zero_b,
+            x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
+            D, F, D, EPS, FINAL_EPS, ctx,
+        )
+    else:
+        fwd = zimage_stack_lora_forward_main_device[H, Dh, N_IMG, N_TXT, S](
+            x_t_host.copy(), cap_seq.copy(),
+            nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, lora_dev,
+            f_scale_zeros.copy(),
+            ident_w, zero_b,
+            x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
+            D, F, D, EPS, FINAL_EPS, ctx,
+        )
     var t_fwd = perf_counter_ns()
 
     # ── feature map [1, D, HT, WT] from the last-block image-token hidden ─────
@@ -477,6 +577,80 @@ def _train_one_step_l2p(
     var d_x_full = _feat_nchw_to_tokens(d_feat, ctx)   # [S,D], image rows filled
     var t_dbwd = perf_counter_ns()
 
+    if dora_active:
+        var dg = zimage_stack_direct_dora_backward_main_device_nofinal[
+            H, Dh, N_IMG, N_TXT, S
+        ](
+            d_x_full, main_blocks, main_mod, direct_dora, direct_targets,
+            uni_cos[], uni_sin[], fwd, D, F, EPS, ctx,
+        )
+        var t_bwd = perf_counter_ns()
+        var gn_before = zimage_direct_dora_grad_norm(dg.grads)
+        if gn_before > Float64(max_grad_norm):
+            zimage_direct_dora_clip_grads(dg.grads, max_grad_norm / Float32(gn_before))
+        zimage_direct_dora_adamw_step(
+            direct_dora, dg.grads, k, step_lr, beta1, beta2, optimizer_eps,
+            weight_decay,
+        )
+        var t_opt = perf_counter_ns()
+        var t1 = perf_counter_ns()
+        var secs = Float64(t1 - t0) / 1.0e9
+        var b_absum = Float32(zimage_direct_dora_zero_leg_l1(direct_dora))
+        print_trainer_progress(
+            String("L2P-dora"), k, run_steps, 1,
+            loss, Float64(gn_before), secs, 0.0,
+            Float64(t1 - train_start_ns) / 1.0e9,
+        )
+        if dg.nonfinite_grads != 0:
+            print("[L2P-dora] warning nonfinite_direct_grads=", dg.nonfinite_grads)
+        print("[TIMING step=", k,
+              "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
+              " direct=", Float32(Float64(t_lora - t_prep) / 1.0e9),
+              " fwd=", Float32(Float64(t_fwd - t_lora) / 1.0e9),
+              " dec=", Float32(Float64(t_dec - t_fwd) / 1.0e9),
+              " loss=", Float32(Float64(t_loss - t_dec) / 1.0e9),
+              " dbwd=", Float32(Float64(t_dbwd - t_loss) / 1.0e9),
+              " bwd=", Float32(Float64(t_bwd - t_dbwd) / 1.0e9),
+              " opt=", Float32(Float64(t_opt - t_bwd) / 1.0e9))
+        return L2PStepResult(loss, Float32(gn_before), Float32(secs), b_absum, dg.nonfinite_grads)
+
+    if oft_active:
+        var og = zimage_stack_direct_oft_backward_main_device_nofinal[
+            H, Dh, N_IMG, N_TXT, S
+        ](
+            d_x_full, main_blocks, main_mod, direct_oft, direct_targets,
+            uni_cos[], uni_sin[], fwd, D, F, EPS, ctx,
+        )
+        var t_bwd = perf_counter_ns()
+        var gn_before = zimage_direct_oft_grad_norm(og.grads)
+        if gn_before > Float64(max_grad_norm):
+            zimage_direct_oft_clip_grads(og.grads, max_grad_norm / Float32(gn_before))
+        zimage_direct_oft_adamw_step(
+            direct_oft, og.grads, k, step_lr, beta1, beta2, optimizer_eps,
+            weight_decay,
+        )
+        var t_opt = perf_counter_ns()
+        var t1 = perf_counter_ns()
+        var secs = Float64(t1 - t0) / 1.0e9
+        var b_absum = Float32(zimage_direct_oft_vec_l1(direct_oft))
+        print_trainer_progress(
+            String("L2P-oft"), k, run_steps, 1,
+            loss, Float64(gn_before), secs, 0.0,
+            Float64(t1 - train_start_ns) / 1.0e9,
+        )
+        if og.nonfinite_grads != 0:
+            print("[L2P-oft] warning nonfinite_direct_grads=", og.nonfinite_grads)
+        print("[TIMING step=", k,
+              "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
+              " direct=", Float32(Float64(t_lora - t_prep) / 1.0e9),
+              " fwd=", Float32(Float64(t_fwd - t_lora) / 1.0e9),
+              " dec=", Float32(Float64(t_dec - t_fwd) / 1.0e9),
+              " loss=", Float32(Float64(t_loss - t_dec) / 1.0e9),
+              " dbwd=", Float32(Float64(t_dbwd - t_loss) / 1.0e9),
+              " bwd=", Float32(Float64(t_bwd - t_dbwd) / 1.0e9),
+              " opt=", Float32(Float64(t_opt - t_bwd) / 1.0e9))
+        return L2PStepResult(loss, Float32(gn_before), Float32(secs), b_absum, og.nonfinite_grads)
+
     # ── DiT stack backward (no final layer): d_x_full -> LoRA grads ───────────
     var grads = zimage_stack_lora_backward_main_device_nofinal[H, Dh, N_IMG, N_TXT, S](
         d_x_full, main_blocks, main_mod, lora_dev,
@@ -486,18 +660,59 @@ def _train_one_step_l2p(
     var t_bwd = perf_counter_ns()
 
     # ── clip + optimize (main adapters only) ──────────────────────────────────
-    var gn_before = _clip_l2p(grads, CLIP_GRAD_NORM, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
-    zimage_lora_adamw_step_main_only(lora, grads, k, LR, ctx)
+    var gn_before: Float64
+    var progress_label = String("L2P-lora")
+    if lokr_active:
+        progress_label = String("L2P-lokr")
+        var mg = zimage_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
+        var mnorm = zimage_lokr_grad_norm(mg)
+        gn_before = mnorm
+        if mnorm > Float64(max_grad_norm):
+            zimage_lokr_clip_grads(mg, max_grad_norm / Float32(mnorm))
+        zimage_lokr_adamw_step(
+            lokr_masters, mg, k, step_lr, beta1, beta2, optimizer_eps,
+            weight_decay,
+        )
+        var carriers = zimage_lokr_carrier_lists(lokr_masters, D, F)
+        lora.ad = carriers^
+        print("[L2P-lokr] step=", k, " master_grad_norm=", Float32(mnorm),
+              " zero_leg_l1=", zimage_lokr_zero_leg_l1(lokr_masters))
+    elif loha_active:
+        progress_label = String("L2P-loha")
+        var mg = zimage_loha_chain_all(loha_masters, grads.d_a, grads.d_b)
+        var mnorm = zimage_loha_grad_norm(mg)
+        gn_before = mnorm
+        if mnorm > Float64(max_grad_norm):
+            zimage_loha_clip_grads(mg, max_grad_norm / Float32(mnorm))
+        zimage_loha_adamw_step(
+            loha_masters, mg, k, step_lr, beta1, beta2, optimizer_eps,
+            weight_decay,
+        )
+        var carriers = zimage_loha_carrier_lists(loha_masters, D, F)
+        lora.ad = carriers^
+        print("[L2P-loha] step=", k, " master_grad_norm=", Float32(mnorm),
+              " zero_leg_l1=", zimage_loha_zero_leg_l1(loha_masters))
+    else:
+        gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
+        zimage_lora_adamw_step_main_only(
+            lora, grads, k, step_lr, ctx, beta1, beta2, optimizer_eps,
+            weight_decay,
+        )
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()
     var secs = Float64(t1 - t0) / 1.0e9
     var b_absum = Float32(0.0)
-    for i in range(TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL):
-        b_absum += _absum_l2p(lora.ad[i].b)
+    if lokr_active:
+        b_absum = Float32(zimage_lokr_zero_leg_l1(lokr_masters))
+    elif loha_active:
+        b_absum = Float32(zimage_loha_zero_leg_l1(loha_masters))
+    else:
+        for i in range(TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL):
+            b_absum += _absum_l2p(lora.ad[i].b)
 
     print_trainer_progress(
-        String("L2P-lora"), k, run_steps, 1,
+        progress_label, k, run_steps, 1,
         loss, Float64(gn_before), secs, 0.0,
         Float64(t1 - train_start_ns) / 1.0e9,
     )
@@ -554,6 +769,30 @@ def main() raises:
             cache_dir = train_cfg.dataset_cache_dir.copy()
         elif train_cfg.cache_dir != String(""):
             cache_dir = train_cfg.cache_dir.copy()
+    var adapter_rank = RANK
+    var adapter_alpha = ALPHA
+    var step_lr = LR
+    var max_grad_norm = CLIP_GRAD_NORM
+    var beta1 = Float32(0.9)
+    var beta2 = Float32(0.999)
+    var optimizer_eps = Float32(1.0e-8)
+    var weight_decay = Float32(0.01)
+    if has_config:
+        adapter_rank = train_cfg.lora_rank
+        adapter_alpha = train_cfg.lora_alpha
+        step_lr = train_cfg.lr
+        max_grad_norm = train_cfg.max_grad_norm
+        beta1 = train_cfg.beta1
+        beta2 = train_cfg.beta2
+        optimizer_eps = train_cfg.eps
+        weight_decay = train_cfg.weight_decay
+    var lokr_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var dora_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var carrier_active = lokr_active or loha_active
+    var direct_active = dora_active or oft_active
+    var direct_targets = 1 if train_cfg.lokr_targets == 1 else 2
 
     print("=== Z-Image L2P REAL LoRA training loop (ai-toolkit faithful) ===")
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " F=", F)
@@ -561,7 +800,7 @@ def main() raises:
           " patch=", PATCH, " feat grid=", HT, "x", WT)
     print("  depth: NR=", NUM_NR, " CR=", NUM_CR, " MAIN=", MAIN_DEPTH)
     print("  bucket: 512x512 -> N_IMG=", N_IMG, " N_TXT=", N_TXT, " S=", S)
-    print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR,
+    print("  recipe: rank=", adapter_rank, " alpha=", adapter_alpha, " lr=", step_lr,
           " timestep=UNIFORM UNSHIFTED")
     print("  checkpoint:", ckpt_path)
     print("  cache:", cache_dir)
@@ -605,19 +844,109 @@ def main() raises:
     var dec_gate = ZImageL2PLocalDecoderGate.load(ckpt_path.copy(), ctx)
     var dec = l2p_decoder_f32_from_gate(dec_gate, ctx)
 
-    # ── LoRA set ──────────────────────────────────────────────────────────────
-    var lora = build_zimage_lora_set(NUM_NR, NUM_CR, MAIN_DEPTH, D, F, RANK, ALPHA)
-    if resume_state != String("") and resume_state != String("-"):
+    # ── LoRA / LyCORIS carrier set ────────────────────────────────────────────
+    var lora = build_zimage_lora_set(NUM_NR, NUM_CR, MAIN_DEPTH, D, F, adapter_rank, adapter_alpha)
+    var lokr_masters = empty_zimage_lokr_set()
+    var loha_masters = empty_zimage_loha_set()
+    var direct_dora = empty_zimage_direct_dora_set()
+    var direct_oft = empty_zimage_direct_oft_set()
+    if (carrier_active or direct_active) and resume_state != String("") and resume_state != String("-"):
+        raise Error("L2P LyCORIS direct/carrier path: resume state is not wired")
+    if (not carrier_active) and (not direct_active) and resume_state != String("") and resume_state != String("-"):
         print("[L2P-lora] loading resume state:", resume_state)
         lora = load_zimage_lora_main_only_state(
-            NUM_NR, NUM_CR, MAIN_DEPTH, RANK, ALPHA, D, F, resume_state, ctx,
+            NUM_NR, NUM_CR, MAIN_DEPTH, adapter_rank, adapter_alpha, D, F,
+            resume_state, ctx,
         )
+    if carrier_active:
+        if lokr_active:
+            lokr_masters = build_zimage_lokr_set(
+                NUM_NR, NUM_CR, MAIN_DEPTH, D, F,
+                adapter_rank, adapter_alpha,
+                train_cfg.lokr_factor, train_cfg.lokr_decompose_both,
+                train_cfg.lokr_full_matrix, direct_targets,
+                train_cfg.seed * UInt64(53) + UInt64(11),
+            )
+            for i in range(TRAIN_ADAPTER_START):
+                lokr_masters.active[i] = False
+            var carrier_bytes = zimage_lokr_carrier_total_bytes(lokr_masters, D, F)
+            print("[L2P-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+            if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+                raise Error(
+                    String("L2P LoKr carrier set needs ")
+                    + String(carrier_bytes) + String(" bytes on device (> budget ")
+                    + String(LOKR_CARRIER_MAX_DEVICE_BYTES) + String(")")
+                )
+            var carriers = zimage_lokr_carrier_lists(lokr_masters, D, F)
+            lora = ZImageLoraSet(carriers^, NUM_NR, NUM_CR, MAIN_DEPTH, adapter_rank)
+            print("[L2P-lokr] carrier set materialized:", len(lora.ad), "adapters")
+        elif loha_active:
+            loha_masters = build_zimage_loha_set(
+                NUM_NR, NUM_CR, MAIN_DEPTH, D, F,
+                adapter_rank, adapter_alpha, direct_targets,
+                train_cfg.seed * UInt64(53) + UInt64(11),
+            )
+            for i in range(TRAIN_ADAPTER_START):
+                loha_masters.active[i] = False
+            var carrier_bytes = zimage_loha_carrier_total_bytes(loha_masters, D, F)
+            print("[L2P-loha] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+            if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+                raise Error(
+                    String("L2P LoHa carrier set needs ")
+                    + String(carrier_bytes) + String(" bytes on device (> budget ")
+                    + String(LOKR_CARRIER_MAX_DEVICE_BYTES) + String(")")
+                )
+            var carriers = zimage_loha_carrier_lists(loha_masters, D, F)
+            lora = ZImageLoraSet(carriers^, NUM_NR, NUM_CR, MAIN_DEPTH, adapter_rank)
+            print("[L2P-loha] carrier set materialized:", len(lora.ad), "adapters")
+    elif dora_active:
+        var dense_bytes = zimage_direct_dense_carrier_bytes(MAIN_DEPTH, D, F, direct_targets)
+        var direct_bytes = zimage_direct_dora_preflight(
+            MAIN_DEPTH, D, F, adapter_rank, direct_targets,
+            ZIMAGE_DIRECT_24_GIB,
+        )
+        print("[L2P-dora] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " budget:", ZIMAGE_DIRECT_24_GIB)
+        direct_dora = build_zimage_direct_dora_set_from_main_blocks(
+            main_blocks, D, F, adapter_rank, adapter_alpha, direct_targets,
+            train_cfg.seed * UInt64(53) + UInt64(29), False, ctx,
+        )
+        print("[L2P-dora] direct trainable bytes materialized:",
+              zimage_direct_dora_trainable_bytes(direct_dora))
+    elif oft_active:
+        var dense_bytes = zimage_direct_dense_carrier_bytes(MAIN_DEPTH, D, F, direct_targets)
+        var direct_bytes = zimage_direct_oft_preflight(
+            MAIN_DEPTH, D, F, L2P_OFT_BLOCK_SIZE, direct_targets,
+            ZIMAGE_DIRECT_24_GIB,
+        )
+        print("[L2P-oft] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " budget:", ZIMAGE_DIRECT_24_GIB)
+        direct_oft = build_zimage_direct_oft_set_for_main_blocks(
+            MAIN_DEPTH, D, F, L2P_OFT_BLOCK_SIZE, direct_targets,
+        )
+        print("[L2P-oft] direct trainable bytes materialized:",
+              zimage_direct_oft_trainable_bytes(direct_oft))
     print("[lora] adapters:", MAIN_DEPTH * ZIMAGE_SLOTS, "trainable main;",
           N_ADAPTERS_TOTAL, "allocated total")
     var b_absum_init = Float32(0.0)
-    for i in range(TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL):
-        b_absum_init += _absum_l2p(lora.ad[i].b)
-    print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+    if lokr_active:
+        b_absum_init = Float32(zimage_lokr_zero_leg_l1(lokr_masters))
+        print("[L2P-lokr] zero-leg L1 at init =", b_absum_init, " (expect 0.0)")
+    elif loha_active:
+        b_absum_init = Float32(zimage_loha_zero_leg_l1(loha_masters))
+        print("[L2P-loha] zero-leg L1 at init =", b_absum_init, " (expect 0.0)")
+    elif dora_active:
+        b_absum_init = Float32(zimage_direct_dora_zero_leg_l1(direct_dora))
+        print("[L2P-dora] zero-leg L1 at init =", b_absum_init, " (expect 0.0)")
+    elif oft_active:
+        b_absum_init = Float32(zimage_direct_oft_vec_l1(direct_oft))
+        print("[L2P-oft] OFT vec L1 at init =", b_absum_init, " (expect 0.0)")
+    else:
+        for i in range(TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL):
+            b_absum_init += _absum_l2p(lora.ad[i].b)
+        print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -628,7 +957,12 @@ def main() raises:
         var step_seed = UInt64(k)
         var r = _train_one_step_l2p(
             k, run_steps, slot, step_seed, cache, aux, dec,
-            nr_blocks, cr_blocks, main_blocks, lora, train_start, ctx,
+            nr_blocks, cr_blocks, main_blocks, lora,
+            lokr_active, loha_active, dora_active, oft_active,
+            lokr_masters, loha_masters, direct_dora, direct_oft,
+            direct_targets,
+            step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
+            train_start, ctx,
         )
         if k == start_step + 1:
             first_loss = r.loss
@@ -637,19 +971,42 @@ def main() raises:
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
     var b_absum_final = Float32(0.0)
-    for i in range(TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL):
-        b_absum_final += _absum_l2p(lora.ad[i].b)
+    if lokr_active:
+        b_absum_final = Float32(zimage_lokr_zero_leg_l1(lokr_masters))
+    elif loha_active:
+        b_absum_final = Float32(zimage_loha_zero_leg_l1(loha_masters))
+    elif dora_active:
+        b_absum_final = Float32(zimage_direct_dora_zero_leg_l1(direct_dora))
+    elif oft_active:
+        b_absum_final = Float32(zimage_direct_oft_vec_l1(direct_oft))
+    else:
+        for i in range(TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL):
+            b_absum_final += _absum_l2p(lora.ad[i].b)
     var trains = b_absum_final > 0.0
     if trains and (last_loss == last_loss):
-        print("RESULT: REAL L2P LORA TRAIN OK — LoRA-B grew 0 ->", b_absum_final,
+        var train_label = String("LyCORIS zero-leg") if (carrier_active or dora_active) else (String("OFT vec") if oft_active else String("LoRA-B"))
+        print("RESULT: REAL L2P TRAIN OK — ", train_label, " grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         _ = sys_system(String("mkdir -p ") + String(LORA_DIR))
         var lora_out = String(LORA_DIR) + String("/l2p_lora_step") + String(run_steps) + String(".safetensors")
-        _ = save_zimage_lora_main_only(lora, lora_out, ctx)
-        var state_out = lora_out + String(".state.safetensors")
-        _ = save_zimage_lora_main_only_state(lora, state_out, ctx)
-        print("[L2P-lora] saved:", lora_out)
-        print("[L2P-lora] state:", state_out)
+        if lokr_active:
+            var nmods = save_zimage_lokr(lokr_masters, lora_out, ctx)
+            print("[L2P-lokr] saved:", lora_out, " modules=", nmods)
+        elif loha_active:
+            var nmods = save_zimage_loha(loha_masters, lora_out, ctx)
+            print("[L2P-loha] saved:", lora_out, " modules=", nmods)
+        elif dora_active:
+            var nmods = save_zimage_direct_dora(direct_dora, lora_out, ctx)
+            print("[L2P-dora] saved:", lora_out, " modules=", nmods)
+        elif oft_active:
+            var nmods = save_zimage_direct_oft(direct_oft, lora_out, ctx)
+            print("[L2P-oft] saved:", lora_out, " modules=", nmods)
+        else:
+            _ = save_zimage_lora_main_only(lora, lora_out, ctx)
+            var state_out = lora_out + String(".state.safetensors")
+            _ = save_zimage_lora_main_only_state(lora, state_out, ctx)
+            print("[L2P-lora] saved:", lora_out)
+            print("[L2P-lora] state:", state_out)
     else:
         print("RESULT: FAIL trains=", trains)

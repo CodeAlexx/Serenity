@@ -79,6 +79,27 @@ from serenitymojo.models.anima.anima_stack_lora import (
     anima_stack_lora_forward_streamed, anima_stack_lora_backward_streamed,
     anima_lora_adamw_step, save_anima_lora, save_anima_lora_state,
 )
+from serenitymojo.models.anima.anima_lycoris_stack import (
+    AnimaLoKrSet, empty_anima_lokr_set, build_anima_lokr_set,
+    anima_lokr_carrier_set, anima_lokr_carrier_total_bytes,
+    anima_lokr_chain_all, anima_lokr_adamw_step, anima_lokr_grad_norm,
+    anima_lokr_clip_grads, anima_lokr_zero_leg_l1, save_anima_lokr,
+    AnimaLoHaSet, empty_anima_loha_set, build_anima_loha_set,
+    anima_loha_carrier_set, anima_loha_carrier_total_bytes,
+    anima_loha_chain_all, anima_loha_adamw_step, anima_loha_grad_norm,
+    anima_loha_clip_grads, anima_loha_zero_leg_l1, save_anima_loha,
+    anima_full_delta_preflight,
+    AnimaDoRASet, empty_anima_dora_set, build_anima_dora_set_from_checkpoint,
+    anima_dora_carrier_set, anima_dora_carrier_total_bytes,
+    anima_dora_preflight, anima_dora_chain_all, anima_dora_adamw_step,
+    anima_dora_grad_norm, anima_dora_clip_grads, anima_dora_zero_leg_l1,
+    save_anima_dora,
+    AnimaOFTSet, empty_anima_oft_set, build_anima_oft_set_from_checkpoint,
+    anima_oft_carrier_set, anima_oft_carrier_total_bytes,
+    anima_oft_preflight, anima_oft_chain_all, anima_oft_adamw_step,
+    anima_oft_grad_norm, anima_oft_clip_grads, anima_oft_vec_l1,
+    save_anima_oft,
+)
 from serenitymojo.models.dit.anima_contract import (
     ANIMA_HIDDEN, ANIMA_NUM_HEADS, ANIMA_HEAD_DIM, ANIMA_DEPTH,
     ANIMA_LATENT_CHANNELS, ANIMA_PATCH_SIZE, ANIMA_MAX_SEQ_LEN, ANIMA_ADAPTER_DIM,
@@ -86,8 +107,15 @@ from serenitymojo.models.dit.anima_contract import (
 
 from serenitymojo.training.schedule import sample_timestep_sigmoid
 from serenitymojo.training.progress_display import print_trainer_progress
-from serenitymojo.training.train_config import TrainConfig, GRADIENT_CHECKPOINTING_ON
-from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
+from serenitymojo.training.train_config import (
+    TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOCON, TRAIN_ADAPTER_ALGO_LOHA,
+    TRAIN_ADAPTER_ALGO_DORA, TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
+)
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -102,7 +130,7 @@ from serenitymojo.training.sample_prompt_config import (
 from serenitymojo.training.anima_sample_streamed import (
     anima_sample_streamed, anima_decode_latent_to_png,
 )
-from std.os import makedirs
+from std.os import listdir, makedirs
 from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_ONLY,
     ot_cache_dir_from_train_config,
@@ -163,6 +191,7 @@ comptime FIXED_SIGMA = Float32(0.5)
 # ANIMA_NUM_STEPS for a sharper preview at the cost of sample wall-time.
 comptime ANIMA_NUM_STEPS = 16          # preview Euler steps (inference uses 30)
 comptime ANIMA_CFG_SCALE = Float32(4.5)  # CFG scale (anima_contract CFG_SCALE_X10/10)
+comptime ANIMA_OFT_BLOCK_SIZE = 4
 
 # ── Data paths ────────────────────────────────────────────────────────────────
 # Cached latents (prepare_anima schema): latent [1,16,H',W'] BF16, + text fields.
@@ -193,7 +222,26 @@ def _parse_nonnegative_int(s: String) raises -> Int:
 
 
 def validate_anima_train_config(cfg: TrainConfig) raises:
-    require_lora_or_locon_linear(cfg, String("Anima"))
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[Anima-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
+        print("[Anima-lokr] network_algorithm=lokr: using carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
+        print("[Anima-loha] network_algorithm=loha: using carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA:
+        print("[Anima-dora] network_algorithm=dora: using full-delta carrier dispatch with byte preflight")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
+        print("[Anima-oft] network_algorithm=oft: using OneTrainer-OFT full-delta carrier dispatch with byte preflight")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("Anima trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("Anima trainer: full finetune is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("Anima trainer: network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+        )
     if cfg.name != String("anima") and cfg.name != String("ANIMA"):
         raise Error(String("Anima trainer config requires model_type=anima/ANIMA, got ") + cfg.name)
     if cfg.checkpoint == String(""):
@@ -298,6 +346,17 @@ def _samples_dir_for_lora(lora_out: String) raises -> String:
     for i in range(slash):
         parent += chr(Int(bs[i]))
     return parent + String("/samples")
+
+
+def _list_safetensors(dir: String) raises -> List[String]:
+    var raw = listdir(dir)
+    var files = List[String]()
+    for i in range(len(raw)):
+        if raw[i].endswith(".safetensors"):
+            files.append(String(raw[i]))
+    if len(files) == 0:
+        raise Error(String("Anima cache has no .safetensors files: ") + dir)
+    return files^
 
 
 # ── deterministic host gaussian noise (Box-Muller on a PCG stream) ────────────
@@ -663,7 +722,8 @@ def main() raises:
     print("base projections + t_embedder loaded (F32 resident)")
 
     # ── load cached sample (latent + frozen context) ──
-    var cache_path = cache_dir + "/sample0.safetensors"
+    var cache_files = _list_safetensors(cache_dir)
+    var cache_path = cache_dir + String("/") + cache_files[0]
     print("cache:", cache_path)
     var cache = SafeTensors.open(cache_path)
     var lat_info = cache.tensor_info("latent")
@@ -726,10 +786,103 @@ def main() raises:
     # ── build the LoRA set (B=0 init -> PEFT identity at step 0) ──
     var lora = build_anima_lora_set(ANIMA_DEPTH, D, JOINT, F, cfg.lora_rank, cfg.lora_alpha)
     var n_adapters = ANIMA_DEPTH * ANIMA_SLOTS
+    var lokr_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var dora_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var carrier_active = lokr_active or loha_active or dora_active or oft_active
+    var lokr_masters = empty_anima_lokr_set()
+    var loha_masters = empty_anima_loha_set()
+    var dora_masters = empty_anima_dora_set()
+    var oft_masters = empty_anima_oft_set()
+    if lokr_active:
+        lokr_masters = build_anima_lokr_set(
+            ANIMA_DEPTH, D, JOINT, F,
+            cfg.lora_rank, cfg.lora_alpha,
+            cfg.lokr_factor, cfg.lokr_factor_attn, cfg.lokr_factor_ff,
+            cfg.lokr_decompose_both, cfg.lokr_full_matrix,
+            1 if cfg.lokr_targets == 1 else 2,
+            UInt64(620701),
+        )
+        var carrier_bytes = anima_lokr_carrier_total_bytes(lokr_masters, D, JOINT, F)
+        print("[Anima-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("Anima LoKr: carrier set needs ")
+                + String(carrier_bytes)
+                + String(" bytes (> budget). Use a smaller lokr_factor/rank or restrict lokr_targets.")
+            )
+        lora = anima_lokr_carrier_set(lokr_masters, D, JOINT, F)
+        print("[Anima-lokr] carrier set materialized:", len(lora.ad), "adapters")
+    elif loha_active:
+        loha_masters = build_anima_loha_set(
+            ANIMA_DEPTH, D, JOINT, F,
+            cfg.lora_rank, cfg.lora_alpha,
+            1 if cfg.lokr_targets == 1 else 2,
+            UInt64(620801),
+        )
+        var carrier_bytes = anima_loha_carrier_total_bytes(loha_masters, D, JOINT, F)
+        print("[Anima-loha] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("Anima LoHa: carrier set needs ")
+                + String(carrier_bytes)
+                + String(" bytes (> budget). Reduce lora_rank or restrict lokr_targets.")
+            )
+        lora = anima_loha_carrier_set(loha_masters, D, JOINT, F)
+        print("[Anima-loha] carrier set materialized:", len(lora.ad), "adapters")
+    elif dora_active:
+        var estimate = anima_full_delta_preflight(
+            ANIMA_DEPTH, D, JOINT, F,
+            1 if cfg.lokr_targets == 1 else 2,
+            LOKR_CARRIER_MAX_DEVICE_BYTES,
+        )
+        print("[Anima-dora] full-delta carrier preflight bytes:", estimate)
+        dora_masters = build_anima_dora_set_from_checkpoint(
+            st, ANIMA_DEPTH, D, JOINT, F,
+            cfg.lora_rank, cfg.lora_alpha,
+            1 if cfg.lokr_targets == 1 else 2,
+            UInt64(620901), False,
+        )
+        anima_dora_preflight(dora_masters, D, JOINT, F, LOKR_CARRIER_MAX_DEVICE_BYTES)
+        var carrier_bytes = anima_dora_carrier_total_bytes(dora_masters, D, JOINT, F)
+        print("[Anima-dora] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        lora = anima_dora_carrier_set(dora_masters, D, JOINT, F)
+        print("[Anima-dora] carrier set materialized:", len(lora.ad), "adapters")
+    elif oft_active:
+        var estimate = anima_full_delta_preflight(
+            ANIMA_DEPTH, D, JOINT, F,
+            1 if cfg.lokr_targets == 1 else 2,
+            LOKR_CARRIER_MAX_DEVICE_BYTES,
+        )
+        print("[Anima-oft] full-delta carrier preflight bytes:", estimate)
+        oft_masters = build_anima_oft_set_from_checkpoint(
+            st, ANIMA_DEPTH, D, JOINT, F,
+            ANIMA_OFT_BLOCK_SIZE,
+            1 if cfg.lokr_targets == 1 else 2,
+        )
+        anima_oft_preflight(oft_masters, D, JOINT, F, LOKR_CARRIER_MAX_DEVICE_BYTES)
+        var carrier_bytes = anima_oft_carrier_total_bytes(oft_masters, D, JOINT, F)
+        print("[Anima-oft] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        lora = anima_oft_carrier_set(oft_masters, D, JOINT, F)
+        print("[Anima-oft] carrier set materialized:", len(lora.ad), "adapters")
     var b_init = Float32(0.0)
     for i in range(n_adapters):
         b_init += _absum(lora.ad[i].b)
     print("LoRA adapters:", n_adapters, "(10 slots x", ANIMA_DEPTH, "blocks)  |B|_1 init =", b_init)
+    var carrier_zero_init = Float64(0.0)
+    if lokr_active:
+        carrier_zero_init = anima_lokr_zero_leg_l1(lokr_masters)
+        print("[Anima-lokr] zero-leg L1 at init =", carrier_zero_init)
+    elif loha_active:
+        carrier_zero_init = anima_loha_zero_leg_l1(loha_masters)
+        print("[Anima-loha] zero-leg L1 at init =", carrier_zero_init)
+    elif dora_active:
+        carrier_zero_init = anima_dora_zero_leg_l1(dora_masters)
+        print("[Anima-dora] zero-leg L1 at init =", carrier_zero_init)
+    elif oft_active:
+        carrier_zero_init = anima_oft_vec_l1(oft_masters)
+        print("[Anima-oft] vec L1 at init =", carrier_zero_init)
 
     var n_lat = B * (C * S_IMG * PS * PS)   # latent element count = B*C*H*W
 
@@ -804,10 +957,59 @@ def main() raises:
         _clip(grads, cfg.max_grad_norm)
         var completed_step = step + 1
         var step_lr = ot_lr_for_optimizer_step(cfg, completed_step)
-        anima_lora_adamw_step(
-            lora, grads, completed_step, step_lr, ctx,
-            cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
-        )
+        if lokr_active:
+            var mg = anima_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
+            var mnorm = anima_lokr_grad_norm(mg)
+            if mnorm > Float64(cfg.max_grad_norm):
+                anima_lokr_clip_grads(mg, cfg.max_grad_norm / Float32(mnorm))
+            anima_lokr_adamw_step(
+                lokr_masters, mg, completed_step, step_lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            lora = anima_lokr_carrier_set(lokr_masters, D, JOINT, F)
+            print("[Anima-lokr] step=", completed_step, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", anima_lokr_zero_leg_l1(lokr_masters))
+        elif loha_active:
+            var mg = anima_loha_chain_all(loha_masters, grads.d_a, grads.d_b)
+            var mnorm = anima_loha_grad_norm(mg)
+            if mnorm > Float64(cfg.max_grad_norm):
+                anima_loha_clip_grads(mg, cfg.max_grad_norm / Float32(mnorm))
+            anima_loha_adamw_step(
+                loha_masters, mg, completed_step, step_lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            lora = anima_loha_carrier_set(loha_masters, D, JOINT, F)
+            print("[Anima-loha] step=", completed_step, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", anima_loha_zero_leg_l1(loha_masters))
+        elif dora_active:
+            var mg = anima_dora_chain_all(dora_masters, grads.d_a, grads.d_b)
+            var mnorm = anima_dora_grad_norm(mg)
+            if mnorm > Float64(cfg.max_grad_norm):
+                anima_dora_clip_grads(mg, cfg.max_grad_norm / Float32(mnorm))
+            anima_dora_adamw_step(
+                dora_masters, mg, completed_step, step_lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            lora = anima_dora_carrier_set(dora_masters, D, JOINT, F)
+            print("[Anima-dora] step=", completed_step, " master_grad_norm=", Float32(mnorm),
+                  " zero_leg_l1=", anima_dora_zero_leg_l1(dora_masters))
+        elif oft_active:
+            var mg = anima_oft_chain_all(oft_masters, grads.d_a, grads.d_b)
+            var mnorm = anima_oft_grad_norm(mg)
+            if mnorm > Float64(cfg.max_grad_norm):
+                anima_oft_clip_grads(mg, cfg.max_grad_norm / Float32(mnorm))
+            anima_oft_adamw_step(
+                oft_masters, mg, completed_step, step_lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            lora = anima_oft_carrier_set(oft_masters, D, JOINT, F)
+            print("[Anima-oft] step=", completed_step, " master_grad_norm=", Float32(mnorm),
+                  " vec_l1=", anima_oft_vec_l1(oft_masters))
+        else:
+            anima_lora_adamw_step(
+                lora, grads, completed_step, step_lr, ctx,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
 
         # diagnostics
         var b_after = Float32(0.0)
@@ -840,18 +1042,36 @@ def main() raises:
         var saved_this_step = False
         if anima_should_save_checkpoint(cfg, completed_step):
             var ckpt_path = _step_lora_path(lora_out, completed_step)
-            _ = save_anima_lora(lora, ckpt_path, ctx)
-            var ckpt_state = anima_state_path_for_lora(ckpt_path)
-            _ = save_anima_lora_state(lora, ckpt_state, ctx)
+            if lokr_active:
+                _ = save_anima_lokr(lokr_masters, ckpt_path, ctx)
+            elif loha_active:
+                _ = save_anima_loha(loha_masters, ckpt_path, ctx)
+            elif dora_active:
+                _ = save_anima_dora(dora_masters, ckpt_path, ctx)
+            elif oft_active:
+                _ = save_anima_oft(oft_masters, ckpt_path, ctx)
+            else:
+                _ = save_anima_lora(lora, ckpt_path, ctx)
+                var ckpt_state = anima_state_path_for_lora(ckpt_path)
+                _ = save_anima_lora_state(lora, ckpt_state, ctx)
+                print("[checkpoint] saved step=", completed_step, " state=", ckpt_state)
             saved_this_step = True
-            print("[checkpoint] saved step=", completed_step, " state=", ckpt_state)
         if sample_enabled and should_sample_completed_step(sample_cadence, completed_step):
             if anima_should_save_before_sample(sample_cadence, completed_step, saved_this_step):
                 var pre_sample_path = _step_lora_path(lora_out, completed_step)
-                _ = save_anima_lora(lora, pre_sample_path, ctx)
-                var pre_sample_state = anima_state_path_for_lora(pre_sample_path)
-                _ = save_anima_lora_state(lora, pre_sample_state, ctx)
-                print("[checkpoint] saved before sample step=", completed_step, " state=", pre_sample_state)
+                if lokr_active:
+                    _ = save_anima_lokr(lokr_masters, pre_sample_path, ctx)
+                elif loha_active:
+                    _ = save_anima_loha(loha_masters, pre_sample_path, ctx)
+                elif dora_active:
+                    _ = save_anima_dora(dora_masters, pre_sample_path, ctx)
+                elif oft_active:
+                    _ = save_anima_oft(oft_masters, pre_sample_path, ctx)
+                else:
+                    _ = save_anima_lora(lora, pre_sample_path, ctx)
+                    var pre_sample_state = anima_state_path_for_lora(pre_sample_path)
+                    _ = save_anima_lora_state(lora, pre_sample_state, ctx)
+                    print("[checkpoint] saved before sample step=", completed_step, " state=", pre_sample_state)
             # ── sample-during-training: denoise from the CURRENT streamed base +
             #    live host LoRA, decode, write <samples_dir>/step_<N>.png. The
             #    forward reuses anima_stack_lora_forward_streamed (the SAME fn the
@@ -882,10 +1102,23 @@ def main() raises:
           "  delta =", last_loss - first_loss)
 
     # ── final LoRA save (kohya net.blocks.<i>.* keys, rs:1136-1155) ──
-    var npairs = save_anima_lora(lora, lora_out, ctx)
-    print("saved", npairs, "LoRA adapter pairs to", lora_out)
-    var nstate = save_anima_lora_state(lora, anima_state_path_for_lora(lora_out), ctx)
-    print("saved", nstate, "LoRA adapter state pairs to", anima_state_path_for_lora(lora_out))
+    if lokr_active:
+        var npairs = save_anima_lokr(lokr_masters, lora_out, ctx)
+        print("saved", npairs, "LoKr adapter modules to", lora_out)
+    elif loha_active:
+        var npairs = save_anima_loha(loha_masters, lora_out, ctx)
+        print("saved", npairs, "LoHa adapter modules to", lora_out)
+    elif dora_active:
+        var npairs = save_anima_dora(dora_masters, lora_out, ctx)
+        print("saved", npairs, "DoRA adapter modules to", lora_out)
+    elif oft_active:
+        var npairs = save_anima_oft(oft_masters, lora_out, ctx)
+        print("saved", npairs, "OFT adapter modules to", lora_out)
+    else:
+        var npairs = save_anima_lora(lora, lora_out, ctx)
+        print("saved", npairs, "LoRA adapter pairs to", lora_out)
+        var nstate = save_anima_lora_state(lora, anima_state_path_for_lora(lora_out), ctx)
+        print("saved", nstate, "LoRA adapter state pairs to", anima_state_path_for_lora(lora_out))
 
     var b_final = Float32(0.0)
     var b_nz = 0
@@ -895,11 +1128,32 @@ def main() raises:
         if s > 0.0:
             b_nz += 1
     var grew = (b_init == Float32(0.0)) and (b_final > Float32(0.0)) and (b_nz == n_adapters)
+    var carrier_zero_final = Float64(0.0)
+    if lokr_active:
+        carrier_zero_final = anima_lokr_zero_leg_l1(lokr_masters)
+        grew = carrier_zero_final > carrier_zero_init
+    elif loha_active:
+        carrier_zero_final = anima_loha_zero_leg_l1(loha_masters)
+        grew = carrier_zero_final > carrier_zero_init
+    elif dora_active:
+        carrier_zero_final = anima_dora_zero_leg_l1(dora_masters)
+        grew = carrier_zero_final > carrier_zero_init
+    elif oft_active:
+        carrier_zero_final = anima_oft_vec_l1(oft_masters)
+        grew = carrier_zero_final > carrier_zero_init
     var loss_down = last_loss < first_loss
     print("")
     if grew and loss_down:
-        print("VERDICT: PASS — loss decreased (", first_loss, "->", last_loss,
-              "), LoRA-B grew 0 -> nonzero (ratio", Float32(b_nz) / Float32(n_adapters), ")")
+        if carrier_active:
+            print("VERDICT: PASS — loss decreased (", first_loss, "->", last_loss,
+                  "), LyCORIS zero-leg grew ", carrier_zero_init, " -> ", carrier_zero_final)
+        else:
+            print("VERDICT: PASS — loss decreased (", first_loss, "->", last_loss,
+                  "), LoRA-B grew 0 -> nonzero (ratio", Float32(b_nz) / Float32(n_adapters), ")")
     else:
-        print("VERDICT: review — loss_down=", loss_down, " B_grew=", grew,
-              " (B init", b_init, " final", b_final, " nonzero", b_nz, "/", n_adapters, ")")
+        if carrier_active:
+            print("VERDICT: review — loss_down=", loss_down, " carrier_grew=", grew,
+                  " (zero-leg init", carrier_zero_init, " final", carrier_zero_final, ")")
+        else:
+            print("VERDICT: review — loss_down=", loss_down, " B_grew=", grew,
+                  " (B init", b_init, " final", b_final, " nonzero", b_nz, "/", n_adapters, ")")

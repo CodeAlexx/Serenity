@@ -69,6 +69,10 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_backward_offload_turbo_moddev_rope_scratch,
     klein_stack_lora_backward_graph,
     klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch,
+    klein_stack_direct_dora_forward_offload_turbo_moddev_rope_scratch,
+    klein_stack_direct_dora_backward_offload_turbo_moddev_rope_scratch,
+    klein_stack_direct_oft_forward_offload_turbo_moddev_rope_scratch,
+    klein_stack_direct_oft_backward_offload_turbo_moddev_rope_scratch,
     klein_lora_adamw_step, save_klein_lora, load_klein_lora_resume,
     save_klein_lora_state, load_klein_lora_state, save_klein_lora_ema,
     klein_lora_set_to_device_resident, klein_lora_adamw_step_resident,
@@ -79,7 +83,9 @@ from serenitymojo.models.klein.weights import (
     load_klein_stack_base_training,
     build_klein_double_modvecs, build_klein_single_modvecs,
     load_klein_step_mod_weights, build_klein_step_mods_device_cached,
+    KleinStepModWeights,
 )
+from serenitymojo.models.klein.klein_stack import KleinStackBase
 from serenitymojo.training.klein_dataset import KleinCache, KleinSample
 from serenitymojo.training.schedule import (
     sample_timestep_logit_normal, flow_match_noise_target,
@@ -127,10 +133,13 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 )
 from serenitymojo.training.serenityboard import SerenityBoardWriter
 from serenitymojo.sampling.klein_sampler import klein_sample
+from serenitymojo.sampling.klein_sample_resident import klein_sample_resident_to_png
 from serenitymojo.offload.plan import build_klein_block_plan, OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.train_config import (
-    TrainConfig, TRAIN_OPTIMIZER_ADAMW,
+    TrainConfig, TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
+    TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_ADAMW_8BIT,
+    TRAIN_OPTIMIZER_AUTOMAGIC3,
     TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
     TRAIN_ADAPTER_ALGO_LOHA, TRAIN_ADAPTER_ALGO_DORA,
     TRAIN_ADAPTER_ALGO_LOKR, TRAIN_ADAPTER_ALGO_OFT,
@@ -144,6 +153,13 @@ from serenitymojo.training.onetrainer_cache_preflight import (
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.ops.tensor_algebra import permute, reshape, reshape_owned
 from serenitymojo.io.ffi import sys_system, sys_open, sys_close, O_RDONLY
+from serenitymojo.training.perf_record import (
+    PERF_FAST_PATH_HOST_GRAD_COMPAT,
+    PERF_LANE_MOJO_CURRENT,
+    TrainingPerfRecord,
+    emit_training_perf_record,
+    empty_training_phase_timings,
+)
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -187,6 +203,34 @@ from serenitymojo.training.loha_stack import (
     klein_loha_adamw_step, klein_loha_trainable_l1, klein_loha_zero_leg_l1,
     save_klein_loha,
 )
+from serenitymojo.training.dora_stack import (
+    KleinDoRASet, KleinDoRAGrads, build_klein_dora_set_from_checkpoint,
+    empty_klein_dora_set, klein_dora_carrier_lists, klein_dora_carrier_total_bytes,
+    klein_dora_preflight, klein_dora_chain_all, klein_dora_grad_norm,
+    klein_dora_clip_grads, klein_dora_adamw_step, klein_dora_zero_leg_l1,
+    save_klein_dora,
+)
+from serenitymojo.training.oft_stack import (
+    KleinOFTSet, KleinOFTGrads, build_klein_oft_set_from_checkpoint,
+    empty_klein_oft_set, klein_oft_carrier_lists, klein_oft_carrier_total_bytes,
+    klein_oft_preflight, klein_oft_chain_all, klein_oft_grad_norm,
+    klein_oft_clip_grads, klein_oft_adamw_step, klein_oft_vec_l1,
+    save_klein_oft,
+)
+from serenitymojo.models.klein.klein_direct_lycoris_stack import (
+    KLEIN_DIRECT_24_GIB,
+    empty_klein_direct_dora_set, empty_klein_direct_oft_set,
+    klein_direct_dense_carrier_bytes,
+    klein_direct_dora_preflight, klein_direct_oft_preflight,
+    build_klein_direct_dora_set_from_checkpoint,
+    build_klein_direct_oft_set_from_checkpoint,
+    klein_direct_dora_grad_norm, klein_direct_dora_clip_grads,
+    klein_direct_dora_adamw_step, klein_direct_dora_zero_leg_l1,
+    klein_direct_dora_trainable_bytes, save_klein_direct_dora,
+    klein_direct_oft_grad_norm, klein_direct_oft_clip_grads,
+    klein_direct_oft_adamw_step, klein_direct_oft_vec_l1,
+    klein_direct_oft_trainable_bytes, save_klein_direct_oft,
+)
 
 
 # ── config file (binding rule 2026-05-31: arch + recipe come from the FILE) ──
@@ -229,6 +273,10 @@ comptime SAMPLE_LH = 64
 comptime SAMPLE_LW = 64
 comptime SAMPLE_N_IMG = 4096
 comptime SAMPLE_S = SAMPLE_N_IMG + N_TXT
+comptime SAMPLE_2K_LH = 128
+comptime SAMPLE_2K_LW = 128
+comptime SAMPLE_2K_N_IMG = 16384
+comptime SAMPLE_2K_S = SAMPLE_2K_N_IMG + N_TXT
 comptime SAMPLE_STEPS = 20
 comptime SAMPLE_CFG = Float32(4.0)
 comptime SAMPLE_SEED = UInt64(42)
@@ -247,6 +295,7 @@ comptime SCRATCH_BWD_SLAB_BYTES = 1024 * 1024 * 1024
 comptime SCRATCH_BWD_SLABS = 3
 comptime VERBOSE_STAGE_LOG = False
 comptime MACHINE_PROGRESS_LOG = False
+comptime KLEIN_OFT_BLOCK_SIZE = 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,6 +317,151 @@ def _latent_to_img_tokens_device(
     var sh = List[Int]()
     sh.append(N_IMG); sh.append(in_ch)
     return reshape_owned(nhwc^, sh^)
+
+
+def _klein_update_min_free(ctx: DeviceContext, min_free: Int) raises -> Int:
+    var mem = ctx.get_memory_info()
+    var free_now = Int(mem[0])
+    if min_free <= 0 or free_now < min_free:
+        return free_now
+    return min_free
+
+
+def _klein_optimizer_name(cfg: TrainConfig) -> String:
+    if cfg.optimizer == TRAIN_OPTIMIZER_ADAMW:
+        return String("AdamW")
+    if cfg.optimizer == TRAIN_OPTIMIZER_ADAFACTOR:
+        return String("Adafactor")
+    if cfg.optimizer == TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW:
+        return String("ScheduleFreeAdamW")
+    if cfg.optimizer == TRAIN_OPTIMIZER_ADAMW_8BIT:
+        return String("AdamW8bit")
+    if cfg.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3:
+        return String("Automagic3")
+    return String("optimizer_") + String(cfg.optimizer)
+
+
+def _klein_hash_update(h: UInt64, s: String) -> UInt64:
+    # Stable scorecard grouping key, not a cryptographic hash.
+    var out = h
+    var bytes = s.as_bytes()
+    for i in range(s.byte_length()):
+        out = ((out * UInt64(131)) + UInt64(bytes[i])) % UInt64(1000000007)
+    return out
+
+
+def _klein_perf_config_hash(cfg: TrainConfig, cfg_path: String, run_steps: Int) -> String:
+    var h = UInt64(2166136261) % UInt64(1000000007)
+    h = _klein_hash_update(h, cfg.name)
+    h = _klein_hash_update(h, cfg_path)
+    h = _klein_hash_update(h, cfg.checkpoint)
+    h = _klein_hash_update(h, klein_cache_dir_from_train_config(cfg))
+    h = _klein_hash_update(h, String(cfg.lora_rank))
+    h = _klein_hash_update(h, String(cfg.lora_alpha))
+    h = _klein_hash_update(h, String(cfg.lr))
+    h = _klein_hash_update(h, String(cfg.optimizer))
+    h = _klein_hash_update(h, String(cfg.adapter_algo))
+    h = _klein_hash_update(h, String(cfg.batch_size))
+    h = _klein_hash_update(h, String(run_steps))
+    return String("klein-h") + String(Int(h))
+
+
+def _klein_perf_flags(
+    cfg: TrainConfig,
+    sample_enabled: Bool,
+    activation_tape_offload: Bool,
+    direct_active: Bool,
+) -> String:
+    var flags = String("strict,host-loss,host-grad-compat")
+    if levers_loss_active(cfg):
+        flags += String(",host-loss-levers")
+    if levers_optimizer_active(cfg):
+        flags += String(",host-optimizer-levers")
+    else:
+        flags += String(",adamw")
+    comptime if KLEIN_V2_ENGINE:
+        flags += String(",v2-resident-lora")
+    else:
+        flags += String(",per-step-lora-upload")
+    comptime if KLEIN_V2_GRAPH_PATH:
+        flags += String(",graph-backward")
+    else:
+        flags += String(",hand-chain-backward")
+    if activation_tape_offload:
+        flags += String(",activation-tape-offload")
+    if direct_active:
+        flags += String(",direct-lycoris")
+    if sample_enabled:
+        flags += String(",inline-samples")
+    else:
+        flags += String(",sampling-disabled")
+    flags += String(",visible-counter-lower-bound")
+    flags += String(",adapter-") + adapter_algo_name(cfg.adapter_algo)
+    return flags^
+
+
+def _klein_emit_perf_record(
+    cfg: TrainConfig,
+    cfg_path: String,
+    run_steps: Int,
+    start_step: Int,
+    measured_loop_seconds: Float64,
+    total_vram_bytes: Int,
+    min_free_bytes: Int,
+    visible_sync_count: Int,
+    visible_host_device_transfer_count: Int,
+    full_tensor_readback_count: Int,
+    forward_seconds: Float64,
+    backward_seconds: Float64,
+    loss_seconds: Float64,
+    grad_norm_seconds: Float64,
+    clip_seconds: Float64,
+    optimizer_seconds: Float64,
+    save_seconds: Float64,
+    sample_seconds: Float64,
+    sample_enabled: Bool,
+    activation_tape_offload: Bool,
+    direct_active: Bool,
+) raises:
+    var measured_steps = run_steps - start_step
+    if measured_steps <= 0:
+        print("[training-perf-json] skipped: measured_steps <= 0")
+        return
+    var peak_vram = 0
+    if total_vram_bytes > 0 and min_free_bytes > 0 and total_vram_bytes > min_free_bytes:
+        peak_vram = total_vram_bytes - min_free_bytes
+    var phases = empty_training_phase_timings()
+    phases.forward_seconds = forward_seconds
+    phases.backward_seconds = backward_seconds
+    phases.loss_seconds = loss_seconds
+    phases.grad_norm_seconds = grad_norm_seconds
+    phases.clip_seconds = clip_seconds
+    phases.optimizer_seconds = optimizer_seconds
+    phases.save_seconds = save_seconds
+    phases.sample_seconds = sample_seconds
+    var rec = TrainingPerfRecord(
+        String("klein"),
+        PERF_LANE_MOJO_CURRENT,
+        _klein_perf_config_hash(cfg, cfg_path, run_steps),
+        String("BF16_BASE_BF16_LORA_F32_OPT"),
+        cfg.lora_rank,
+        cfg.batch_size,
+        String("512"),
+        _klein_optimizer_name(cfg),
+        _klein_perf_flags(cfg, sample_enabled, activation_tape_offload, direct_active),
+        0,
+        measured_steps,
+        measured_loop_seconds / Float64(measured_steps),
+        phases^,
+        peak_vram,
+        visible_host_device_transfer_count,
+        full_tensor_readback_count,
+        visible_sync_count,
+        PERF_FAST_PATH_HOST_GRAD_COMPAT,
+        String("klein-stack-direct"),
+        String(""),
+    )
+    emit_training_perf_record(rec)
 
 
 def _host_f32_for_step_math(t: Tensor, ctx: DeviceContext) raises -> List[Float32]:
@@ -371,22 +565,24 @@ def _klein_loss_grad(
 # Build the Klein rope tables as flat host Lists [S*H*(Dh//2)] — the layout the
 # LoRA stack consumes. Replicates build_klein_rope_tables (klein_dit.mojo:522)
 # host loop EXACTLY (4-axis position rope, theta=2000, 16 freqs/axis).
-def _build_klein_rope_host() raises -> Tuple[List[Float32], List[Float32]]:
+def _build_klein_rope_host_for[
+    N_IMG_R: Int, N_TXT_R: Int, S_R: Int, H_R: Int
+]() raises -> Tuple[List[Float32], List[Float32]]:
     var img_w = 1
-    while img_w * img_w < N_IMG:
+    while img_w * img_w < N_IMG_R:
         img_w += 1
-    if img_w * img_w != N_IMG:
+    if img_w * img_w != N_IMG_R:
         raise Error("N_IMG must be a square grid")
     var cos_vals = List[Float32]()
     var sin_vals = List[Float32]()
     var log_theta = flog(Float32(2000.0))
-    for tok in range(S):
+    for tok in range(S_R):
         var p0 = 0
         var p1 = 0
         var p2 = 0
         var p3 = 0
-        if tok >= N_TXT:
-            var idx = tok - N_TXT
+        if tok >= N_TXT_R:
+            var idx = tok - N_TXT_R
             p1 = idx // img_w
             p2 = idx % img_w
         else:
@@ -396,7 +592,7 @@ def _build_klein_rope_host() raises -> Tuple[List[Float32], List[Float32]]:
             # (collapsed text positions) — the bug the Rust port already fixed
             # (EDv2 klein.rs KLEIN_VERIFY §H2; txt_ids_data[k*4+3]=k).
             p3 = tok
-        for _h in range(H):
+        for _h in range(H_R):
             for axis in range(4):
                 var pos = p0
                 if axis == 1:
@@ -411,6 +607,10 @@ def _build_klein_rope_host() raises -> Tuple[List[Float32], List[Float32]]:
                     cos_vals.append(fcos(angle))
                     sin_vals.append(fsin(angle))
     return (cos_vals^, sin_vals^)
+
+
+def _build_klein_rope_host() raises -> Tuple[List[Float32], List[Float32]]:
+    return _build_klein_rope_host_for[N_IMG, N_TXT, S, H]()
 
 
 # Deterministic host gaussian noise of length n (Box-Muller on a PCG stream),
@@ -712,6 +912,112 @@ def _do_sample_all(
         board.log_text(String("prompts/") + p.label, step, p.prompt)
 
 
+def _klein_inline_sampling_needs_large_grid(sample_cfg: SamplePromptConfig) -> Bool:
+    for i in range(len(sample_cfg.prompts)):
+        var p = sample_cfg.prompts[i].copy()
+        if p.width > 512 or p.height > 512:
+            return True
+    return False
+
+
+def _do_sample_prompt_resident(
+    cfg: TrainConfig,
+    p: SamplePrompt,
+    step: Int,
+    mut base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    lora_dev: KleinLoraDeviceSet,
+    mod_weights: KleinStepModWeights,
+    cos_dev: Tensor,
+    sin_dev: Tensor,
+    mut scratch_fwd: ScratchRingAllocator,
+    ctx: DeviceContext,
+) raises -> String:
+    if p.frames != 1:
+        raise Error(String("Klein inline sampler expects frames=1 for ") + p.label)
+    if not (
+        (p.width == 512 and p.height == 512)
+        or (p.width == 1024 and p.height == 1024)
+        or (p.width == 2048 and p.height == 2048)
+    ):
+        raise Error(
+            String("Klein resident inline sampler supports 512x512, 1024x1024, and 2048x2048; got ")
+            + String(p.width)
+            + String("x") + String(p.height) + String(" for ") + p.label
+        )
+    var png = _sample_png_path(step, p.label)
+    var caps = load_caps(p.caps_pos, p.caps_neg, ctx)
+    var txt_sh = List[Int]()
+    txt_sh.append(N_TXT)
+    txt_sh.append(cfg.joint_attention_dim)
+    var pos_txt = reshape(caps.pos, txt_sh.copy(), ctx)
+    var neg_txt = reshape(caps.neg, txt_sh^, ctx)
+    if p.width == 2048 and p.height == 2048:
+        var sample_rope = _build_klein_rope_host_for[SAMPLE_2K_N_IMG, N_TXT, SAMPLE_2K_S, H]()
+        var sample_cos_dev = Tensor.from_host(
+            sample_rope[0].copy(), [SAMPLE_2K_S * H, Dh // 2], STDtype.F32, ctx
+        )
+        var sample_sin_dev = Tensor.from_host(
+            sample_rope[1].copy(), [SAMPLE_2K_S * H, Dh // 2], STDtype.F32, ctx
+        )
+        klein_sample_resident_to_png[H, Dh, SAMPLE_2K_N_IMG, N_TXT, SAMPLE_2K_S, SAMPLE_2K_LH, SAMPLE_2K_LW](
+            base, loader, lora_dev, mod_weights, sample_cos_dev, sample_sin_dev, scratch_fwd,
+            pos_txt, neg_txt, p.cfg, p.steps, p.seed, cfg.vae, png,
+            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+            cfg.joint_attention_dim, cfg.out_channels, cfg.eps,
+            cfg.timestep_dim, ctx,
+        )
+    elif p.width == 1024 and p.height == 1024:
+        var sample_rope = _build_klein_rope_host_for[SAMPLE_N_IMG, N_TXT, SAMPLE_S, H]()
+        var sample_cos_dev = Tensor.from_host(
+            sample_rope[0].copy(), [SAMPLE_S * H, Dh // 2], STDtype.F32, ctx
+        )
+        var sample_sin_dev = Tensor.from_host(
+            sample_rope[1].copy(), [SAMPLE_S * H, Dh // 2], STDtype.F32, ctx
+        )
+        klein_sample_resident_to_png[H, Dh, SAMPLE_N_IMG, N_TXT, SAMPLE_S, SAMPLE_LH, SAMPLE_LW](
+            base, loader, lora_dev, mod_weights, sample_cos_dev, sample_sin_dev, scratch_fwd,
+            pos_txt, neg_txt, p.cfg, p.steps, p.seed, cfg.vae, png,
+            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+            cfg.joint_attention_dim, cfg.out_channels, cfg.eps,
+            cfg.timestep_dim, ctx,
+        )
+    else:
+        klein_sample_resident_to_png[H, Dh, N_IMG, N_TXT, S, LH, LW](
+            base, loader, lora_dev, mod_weights, cos_dev, sin_dev, scratch_fwd,
+            pos_txt, neg_txt, p.cfg, p.steps, p.seed, cfg.vae, png,
+            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+            cfg.joint_attention_dim, cfg.out_channels, cfg.eps,
+            cfg.timestep_dim, ctx,
+        )
+    print("[Klein-lora] resident inline sample step=", step, " label=", p.label, " path=", png)
+    return png^
+
+
+def _do_sample_all_resident(
+    cfg: TrainConfig,
+    sample_cfg: SamplePromptConfig,
+    step: Int,
+    mut base: KleinStackBase,
+    mut loader: TurboPlannedLoader,
+    lora_dev: KleinLoraDeviceSet,
+    mod_weights: KleinStepModWeights,
+    cos_dev: Tensor,
+    sin_dev: Tensor,
+    mut scratch_fwd: ScratchRingAllocator,
+    board: SerenityBoardWriter,
+    ctx: DeviceContext,
+) raises:
+    for i in range(len(sample_cfg.prompts)):
+        var p = sample_cfg.prompts[i].copy()
+        var png = _do_sample_prompt_resident(
+            cfg, p, step, base, loader, lora_dev, mod_weights, cos_dev, sin_dev,
+            scratch_fwd, ctx,
+        )
+        board.log_image_png(String("samples/") + p.label, step, i, png)
+        board.log_text(String("prompts/") + p.label, step, p.prompt)
+
+
 def main() raises:
     # ── read the model config FILE (arch + recipe + paths). argv[1] overrides. ─
     var a = argv()
@@ -724,8 +1030,11 @@ def main() raises:
     # carrier path. Default (0) leaves every branch below byte-unchanged.
     var lokr_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
     var loha_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
-    # Both LoKr and LoHa drive the SHARED carrier path (host AdamW on masters +
-    # per-step carrier re-upload + hand-chain backward); only build/chain/save differ.
+    var dora_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var direct_active = dora_active or oft_active
+    # LoKr/LoHa still drive the shared carrier path. DoRA/OFT use compact direct
+    # W_eff lowering to avoid the dense full-delta carrier above 24 GB.
     var carrier_active = lokr_active or loha_active
     var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
@@ -780,9 +1089,20 @@ def main() raises:
     )
     var sample_every = sample_cadence.sample_every_steps(sample_cfg.every_steps)
     if runtime_sample_enabled:
+        if carrier_active or direct_active:
+            raise Error(
+                String("Klein resident inline sampler currently supports LoRA/LoCon ")
+                + String("adapters only; set sample_every=0 for LoKr/LoHa/DoRA/OFT runs")
+            )
         _validate_precached_caps(sample_cfg, cfg.joint_attention_dim)
 
     var ctx = DeviceContext()
+    var perf_mem0 = ctx.get_memory_info()
+    var perf_min_free = Int(perf_mem0[0])
+    var perf_total_vram = Int(perf_mem0[1])
+    var perf_visible_sync_count = 0
+    var perf_visible_transfer_count = 0
+    var perf_full_tensor_readback_count = 0
     _ = sys_system(String("mkdir -p ") + SAMPLE_DIR)
     var board = SerenityBoardWriter.open(String(SAMPLE_DIR), String("klein_lora_mojo"), start_step)
     board.log_hparams(
@@ -817,6 +1137,7 @@ def main() raises:
     if (
         runtime_sample_enabled and start_step == 0
         and should_sample_completed_step(sample_cadence, 0)
+        and sample_cfg.sample_at_start
         and run_steps >= sample_every
     ):
         print("[cadence] step 0 baseline samples (no LoRA)")
@@ -846,15 +1167,22 @@ def main() raises:
     # a VRAM budget; the rest keep streaming through the 2 turbo slots. MEASURED
     # basis: 12.4 GiB peak of 24.5 GiB during a streamed step → ~9 GiB headroom.
     # Byte-identical weights (same pinned block store bytes) → loss unchanged.
-    # T2.G: LoKr runs pin NOTHING — the carrier adapter set takes the VRAM
-    # headroom the pinned blocks would use (full_matrix carriers especially).
-    var resident_budget_bytes = 0 if carrier_active else RESIDENT_BUDGET_BYTES
+    # T2.G: LoKr/large inline samples run pin NOTHING. LoKr carriers and
+    # 1024px validation both need the VRAM headroom the pinned blocks would use.
+    var large_inline_sample = (
+        runtime_sample_enabled and _klein_inline_sampling_needs_large_grid(sample_cfg)
+    )
+    var resident_budget_bytes = (
+        0 if (carrier_active or large_inline_sample) else RESIDENT_BUDGET_BYTES
+    )
     var pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
     print(
         "  resident blocks pinned:", pinned_blocks, "of",
         cfg.num_double + cfg.num_single,
         " budget_bytes=", resident_budget_bytes,
     )
+    if large_inline_sample:
+        print("  large inline sample: block pinning disabled for sampler headroom")
     var use_activation_tape_offload = cfg.activation_offload_enabled()
     if cfg.gradient_checkpointing_offload():
         print(
@@ -902,25 +1230,22 @@ def main() raises:
             " rank=", cfg.lora_rank, " alpha=", cfg.lora_alpha,
         )
     elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA:
-        # adapter_algo==3 selects DoRA (weight-decomposed LoRA). The DoRA
-        # PRIMITIVE (effective-weight fwd, 3-grad bwd over lora_down/lora_up/
-        # magnitude, AdamW) + lora_down/lora_up/.dora_scale/.alpha save convention
-        # ship in training/dora_adapter.mojo + training/dora_save.mojo and are
-        # gated by dora_adapter_smoke.mojo (effective-weight + FD-detached-norm
-        # parity + 3-grad grad-flow + save round-trip, incl. a deliberate
-        # dead-grad abort). The Klein stack forward/backward (klein_stack_lora_*)
-        # is hardwired to the additive 2-factor KleinLoraSet A/B delta; DoRA
-        # REPLACES the effective weight (m × normalized WP) rather than adding a
-        # delta, so routing every adapted linear through WP_dora is a larger
-        # follow-up. We fail loud rather than silently train the wrong thing.
-        raise Error(
-            "adapter_algo=3 (DoRA) selected: the DoRA adapter primitive "
-            + "(effective-weight fwd, 3-grad bwd, AdamW) + lora_down/lora_up/"
-            + ".dora_scale/.alpha save ship in training/dora_adapter.mojo + "
-            + "training/dora_save.mojo and are gated by dora_adapter_smoke.mojo, "
-            + "but the Klein stack is additive-LoRA-only — wiring the "
-            + "magnitude/direction WP_dora through the stack is a tracked "
-            + "follow-up. Use adapter_algo=0 (plain LoRA) for now."
+        # adapter_algo==3: DoRA e2e TRAINING through compact direct W_eff
+        # lowering. W_orig is sourced from the frozen checkpoint per slot and
+        # the DoRA masters own AdamW/save without materializing dense carriers.
+        if cfg.grad_accum_steps > 1:
+            raise Error("adapter_algo=3 (DoRA): grad_accum_steps>1 not wired this wave")
+        if cfg.ema_enabled:
+            raise Error("adapter_algo=3 (DoRA): EMA shadows not wired this wave")
+        if levers_optimizer_active(cfg):
+            raise Error("adapter_algo=3 (DoRA): levers optimizers not wired (host AdamW only)")
+        if resume_lora != String(""):
+            raise Error("adapter_algo=3 (DoRA): resume/init_lora warm-start not wired this wave")
+        runtime_sample_enabled = False
+        print(
+            "[Klein-dora] DoRA training via direct W_eff: targets=",
+            cfg.lokr_targets, " rank=", cfg.lora_rank,
+            " alpha=", cfg.lora_alpha, " wd_on_out=False",
         )
     elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
         # adapter_algo==4: LyCORIS LoKr e2e TRAINING (T2.G 2026-06-11,
@@ -960,47 +1285,26 @@ def main() raises:
             " rank=", cfg.lora_rank, " alpha=", cfg.lora_alpha,
         )
     elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
-        # adapter_algo==5 selects Diag-OFT (Orthogonal Fine-Tuning). The OFT
-        # PRIMITIVE (exact-Cayley R=(I+Q)⁻¹(I-Q) per output block, W_eff=R@W
-        # forward, analytic d_S backward through the Cayley + skew chain, AdamW)
-        # + oft_blocks/.alpha save convention ship in training/oft_adapter.mojo
-        # + training/oft_save.mojo and are gated by oft_adapter_smoke.mojo
-        # (RᵀR≈I orthogonality + identity-at-init + FD parity + grad-flow +
-        # save round-trip, incl. a deliberate dead-grad abort). OFT is
-        # MULTIPLICATIVE (W_eff = R·W), not an additive low-rank delta — the
-        # Klein stack forward/backward is additive 2-factor A/B only, so routing
-        # every adapted linear through the block-diagonal rotation is a tracked
-        # follow-up. We fail loud rather than silently train the wrong thing.
-        raise Error(
-            "adapter_algo=5 (Diag-OFT) selected: the OFT adapter primitive "
-            + "(exact-Cayley R, W_eff=R·W fwd, analytic d_S bwd, AdamW) + "
-            + "oft_blocks/.alpha save ship in training/oft_adapter.mojo + "
-            + "training/oft_save.mojo and are gated by oft_adapter_smoke.mojo, "
-            + "but the Klein stack is additive-LoRA-only — wiring the "
-            + "multiplicative block-diagonal rotation through the stack is a "
-            + "tracked follow-up. Use adapter_algo=0 (plain LoRA) for now."
+        # adapter_algo==5: OneTrainer-OFT e2e TRAINING through compact direct
+        # input rotation. This is the OneTrainer triu-vector + 5-term Neumann
+        # variant, saved as <prefix>.oft_R.weight.
+        if cfg.grad_accum_steps > 1:
+            raise Error("adapter_algo=5 (OFT): grad_accum_steps>1 not wired this wave")
+        if cfg.ema_enabled:
+            raise Error("adapter_algo=5 (OFT): EMA shadows not wired this wave")
+        if levers_optimizer_active(cfg):
+            raise Error("adapter_algo=5 (OFT): levers optimizers not wired (host AdamW only)")
+        if resume_lora != String(""):
+            raise Error("adapter_algo=5 (OFT): resume/init_lora warm-start not wired this wave")
+        runtime_sample_enabled = False
+        print(
+            "[Klein-oft] OneTrainer-OFT training via direct W_eff: targets=",
+            cfg.lokr_targets, " block_size=", KLEIN_OFT_BLOCK_SIZE,
         )
     elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
-        # adapter_algo==6 selects BOFT (Butterfly OFT). The BOFT PRIMITIVE
-        # (m-stage butterfly product of block-diagonal exact-Cayley rotations
-        # with butterfly permutation between stages, analytic per-stage d_S
-        # backward via reverse-order accumulation, AdamW) + oft_blocks(4D)/.alpha
-        # save convention ship in training/boft_adapter.mojo +
-        # training/boft_save.mojo and are gated by boft_adapter_smoke.mojo
-        # (overall-transform orthogonality + identity-at-init + FD parity for
-        # ALL factor params + grad-flow + save round-trip, incl. a deliberate
-        # dead-grad abort). Like OFT, BOFT is MULTIPLICATIVE — the Klein stack is
-        # additive-LoRA-only, so wiring the butterfly rotation chain through the
-        # stack is a tracked follow-up. We fail loud rather than silently train
-        # the wrong thing.
         raise Error(
-            "adapter_algo=6 (BOFT) selected: the BOFT adapter primitive "
-            + "(m-stage butterfly Cayley rotation chain, analytic per-stage bwd, "
-            + "AdamW) + oft_blocks(4D)/.alpha save ship in "
-            + "training/boft_adapter.mojo + training/boft_save.mojo and are "
-            + "gated by boft_adapter_smoke.mojo, but the Klein stack is "
-            + "additive-LoRA-only — wiring the butterfly rotation chain through "
-            + "the stack is a tracked follow-up. Use adapter_algo=0 (plain LoRA) for now."
+            "adapter_algo=6 (BOFT) selected: BOFT is intentionally excluded for "
+            + "this product path; use lora, locon, loha, dora, lokr, or oft."
         )
     elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
         print("[Klein-locon] network_algorithm=locon: Klein has linear targets only; using the LoRA-compatible down/up path")
@@ -1010,7 +1314,7 @@ def main() raises:
             + String(cfg.adapter_algo)
             + String(" (")
             + adapter_algo_name(cfg.adapter_algo)
-            + String("; supported here: lora, locon, lokr)")
+            + String("; supported here: lora, locon, loha, dora, lokr, oft)")
         )
 
     # ── build LoRA set (OneTrainer split slots: 12 double + 2 single) ─────────
@@ -1045,6 +1349,10 @@ def main() raises:
     # state and the saved checkpoint.
     var lokr_masters = empty_klein_lokr_set()
     var loha_masters = empty_klein_loha_set()
+    var dora_masters = empty_klein_dora_set()
+    var oft_masters = empty_klein_oft_set()
+    var direct_dora_masters = empty_klein_direct_dora_set()
+    var direct_oft_masters = empty_klein_direct_oft_set()
     if lokr_active:
         lokr_masters = build_klein_lokr_set(
             cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
@@ -1098,6 +1406,55 @@ def main() raises:
             cfg.num_double, cfg.num_single, cfg.lora_rank,
         )
         print("[Klein-loha] carrier set materialized:", len(lora.dbl), "double-slot +", len(lora.sgl), "single-slot")
+    if dora_active:
+        var dense_bytes = klein_direct_dense_carrier_bytes(
+            cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            cfg.lokr_targets,
+        )
+        var direct_bytes = klein_direct_dora_preflight(
+            cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            cfg.lora_rank, cfg.lokr_targets, KLEIN_DIRECT_24_GIB, False,
+        )
+        print(
+            "[Klein-dora] dense carrier bytes:", dense_bytes,
+            " direct trainable bytes:", direct_bytes,
+            " budget:", KLEIN_DIRECT_24_GIB,
+        )
+        direct_dora_masters = build_klein_direct_dora_set_from_checkpoint(
+            st, cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            cfg.lora_rank, cfg.lora_alpha, cfg.lokr_targets,
+            SEED_BASE * UInt64(53) + UInt64(11),
+            False,
+        )
+        print(
+            "[Klein-dora] direct trainable bytes:",
+            klein_direct_dora_trainable_bytes(direct_dora_masters),
+            " slots:", len(direct_dora_masters.ad),
+        )
+    if oft_active:
+        var dense_bytes = klein_direct_dense_carrier_bytes(
+            cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            cfg.lokr_targets,
+        )
+        var direct_bytes = klein_direct_oft_preflight(
+            cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            KLEIN_OFT_BLOCK_SIZE, cfg.lokr_targets, KLEIN_DIRECT_24_GIB,
+        )
+        print(
+            "[Klein-oft] dense carrier bytes:", dense_bytes,
+            " direct trainable bytes:", direct_bytes,
+            " block_size=", KLEIN_OFT_BLOCK_SIZE,
+            " budget:", KLEIN_DIRECT_24_GIB,
+        )
+        direct_oft_masters = build_klein_direct_oft_set_from_checkpoint(
+            st, cfg.num_double, cfg.num_single, cfg.d_model, cfg.mlp_hidden,
+            KLEIN_OFT_BLOCK_SIZE, cfg.lokr_targets,
+        )
+        print(
+            "[Klein-oft] direct trainable bytes:",
+            klein_direct_oft_trainable_bytes(direct_oft_masters),
+            " slots:", len(direct_oft_masters.ad),
+        )
 
     # v2 engine: persistent device OT-AdamW state (dbl + sgl lists) + a
     # resident device LoRA set viewing the live param buffers. Built ONCE
@@ -1108,7 +1465,7 @@ def main() raises:
     var dbl_state: LoraAdamWOTDeviceState
     var sgl_state: LoraAdamWOTDeviceState
     var resident_lora_dev: KleinLoraDeviceSet
-    if carrier_active:
+    if carrier_active or direct_active:
         var dummy = build_klein_lora_set(1, 1, 8, 8, 1, Float32(1.0))
         dbl_state = lora_adamw_ot_device_state_init(dummy.dbl, ctx)
         sgl_state = lora_adamw_ot_device_state_init(dummy.sgl, ctx)
@@ -1163,17 +1520,24 @@ def main() raises:
     print("  cache samples:", cache.count())
     var compatible = _compatible_cache_indices(cache, cfg, ctx)
     print("  cache compatible samples:", len(compatible), "of", cache.count(), "for", LH, "x", LW)
-    print("  preloading compatible cache tensors:", len(compatible))
+    var preload_cache_tensors = not large_inline_sample
+    print(
+        "  preloading compatible cache tensors:",
+        len(compatible) if preload_cache_tensors else 0,
+    )
     var cached_img_tokens = List[TArc]()
     var cached_txt_tokens = List[TArc]()
     var preload_txt_sh = List[Int]()
     preload_txt_sh.append(N_TXT); preload_txt_sh.append(cfg.joint_attention_dim)
-    for ci in range(len(compatible)):
-        var sample = cache.load(compatible[ci], ctx)
-        var img_tok = _latent_to_img_tokens_device(sample.latent, cfg.in_channels, ctx)
-        var txt_tok = reshape(sample.text_embedding, preload_txt_sh.copy(), ctx)
-        cached_img_tokens.append(TArc(img_tok^))
-        cached_txt_tokens.append(TArc(txt_tok^))
+    if preload_cache_tensors:
+        for ci in range(len(compatible)):
+            var sample = cache.load(compatible[ci], ctx)
+            var img_tok = _latent_to_img_tokens_device(sample.latent, cfg.in_channels, ctx)
+            var txt_tok = reshape(sample.text_embedding, preload_txt_sh.copy(), ctx)
+            cached_img_tokens.append(TArc(img_tok^))
+            cached_txt_tokens.append(TArc(txt_tok^))
+    else:
+        print("  large inline sample: cache tensors load on demand")
     print("  preloaded cache tensors:", len(cached_img_tokens), "samples")
 
     # ── caption-dropout uncond embedding (Wave 2B item 2d; default-off) ───────
@@ -1198,10 +1562,11 @@ def main() raises:
         print("  caption_dropout: prob=", cfg.caption_dropout_prob, " (uncond = zero embedding)")
 
     var scratch_fwd = ScratchRingAllocator(ctx, SCRATCH_FWD_SLAB_BYTES, SCRATCH_FWD_SLABS)
-    var scratch_bwd = ScratchRingAllocator(ctx, SCRATCH_BWD_SLAB_BYTES, SCRATCH_BWD_SLABS)
+    var scratch_bwd_slabs = 1 if large_inline_sample else SCRATCH_BWD_SLABS
+    var scratch_bwd = ScratchRingAllocator(ctx, SCRATCH_BWD_SLAB_BYTES, scratch_bwd_slabs)
     print(
         "  scratch fwd:", SCRATCH_FWD_SLAB_BYTES, "bytes x", SCRATCH_FWD_SLABS,
-        "slabs; bwd:", SCRATCH_BWD_SLAB_BYTES, "bytes x", SCRATCH_BWD_SLABS, "slabs",
+        "slabs; bwd:", SCRATCH_BWD_SLAB_BYTES, "bytes x", scratch_bwd_slabs, "slabs",
     )
 
     # ── gradient accumulation buffers (Wave 2B item 2h; default-off == 1) ─────
@@ -1223,6 +1588,15 @@ def main() raises:
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
+    var perf_forward_seconds = 0.0
+    var perf_backward_seconds = 0.0
+    var perf_loss_seconds = 0.0
+    var perf_grad_norm_seconds = 0.0
+    var perf_clip_seconds = 0.0
+    var perf_optimizer_seconds = 0.0
+    var perf_save_seconds = 0.0
+    var perf_sample_seconds = 0.0
+
     # ── training loop ─────────────────────────────────────────────────────────
     var train_start = perf_counter_ns()
     for k in range(start_step + 1, run_steps + 1):
@@ -1234,9 +1608,18 @@ def main() raises:
 
         # pick a sample (round-robin)
         var t_load0 = perf_counter_ns()
-        var cache_slot = (k - 1) % len(cached_img_tokens)
-        var latent_tokens_t = cached_img_tokens[cache_slot].copy()
-        var txt_tokens_t = cached_txt_tokens[cache_slot].copy()
+        var cache_slot = (k - 1) % len(compatible)
+        var latent_tokens_t: TArc
+        var txt_tokens_t: TArc
+        if preload_cache_tensors:
+            latent_tokens_t = cached_img_tokens[cache_slot].copy()
+            txt_tokens_t = cached_txt_tokens[cache_slot].copy()
+        else:
+            var sample = cache.load(compatible[cache_slot], ctx)
+            var img_tok = _latent_to_img_tokens_device(sample.latent, cfg.in_channels, ctx)
+            var txt_tok = reshape(sample.text_embedding, preload_txt_sh.copy(), ctx)
+            latent_tokens_t = TArc(img_tok^)
+            txt_tokens_t = TArc(txt_tok^)
         # ── caption dropout (Wave 2B item 2d; default-off when prob<=0) ────────
         # Per-step Bernoulli on the same uniform draw as the Rust StdRng path.
         # When it fires, swap the conditional text tokens for the cached uncond
@@ -1312,6 +1695,8 @@ def main() raises:
         var fm = flow_match_noise_target(latent_tokens_t[], sigma, noise_t, ctx)
         var x_t_dev = TArc(fm.x_t.clone(ctx))
         var target = _host_f32_for_step_math(fm.target, ctx)
+        perf_visible_transfer_count += 2
+        perf_full_tensor_readback_count += 1
         var t_noise1 = perf_counter_ns()
         var noise_secs = Float64(t_noise1 - t_noise0) / 1.0e9
         var noise_speed = Float64(n_img_vals) / noise_secs if noise_secs > 0.0 else Float64(0.0)
@@ -1355,6 +1740,202 @@ def main() raises:
         if runtime_profile:
             print("PROG_STAGE step=", k, " total=", run_steps, " phase=forward_begin")
         var t_fwd0 = perf_counter_ns()
+        if direct_active:
+            if use_activation_tape_offload:
+                raise Error("Klein direct DoRA/OFT: activation_tape_offload is not wired for the direct path")
+            if dora_active:
+                var fwd_direct = klein_stack_direct_dora_forward_offload_turbo_moddev_rope_scratch[
+                    H, Dh, N_IMG, N_TXT, S
+                ](
+                    x_t_dev, txt_tokens_t, base, loader, direct_dora_masters,
+                    cfg.num_double, cfg.num_single, cfg.lokr_targets,
+                    img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_fwd,
+                )
+                var t_fwd1 = perf_counter_ns()
+                perf_forward_seconds += Float64(t_fwd1 - t_fwd0) / 1.0e9
+                if runtime_profile:
+                    print(
+                        "PROG_STAGE step=", k, " total=", run_steps, " phase=forward",
+                        " secs=", Float32(Float64(t_fwd1 - t_fwd0) / 1.0e9),
+                    )
+                var lg_direct = _klein_loss_grad(fwd_direct.out, target, sigma, cfg)
+                if runtime_profile:
+                    print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", lg_direct.loss)
+                var t_bwd0_direct = perf_counter_ns()
+                perf_loss_seconds += Float64(t_bwd0_direct - t_fwd1) / 1.0e9
+                var dg = klein_stack_direct_dora_backward_offload_turbo_moddev_rope_scratch[
+                    H, Dh, N_IMG, N_TXT, S
+                ](
+                    lg_direct.d_loss.copy(), x_t_dev, txt_tokens_t, base, loader,
+                    direct_dora_masters, cfg.num_double, cfg.num_single, cfg.lokr_targets,
+                    img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_direct,
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                )
+                var t_bwd1_direct = perf_counter_ns()
+                perf_backward_seconds += Float64(t_bwd1_direct - t_bwd0_direct) / 1.0e9
+                if runtime_profile:
+                    print(
+                        "PROG_STAGE step=", k, " total=", run_steps, " phase=backward",
+                        " secs=", Float32(Float64(t_bwd1_direct - t_bwd0_direct) / 1.0e9),
+                    )
+                var t_norm0_direct = perf_counter_ns()
+                var dnorm = klein_direct_dora_grad_norm(dg.grads)
+                var t_norm1_direct = perf_counter_ns()
+                perf_grad_norm_seconds += Float64(t_norm1_direct - t_norm0_direct) / 1.0e9
+                var t_clip0_direct = perf_counter_ns()
+                var clip_scale_direct = Float32(1.0)
+                if dnorm > Float64(cfg.max_grad_norm):
+                    clip_scale_direct = cfg.max_grad_norm / Float32(dnorm)
+                    klein_direct_dora_clip_grads(dg.grads, clip_scale_direct)
+                var t_clip1_direct = perf_counter_ns()
+                perf_clip_seconds += Float64(t_clip1_direct - t_clip0_direct) / 1.0e9
+                var optimizer_step = ((k - 1) // accum_steps) + 1
+                var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
+                if runtime_profile:
+                    print("PROG_STAGE step=", k, " total=", run_steps, " phase=optim_begin")
+                var t_optim0_direct = perf_counter_ns()
+                klein_direct_dora_adamw_step(
+                    direct_dora_masters, dg.grads, optimizer_step, step_lr,
+                    cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                )
+                var t_optim1_direct = perf_counter_ns()
+                perf_optimizer_seconds += Float64(t_optim1_direct - t_optim0_direct) / 1.0e9
+                if runtime_profile:
+                    print(
+                        "PROG_STAGE step=", k, " total=", run_steps, " phase=optim",
+                        " secs=", Float32(Float64(t_optim1_direct - t_optim0_direct) / 1.0e9),
+                    )
+                var t1_direct = perf_counter_ns()
+                var secs_direct = Float64(t1_direct - t0) / 1.0e9
+                if MACHINE_PROGRESS_LOG:
+                    print(
+                        "PROG step=", k, " total=", run_steps, " loss=", lg_direct.loss,
+                        " grad=", Float32(dnorm), " lr=", step_lr,
+                        " clip=", clip_scale_direct, " secs=", Float32(secs_direct),
+                    )
+                print_trainer_progress(
+                    String("Klein-dora"), k, cfg.max_steps, len(compatible),
+                    lg_direct.loss, dnorm, secs_direct, noise_speed,
+                    Float64(t1_direct - train_start) / 1.0e9,
+                )
+                board.log_train_step(k, lg_direct.loss, dnorm, step_lr, secs_direct, noise_speed)
+                print(
+                    "[Klein-dora] step=", k,
+                    " grad_norm=", Float32(dnorm),
+                    " zero_leg_l1=", klein_direct_dora_zero_leg_l1(direct_dora_masters),
+                )
+                if klein_should_save_checkpoint(cfg, k) or k == run_steps:
+                    var t_save0_direct = perf_counter_ns()
+                    var ckpt = _lora_path_for_step(output_lora_path, k, cfg.max_steps)
+                    var nmods = save_klein_direct_dora(direct_dora_masters, ckpt, ctx)
+                    print("[Klein-dora] save step=", k, " path=", ckpt, " modules=", nmods)
+                    board.log_text(String("events/save"), k, ckpt)
+                    var t_save1_direct = perf_counter_ns()
+                    perf_save_seconds += Float64(t_save1_direct - t_save0_direct) / 1.0e9
+                    perf_visible_sync_count += 1
+                    perf_full_tensor_readback_count += 1
+                perf_min_free = _klein_update_min_free(ctx, perf_min_free)
+                continue
+            if oft_active:
+                var fwd_direct = klein_stack_direct_oft_forward_offload_turbo_moddev_rope_scratch[
+                    H, Dh, N_IMG, N_TXT, S
+                ](
+                    x_t_dev, txt_tokens_t, base, loader, direct_oft_masters,
+                    cfg.num_double, cfg.num_single, cfg.lokr_targets,
+                    img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_fwd,
+                )
+                var t_fwd1 = perf_counter_ns()
+                perf_forward_seconds += Float64(t_fwd1 - t_fwd0) / 1.0e9
+                if runtime_profile:
+                    print(
+                        "PROG_STAGE step=", k, " total=", run_steps, " phase=forward",
+                        " secs=", Float32(Float64(t_fwd1 - t_fwd0) / 1.0e9),
+                    )
+                var lg_direct = _klein_loss_grad(fwd_direct.out, target, sigma, cfg)
+                if runtime_profile:
+                    print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", lg_direct.loss)
+                var t_bwd0_direct = perf_counter_ns()
+                perf_loss_seconds += Float64(t_bwd0_direct - t_fwd1) / 1.0e9
+                var og = klein_stack_direct_oft_backward_offload_turbo_moddev_rope_scratch[
+                    H, Dh, N_IMG, N_TXT, S
+                ](
+                    lg_direct.d_loss.copy(), x_t_dev, txt_tokens_t, base, loader,
+                    direct_oft_masters, cfg.num_double, cfg.num_single, cfg.lokr_targets,
+                    img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_direct,
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                )
+                var t_bwd1_direct = perf_counter_ns()
+                perf_backward_seconds += Float64(t_bwd1_direct - t_bwd0_direct) / 1.0e9
+                if runtime_profile:
+                    print(
+                        "PROG_STAGE step=", k, " total=", run_steps, " phase=backward",
+                        " secs=", Float32(Float64(t_bwd1_direct - t_bwd0_direct) / 1.0e9),
+                    )
+                var t_norm0_direct = perf_counter_ns()
+                var onorm = klein_direct_oft_grad_norm(og.grads)
+                var t_norm1_direct = perf_counter_ns()
+                perf_grad_norm_seconds += Float64(t_norm1_direct - t_norm0_direct) / 1.0e9
+                var t_clip0_direct = perf_counter_ns()
+                var clip_scale_direct = Float32(1.0)
+                if onorm > Float64(cfg.max_grad_norm):
+                    clip_scale_direct = cfg.max_grad_norm / Float32(onorm)
+                    klein_direct_oft_clip_grads(og.grads, clip_scale_direct)
+                var t_clip1_direct = perf_counter_ns()
+                perf_clip_seconds += Float64(t_clip1_direct - t_clip0_direct) / 1.0e9
+                var optimizer_step = ((k - 1) // accum_steps) + 1
+                var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
+                if runtime_profile:
+                    print("PROG_STAGE step=", k, " total=", run_steps, " phase=optim_begin")
+                var t_optim0_direct = perf_counter_ns()
+                klein_direct_oft_adamw_step(
+                    direct_oft_masters, og.grads, optimizer_step, step_lr,
+                    cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                )
+                var t_optim1_direct = perf_counter_ns()
+                perf_optimizer_seconds += Float64(t_optim1_direct - t_optim0_direct) / 1.0e9
+                if runtime_profile:
+                    print(
+                        "PROG_STAGE step=", k, " total=", run_steps, " phase=optim",
+                        " secs=", Float32(Float64(t_optim1_direct - t_optim0_direct) / 1.0e9),
+                    )
+                var t1_direct = perf_counter_ns()
+                var secs_direct = Float64(t1_direct - t0) / 1.0e9
+                if MACHINE_PROGRESS_LOG:
+                    print(
+                        "PROG step=", k, " total=", run_steps, " loss=", lg_direct.loss,
+                        " grad=", Float32(onorm), " lr=", step_lr,
+                        " clip=", clip_scale_direct, " secs=", Float32(secs_direct),
+                    )
+                print_trainer_progress(
+                    String("Klein-oft"), k, cfg.max_steps, len(compatible),
+                    lg_direct.loss, onorm, secs_direct, noise_speed,
+                    Float64(t1_direct - train_start) / 1.0e9,
+                )
+                board.log_train_step(k, lg_direct.loss, onorm, step_lr, secs_direct, noise_speed)
+                print(
+                    "[Klein-oft] step=", k,
+                    " grad_norm=", Float32(onorm),
+                    " vec_l1=", klein_direct_oft_vec_l1(direct_oft_masters),
+                )
+                if klein_should_save_checkpoint(cfg, k) or k == run_steps:
+                    var t_save0_direct = perf_counter_ns()
+                    var ckpt = _lora_path_for_step(output_lora_path, k, cfg.max_steps)
+                    var nmods = save_klein_direct_oft(direct_oft_masters, ckpt, ctx)
+                    print("[Klein-oft] save step=", k, " path=", ckpt, " modules=", nmods)
+                    board.log_text(String("events/save"), k, ckpt)
+                    var t_save1_direct = perf_counter_ns()
+                    perf_save_seconds += Float64(t_save1_direct - t_save0_direct) / 1.0e9
+                    perf_visible_sync_count += 1
+                    perf_full_tensor_readback_count += 1
+                perf_min_free = _klein_update_min_free(ctx, perf_min_free)
+                continue
+
         if use_activation_tape_offload:
             var fwd_tape = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape[H, Dh, N_IMG, N_TXT, S](
                 x_t_dev, txt_tokens_t, base,
@@ -1363,6 +1944,7 @@ def main() raises:
                 cfg.out_channels, cfg.eps, ctx, scratch_fwd,
             )
             var t_fwd1 = perf_counter_ns()
+            perf_forward_seconds += Float64(t_fwd1 - t_fwd0) / 1.0e9
             if runtime_profile:
                 print(
                     "PROG_STAGE step=", k, " total=", run_steps, " phase=forward",
@@ -1374,6 +1956,7 @@ def main() raises:
             if runtime_profile:
                 print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
             t_bwd0 = perf_counter_ns()
+            perf_loss_seconds += Float64(t_bwd0 - t_fwd1) / 1.0e9
             g = klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
                 lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
                 loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
@@ -1388,6 +1971,7 @@ def main() raises:
                 cfg.out_channels, cfg.eps, ctx, scratch_fwd,
             )
             var t_fwd1 = perf_counter_ns()
+            perf_forward_seconds += Float64(t_fwd1 - t_fwd0) / 1.0e9
             if runtime_profile:
                 print(
                     "PROG_STAGE step=", k, " total=", run_steps, " phase=forward",
@@ -1398,6 +1982,7 @@ def main() raises:
             if runtime_profile:
                 print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
             t_bwd0 = perf_counter_ns()
+            perf_loss_seconds += Float64(t_bwd0 - t_fwd1) / 1.0e9
             comptime if KLEIN_V2_GRAPH_PATH:
                 # P6: per-block graph-engine backward (same conductor loop,
                 # same scratch ring, same arg list — drop-in for the
@@ -1427,6 +2012,7 @@ def main() raises:
                     cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
                 )
         var t_bwd1 = perf_counter_ns()
+        perf_backward_seconds += Float64(t_bwd1 - t_bwd0) / 1.0e9
         if runtime_profile:
             print(
                 "PROG_STAGE step=", k, " total=", run_steps, " phase=backward",
@@ -1465,6 +2051,7 @@ def main() raises:
                 var pending_optimizer_step = ((k - 1) // accum_steps) + 1
                 var pending_lr = ot_lr_for_optimizer_step(cfg, pending_optimizer_step)
                 board.log_train_step(k, loss, 0.0, pending_lr, secsm, noise_speed)
+                perf_min_free = _klein_update_min_free(ctx, perf_min_free)
                 continue
             # boundary: MEAN the window then overwrite g's four groups with it.
             var inv_micro = Float32(1.0) / Float32(micro_in_window)
@@ -1481,6 +2068,7 @@ def main() raises:
             micro_in_window = 0
 
         # grad_norm = L2 of ALL LoRA d_A/d_B
+        var t_norm0 = perf_counter_ns()
         var gsum = 0.0
         var nd = cfg.num_double * DBL_SLOTS
         for i in range(nd):
@@ -1491,6 +2079,8 @@ def main() raises:
             var a = _l2(g.sgl_d_a[i]); var b = _l2(g.sgl_d_b[i])
             gsum += a * a + b * b
         var grad_norm = sqrt(gsum)
+        var t_norm1 = perf_counter_ns()
+        perf_grad_norm_seconds += Float64(t_norm1 - t_norm0) / 1.0e9
 
         # ── dead-adapter warn (project's #1 silent failure) ───────────────────
         # B legitimately starts at 0, so its grad can be ~0 early; warn when an
@@ -1507,6 +2097,7 @@ def main() raises:
         # (LoKr clips on the MASTER grads inside its optimizer branch below —
         # carrier grads pass through unclipped, mirroring ST clipping the
         # actual lycoris trainables.)
+        var t_clip0 = perf_counter_ns()
         var clip_scale = Float32(1.0)
         if (not carrier_active) and grad_norm > Float64(cfg.max_grad_norm):
             clip_scale = cfg.max_grad_norm / Float32(grad_norm)
@@ -1516,6 +2107,8 @@ def main() raises:
             for i in range(ns):
                 _scale_inplace(g.sgl_d_a[i], clip_scale)
                 _scale_inplace(g.sgl_d_b[i], clip_scale)
+        var t_clip1 = perf_counter_ns()
+        perf_clip_seconds += Float64(t_clip1 - t_clip0) / 1.0e9
 
         # AdamW step (on clipped grads)
         if runtime_profile:
@@ -1597,6 +2190,60 @@ def main() raises:
                 " factor_l1=", klein_loha_trainable_l1(loha_masters),
                 " zero_leg_l1=", klein_loha_zero_leg_l1(loha_masters),
             )
+        elif dora_active:
+            # DoRA carrier optimizer path: chain carrier grads -> A/B/m grads,
+            # clip masters, host AdamW, re-materialize full-delta carriers.
+            var mg = klein_dora_chain_all(
+                dora_masters, g.dbl_d_a, g.dbl_d_b, g.sgl_d_a, g.sgl_d_b
+            )
+            var mnorm = klein_dora_grad_norm(mg)
+            grad_norm = mnorm
+            if mnorm > Float64(cfg.max_grad_norm):
+                clip_scale = cfg.max_grad_norm / Float32(mnorm)
+                klein_dora_clip_grads(mg, clip_scale)
+            klein_dora_adamw_step(
+                dora_masters, mg, optimizer_step, step_lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            var dora_carriers_k = klein_dora_carrier_lists(
+                dora_masters, cfg.d_model, cfg.mlp_hidden
+            )
+            lora = KleinLoraSet(
+                dora_carriers_k[0].copy(), dora_carriers_k[1].copy(),
+                cfg.num_double, cfg.num_single, cfg.lora_rank,
+            )
+            print(
+                "[Klein-dora] step=", k,
+                " master_grad_norm=", Float32(mnorm),
+                " zero_leg_l1=", klein_dora_zero_leg_l1(dora_masters),
+            )
+        elif oft_active:
+            # OneTrainer-OFT carrier optimizer path: chain carrier grads -> triu
+            # rotation vectors, clip masters, host AdamW, re-materialize.
+            var mg = klein_oft_chain_all(
+                oft_masters, g.dbl_d_a, g.dbl_d_b, g.sgl_d_a, g.sgl_d_b
+            )
+            var mnorm = klein_oft_grad_norm(mg)
+            grad_norm = mnorm
+            if mnorm > Float64(cfg.max_grad_norm):
+                clip_scale = cfg.max_grad_norm / Float32(mnorm)
+                klein_oft_clip_grads(mg, clip_scale)
+            klein_oft_adamw_step(
+                oft_masters, mg, optimizer_step, step_lr,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            var oft_carriers_k = klein_oft_carrier_lists(
+                oft_masters, cfg.d_model, cfg.mlp_hidden
+            )
+            lora = KleinLoraSet(
+                oft_carriers_k[0].copy(), oft_carriers_k[1].copy(),
+                cfg.num_double, cfg.num_single, cfg.lora_rank,
+            )
+            print(
+                "[Klein-oft] step=", k,
+                " master_grad_norm=", Float32(mnorm),
+                " vec_l1=", klein_oft_vec_l1(oft_masters),
+            )
         elif levers_optimizer_active(cfg):
             levers_optimizer_step_host(
                 cfg, lora.dbl, g.dbl_d_a, g.dbl_d_b, optimizer_step,
@@ -1635,6 +2282,7 @@ def main() raises:
                     ema_update_host(ema_sgl_a[i], lora.sgl[i].a, ema_decay)
                     ema_update_host(ema_sgl_b[i], lora.sgl[i].b, ema_decay)
         var t_optim1 = perf_counter_ns()
+        perf_optimizer_seconds += Float64(t_optim1 - t_optim0) / 1.0e9
         if runtime_profile:
             print(
                 "PROG_STAGE step=", k, " total=", run_steps, " phase=optim",
@@ -1658,6 +2306,7 @@ def main() raises:
             Float64(t1 - train_start) / 1.0e9,
         )
         board.log_train_step(k, loss, grad_norm, step_lr, secs, noise_speed)
+        perf_min_free = _klein_update_min_free(ctx, perf_min_free)
         # ── cadence ───────────────────────────────────────────────────────────
         var save_due = klein_should_save_checkpoint(cfg, k)
         var sample_due = (
@@ -1667,6 +2316,7 @@ def main() raises:
         )
         var chunk_final_due = k == run_steps
         if save_due or sample_due or chunk_final_due:
+            var t_save0 = perf_counter_ns()
             # T1.C schedule-free SAVE BRACKET (levers.mojo SAVE CONTRACT):
             # eval mode for the save + validation sample, train mode after.
             # No-op for every other optimizer, including the default AdamW.
@@ -1686,6 +2336,18 @@ def main() raises:
                 # key convention. No optimizer-state sidecar this wave.
                 var nmods = save_klein_loha(loha_masters, ckpt, ctx)
                 print("[Klein-loha] save step=", k, " path=", ckpt, " modules=", nmods)
+                board.log_text(String("events/save"), k, ckpt)
+            elif dora_active:
+                # DoRA product file in the upstream/OneTrainer lora_down/lora_up
+                # + dora_scale + .alpha convention. No optimizer-state sidecar.
+                var nmods = save_klein_dora(dora_masters, ckpt, ctx)
+                print("[Klein-dora] save step=", k, " path=", ckpt, " modules=", nmods)
+                board.log_text(String("events/save"), k, ckpt)
+            elif oft_active:
+                # OneTrainer-OFT product file: <prefix>.oft_R.weight triu-vector
+                # params. No optimizer-state sidecar this wave.
+                var nmods = save_klein_oft(oft_masters, ckpt, ctx)
+                print("[Klein-oft] save step=", k, " path=", ckpt, " modules=", nmods)
                 board.log_text(String("events/save"), k, ckpt)
             else:
                 var npairs = save_klein_lora(lora, ckpt, ctx)
@@ -1715,8 +2377,25 @@ def main() raises:
                 )
                 print("[Klein-lora] save_ema step=", k, " path=", ema_path, " pairs=", nema)
                 board.log_text(String("events/save_ema"), k, ema_path)
+            var t_save1 = perf_counter_ns()
+            perf_save_seconds += Float64(t_save1 - t_save0) / 1.0e9
+            perf_visible_sync_count += 1
+            perf_full_tensor_readback_count += 1
             if sample_due:
-                _do_sample_all(cfg, sample_cfg, k, ckpt, board, ctx)
+                var t_sample0 = perf_counter_ns()
+                var sample_lora_dev: KleinLoraDeviceSet
+                comptime if KLEIN_V2_ENGINE:
+                    sample_lora_dev = resident_lora_dev.copy()
+                else:
+                    sample_lora_dev = klein_lora_set_to_device(lora, ctx)
+                _do_sample_all_resident(
+                    cfg, sample_cfg, k, base, loader, sample_lora_dev, mod_weights,
+                    cos_dev[], sin_dev[], scratch_fwd, board, ctx,
+                )
+                var t_sample1 = perf_counter_ns()
+                perf_sample_seconds += Float64(t_sample1 - t_sample0) / 1.0e9
+                perf_visible_sync_count += 1
+                perf_min_free = _klein_update_min_free(ctx, perf_min_free)
             # Do not reload PEFT LoRA into the live trainer here. PEFT files do
             # not carry AdamW moments, so reloading them mid-run resets optimizer
             # state and hurts convergence. Resume checks belong to the external
@@ -1725,6 +2404,18 @@ def main() raises:
             levers_optimizer_train_after_save(cfg, lev_opt_sgl)
 
     print("")
+    var train_end = perf_counter_ns()
+    _klein_emit_perf_record(
+        cfg, cfg_path, run_steps, start_step,
+        Float64(train_end - train_start) / 1.0e9,
+        perf_total_vram, perf_min_free,
+        perf_visible_sync_count, perf_visible_transfer_count,
+        perf_full_tensor_readback_count,
+        perf_forward_seconds, perf_backward_seconds, perf_loss_seconds,
+        perf_grad_norm_seconds, perf_clip_seconds, perf_optimizer_seconds,
+        perf_save_seconds, perf_sample_seconds,
+        runtime_sample_enabled, use_activation_tape_offload, direct_active,
+    )
     print("DONE: worker reached step", run_steps, "of", cfg.max_steps, "target")
     board.set_status(String("complete"))
     board.close()

@@ -45,6 +45,7 @@ from std.sys import argv
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
+from std.os import listdir, makedirs
 from std.time import perf_counter_ns
 
 from serenitymojo.tensor import Tensor
@@ -61,10 +62,32 @@ from serenitymojo.models.sdxl.sdxl_real_train import (
 )
 from serenitymojo.models.sdxl.sdxl_unet_stack_lora import (
     SdxlLoraSet, build_sdxl_lora_set, sdxl_lora_adamw_step, SdxlStLoraGrads,
-    save_sdxl_lora, save_sdxl_lora_state,
+    save_sdxl_lora, save_sdxl_lora_state, sdxl_lora_prefixes,
 )
 from serenitymojo.models.sdxl.lora_block import SDXL_SLOTS
 from serenitymojo.training.train_step import LoraGrads, _lora_adamw
+from serenitymojo.training.flat_lycoris_stack import (
+    FlatLoKrSet, empty_flat_lokr_set, build_flat_lokr_set,
+    FlatLoKrGrads,
+    flat_lokr_carrier_list, flat_lokr_carrier_total_bytes,
+    flat_lokr_chain_all, flat_lokr_grad_norm, flat_lokr_clip_grads,
+    flat_lokr_adamw_step, flat_lokr_zero_leg_l1, save_flat_lokr,
+    FlatLoHaSet, empty_flat_loha_set, build_flat_loha_set,
+    FlatLoHaGrads,
+    flat_loha_carrier_list, flat_loha_carrier_total_bytes,
+    flat_loha_chain_all, flat_loha_grad_norm, flat_loha_clip_grads,
+    flat_loha_adamw_step, flat_loha_zero_leg_l1, save_flat_loha,
+    FlatDoRASet, FlatDoRAGrads, empty_flat_dora_set,
+    build_flat_dora_set_from_weights, flat_dora_carrier_list,
+    flat_dora_carrier_total_bytes, flat_dora_preflight,
+    flat_dora_chain_all, flat_dora_grad_norm, flat_dora_clip_grads,
+    flat_dora_adamw_step, flat_dora_zero_leg_l1, save_flat_dora,
+    FlatOFTSet, FlatOFTGrads, empty_flat_oft_set,
+    build_flat_oft_set_from_weights, flat_oft_carrier_list,
+    flat_oft_carrier_total_bytes, flat_oft_preflight,
+    flat_oft_chain_all, flat_oft_grad_norm, flat_oft_clip_grads,
+    flat_oft_adamw_step, flat_oft_vec_l1, save_flat_oft,
+)
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.sdxl_sample_resident import (
@@ -92,8 +115,17 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 )
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TRAIN_ADAPTER_ALGO_LORA,
+    TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOHA,
+    TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_DORA,
+    TRAIN_ADAPTER_ALGO_OFT,
+    TRAIN_ADAPTER_ALGO_BOFT,
+    TRAIN_ADAPTER_ALGO_LOCON,
 )
-from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.caption_dropout import should_drop_caption
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
@@ -131,6 +163,8 @@ comptime CLIP = Float32(1.0)
 comptime FIXED_SMOKE = True
 comptime FIXED_T_IDX = 500
 comptime SEED_BASE = UInt64(42)
+comptime SDXL_OFT_BLOCK_SIZE = 4
+comptime SDXL_CARRIER_RUNTIME_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 
 # ── sample-during-training (v1; sdxl_sample_resident) ─────────────────────────
 # When cadence fires, run an eps-pred Euler CFG denoise on the FROZEN UNet weights
@@ -178,7 +212,42 @@ def _close_f32(a: Float32, b: Float32, tol: Float32 = Float32(1.0e-7)) -> Bool:
 
 
 def validate_sdxl_train_config(cfg: TrainConfig) raises:
-    require_lora_or_locon_linear(cfg, String("SDXL"))
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[SDXL-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
+        print("[SDXL-lokr] network_algorithm=lokr: using SpatialTransformer carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
+        print("[SDXL-loha] network_algorithm=loha: using SpatialTransformer carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA or cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
+        var full_delta_bytes = _sdxl_full_delta_carrier_bytes_estimate(cfg.lokr_targets)
+        print(
+            "[SDXL-", adapter_algo_name(cfg.adapter_algo),
+            "] network_algorithm=", adapter_algo_name(cfg.adapter_algo),
+            ": using full-delta carrier dispatch through the LoRA stack",
+        )
+        print(
+            "[SDXL-", adapter_algo_name(cfg.adapter_algo),
+            "] full-delta carrier bytes=", full_delta_bytes,
+            " budget=", LOKR_CARRIER_MAX_DEVICE_BYTES,
+        )
+        if full_delta_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("SDXL trainer: ")
+                + adapter_algo_name(cfg.adapter_algo)
+                + String(" full-delta carrier needs ")
+                + String(full_delta_bytes)
+                + String(" bytes (> budget). Use attention-only targets or direct W_eff lowering.")
+            )
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("SDXL trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("SDXL trainer: full finetune is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("SDXL trainer: adapter algorithm ")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+        )
     if cfg.checkpoint == String(""):
         raise Error("SDXL trainer config must set checkpoint")
     if cfg.in_channels != 0 and cfg.in_channels != 4:
@@ -224,6 +293,34 @@ def sdxl_output_lora_path_for_st(cfg: TrainConfig, completed_step: Int, st_index
     return ot_output_lora_path_for_stream_from_train_config(
         cfg, String(LORA_DIR), String("sdxl_lora"), st_index, completed_step
     )
+
+
+def _substr(s: String, start: Int, end: Int) -> String:
+    var out = String("")
+    var i = 0
+    for ch in s.codepoint_slices():
+        if i >= start and i < end:
+            out += String(ch)
+        i += 1
+    return out^
+
+
+def _dirname(path: String) -> String:
+    var last = -1
+    var i = 0
+    for ch in path.codepoint_slices():
+        if String(ch) == String("/"):
+            last = i
+        i += 1
+    if last <= 0:
+        return String(".")
+    return _substr(path, 0, last)
+
+
+def _mkdir_parent(path: String) raises:
+    var parent_dir = _dirname(path)
+    if parent_dir != String("."):
+        makedirs(parent_dir, exist_ok=True)
 
 
 def sdxl_sample_cadence_from_train_config(
@@ -366,6 +463,195 @@ def _adamw_all(
             )
 
 
+def _sdxl_slot_in(slot: Int, C: Int, Cctx: Int, Cff: Int) -> Int:
+    if slot == 5 or slot == 6:
+        return Cctx
+    if slot == 9:
+        return Cff
+    return C
+
+
+def _sdxl_slot_out(slot: Int, C: Int, Cff: Int) -> Int:
+    if slot == 8:
+        return 2 * Cff
+    return C
+
+
+def _sdxl_flat_in_dims(num_blocks: Int, C: Int, Cctx: Int, Cff: Int) -> List[Int]:
+    var out = List[Int]()
+    for _bi in range(num_blocks):
+        for slot in range(SDXL_SLOTS):
+            out.append(_sdxl_slot_in(slot, C, Cctx, Cff))
+    return out^
+
+
+def _sdxl_flat_out_dims(num_blocks: Int, C: Int, Cff: Int) -> List[Int]:
+    var out = List[Int]()
+    for _bi in range(num_blocks):
+        for slot in range(SDXL_SLOTS):
+            out.append(_sdxl_slot_out(slot, C, Cff))
+    return out^
+
+
+def _build_sdxl_flat_lokr(
+    st_prefix: String, num_blocks: Int, C: Int, Cff: Int,
+    cfg: TrainConfig, seed: UInt64,
+) raises -> FlatLoKrSet:
+    var ins = _sdxl_flat_in_dims(num_blocks, C, CCTX, Cff)
+    var outs = _sdxl_flat_out_dims(num_blocks, C, Cff)
+    var names = sdxl_lora_prefixes(st_prefix, num_blocks)
+    return build_flat_lokr_set(
+        ins, outs, names,
+        cfg.lora_rank, cfg.lora_alpha, cfg.lokr_factor,
+        cfg.lokr_decompose_both, cfg.lokr_full_matrix, seed,
+    )
+
+
+def _build_sdxl_flat_loha(
+    st_prefix: String, num_blocks: Int, C: Int, Cff: Int,
+    cfg: TrainConfig, seed: UInt64,
+) raises -> FlatLoHaSet:
+    var ins = _sdxl_flat_in_dims(num_blocks, C, CCTX, Cff)
+    var outs = _sdxl_flat_out_dims(num_blocks, C, Cff)
+    var names = sdxl_lora_prefixes(st_prefix, num_blocks)
+    return build_flat_loha_set(ins, outs, names, cfg.lora_rank, cfg.lora_alpha, seed)
+
+
+def _sdxl_slot_is_attn(slot: Int) -> Bool:
+    return slot >= 0 and slot <= 7
+
+
+def _sdxl_slot_targeted(slot: Int, targets: Int) -> Bool:
+    if _sdxl_slot_is_attn(slot):
+        return targets >= 1
+    return targets >= 2
+
+
+def _validate_sdxl_lycoris_targets(targets: Int) raises:
+    if targets < 1 or targets > 3:
+        raise Error("SDXL DoRA/OFT targets must be 1(attn)|2(all)|3(all)")
+
+
+def _sdxl_flat_active(num_blocks: Int, targets: Int) raises -> List[Bool]:
+    _validate_sdxl_lycoris_targets(targets)
+    var out = List[Bool]()
+    for _bi in range(num_blocks):
+        for slot in range(SDXL_SLOTS):
+            out.append(_sdxl_slot_targeted(slot, targets))
+    return out^
+
+
+def _sdxl_full_delta_carrier_bytes_for_st(
+    num_blocks: Int, C: Int, Cff: Int, targets: Int,
+) raises -> Int:
+    _validate_sdxl_lycoris_targets(targets)
+    var elems = 0
+    for _bi in range(num_blocks):
+        for slot in range(SDXL_SLOTS):
+            var inf = _sdxl_slot_in(slot, C, CCTX, Cff)
+            var outf = _sdxl_slot_out(slot, C, Cff)
+            if _sdxl_slot_targeted(slot, targets):
+                elems += inf * inf + outf * inf
+            else:
+                elems += inf + outf
+    return elems * 2
+
+
+def _sdxl_full_delta_carrier_bytes_estimate(targets: Int) raises -> Int:
+    _validate_sdxl_lycoris_targets(targets)
+    var total = 0
+    for i in range(N_ST):
+        total += _sdxl_full_delta_carrier_bytes_for_st(
+            sdxl_st_depth(i), sdxl_st_C(i), sdxl_st_Cff(i), targets,
+        )
+    return total
+
+
+def _sdxl_weight_key(st_prefix: String, block_idx: Int, slot: Int) raises -> String:
+    var bp = (
+        st_prefix + String(".transformer_blocks.")
+        + String(block_idx) + String(".")
+    )
+    if slot == 0:
+        return bp + String("attn1.to_q.weight")
+    if slot == 1:
+        return bp + String("attn1.to_k.weight")
+    if slot == 2:
+        return bp + String("attn1.to_v.weight")
+    if slot == 3:
+        return bp + String("attn1.to_out.0.weight")
+    if slot == 4:
+        return bp + String("attn2.to_q.weight")
+    if slot == 5:
+        return bp + String("attn2.to_k.weight")
+    if slot == 6:
+        return bp + String("attn2.to_v.weight")
+    if slot == 7:
+        return bp + String("attn2.to_out.0.weight")
+    if slot == 8:
+        return bp + String("ff.net.0.proj.weight")
+    if slot == 9:
+        return bp + String("ff.net.2.weight")
+    raise Error(String("SDXL LyCORIS bad slot ") + String(slot))
+
+
+def _read_sdxl_weight_f32(
+    st: SafeTensors, key: String, in_f: Int, out_f: Int,
+) raises -> List[Float32]:
+    var info = st.tensor_info(key)
+    if info.dtype != STDtype.BF16:
+        raise Error(String("SDXL LyCORIS base weight: expected BF16 for ") + key)
+    if len(info.shape) != 2:
+        raise Error(String("SDXL LyCORIS base weight: expected 2D for ") + key)
+    if Int(info.shape[0]) != out_f or Int(info.shape[1]) != in_f:
+        raise Error(String("SDXL LyCORIS base weight: shape mismatch for ") + key)
+    var bytes = st.tensor_bytes(key)
+    var bp = bytes.unsafe_ptr().bitcast[BFloat16]()
+    var out = List[Float32]()
+    for i in range(in_f * out_f):
+        out.append(bp[i].cast[DType.float32]())
+    return out^
+
+
+def _sdxl_flat_weights(
+    st: SafeTensors, st_prefix: String, num_blocks: Int, C: Int, Cff: Int,
+    targets: Int,
+) raises -> List[List[Float32]]:
+    _validate_sdxl_lycoris_targets(targets)
+    var out = List[List[Float32]]()
+    for bi in range(num_blocks):
+        for slot in range(SDXL_SLOTS):
+            if _sdxl_slot_targeted(slot, targets):
+                var inf = _sdxl_slot_in(slot, C, CCTX, Cff)
+                var outf = _sdxl_slot_out(slot, C, Cff)
+                out.append(_read_sdxl_weight_f32(
+                    st, _sdxl_weight_key(st_prefix, bi, slot), inf, outf,
+                ))
+            else:
+                var dummy = List[Float32]()
+                dummy.append(Float32(1.0))
+                out.append(dummy^)
+    return out^
+
+
+def _require_sdxl_carrier_runtime_vram(
+    label: String, carrier_bytes: Int, free_after_weights: UInt,
+) raises:
+    var free_bytes = Int(free_after_weights)
+    var need = carrier_bytes + SDXL_CARRIER_RUNTIME_RESERVE_BYTES
+    if need > free_bytes:
+        raise Error(
+            String("SDXL ") + label
+            + String(": full-delta carrier needs ")
+            + String(carrier_bytes)
+            + String(" device bytes plus ")
+            + String(SDXL_CARRIER_RUNTIME_RESERVE_BYTES)
+            + String(" bytes runtime reserve, but only ")
+            + String(free_bytes)
+            + String(" bytes were free after resident UNet weight load. This does not meet the 24 GB target; use a smaller target set or lower DoRA/OFT to a direct W_eff path.")
+        )
+
+
 def _load_cache_preserving_dtype(
     st: SafeTensors, name: String, ctx: DeviceContext
 ) raises -> Tensor:
@@ -450,6 +736,7 @@ def main() raises:
     var cache_dir = sdxl_cache_dir_from_train_config(train_cfg)
     var sample_cadence = sdxl_sample_cadence_from_train_config(cfg_path, train_cfg)
     var sample_enabled = sdxl_sampling_enabled(sample_cadence)
+    _mkdir_parent(sdxl_output_lora_path_for_st(train_cfg, run_steps, 0))
 
     print("=== SDXL REAL conv-UNet LoRA training loop ===")
     print("  config:", cfg_path)
@@ -486,21 +773,148 @@ def main() raises:
     var stw = SafeTensors.open(ckpt)
     var w = build_sdxl_real_weights(stw, ctx)
     print("[load] weights ready")
+    var mem_weights = ctx.get_memory_info()
+    print("[load] free VRAM after resident UNet weights (bytes):", mem_weights[0], " total:", mem_weights[1])
 
-    # ── LoRA sets (one per ST; B=0 init -> identity at step 0) ──
+    # ── LoRA / LyCORIS carrier sets (one per ST; identity at step 0) ──
+    var lokr_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var dora_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var carrier_active = lokr_active or loha_active or dora_active or oft_active
+    if dora_active or oft_active:
+        var projected_bytes = _sdxl_full_delta_carrier_bytes_estimate(train_cfg.lokr_targets)
+        _require_sdxl_carrier_runtime_vram(
+            adapter_algo_name(train_cfg.adapter_algo), projected_bytes, mem_weights[0],
+        )
     var lora = List[SdxlLoraSet]()
+    var lokr_sets = List[FlatLoKrSet]()
+    var loha_sets = List[FlatLoHaSet]()
+    var dora_sets = List[FlatDoRASet]()
+    var oft_sets = List[FlatOFTSet]()
     var n_adapters = 0
-    for i in range(N_ST):
-        var ls = build_sdxl_lora_set(sdxl_st_depth(i), sdxl_st_C(i), CCTX, sdxl_st_Cff(i), RANK, ALPHA)
-        n_adapters += ls.num_blocks * SDXL_SLOTS
-        lora.append(ls^)
+    var carrier_bytes_total = 0
+    var prefixes_for_lycoris = sdxl_st_prefixes()
+    if carrier_active:
+        for i in range(N_ST):
+            var depth = sdxl_st_depth(i)
+            var C = sdxl_st_C(i)
+            var Cff = sdxl_st_Cff(i)
+            n_adapters += depth * SDXL_SLOTS
+            if lokr_active:
+                var ms = _build_sdxl_flat_lokr(
+                    prefixes_for_lycoris[i], depth, C, Cff, train_cfg,
+                    train_cfg.seed * UInt64(59) + UInt64(i + 1),
+                )
+                carrier_bytes_total += flat_lokr_carrier_total_bytes(ms)
+                lokr_sets.append(ms^)
+                loha_sets.append(empty_flat_loha_set())
+                dora_sets.append(empty_flat_dora_set())
+                oft_sets.append(empty_flat_oft_set())
+            elif loha_active:
+                var ms = _build_sdxl_flat_loha(
+                    prefixes_for_lycoris[i], depth, C, Cff, train_cfg,
+                    train_cfg.seed * UInt64(59) + UInt64(i + 1),
+                )
+                carrier_bytes_total += flat_loha_carrier_total_bytes(ms)
+                loha_sets.append(ms^)
+                lokr_sets.append(empty_flat_lokr_set())
+                dora_sets.append(empty_flat_dora_set())
+                oft_sets.append(empty_flat_oft_set())
+            elif dora_active:
+                var ins = _sdxl_flat_in_dims(depth, C, CCTX, Cff)
+                var outs = _sdxl_flat_out_dims(depth, C, Cff)
+                var names = sdxl_lora_prefixes(prefixes_for_lycoris[i], depth)
+                var active = _sdxl_flat_active(depth, train_cfg.lokr_targets)
+                var weights = _sdxl_flat_weights(
+                    stw, prefixes_for_lycoris[i], depth, C, Cff, train_cfg.lokr_targets,
+                )
+                var ms = build_flat_dora_set_from_weights(
+                    ins, outs, names, weights, active,
+                    train_cfg.lora_rank, train_cfg.lora_alpha,
+                    train_cfg.seed * UInt64(59) + UInt64(i + 1), False,
+                )
+                carrier_bytes_total += flat_dora_carrier_total_bytes(ms)
+                dora_sets.append(ms^)
+                lokr_sets.append(empty_flat_lokr_set())
+                loha_sets.append(empty_flat_loha_set())
+                oft_sets.append(empty_flat_oft_set())
+            else:
+                var ins = _sdxl_flat_in_dims(depth, C, CCTX, Cff)
+                var outs = _sdxl_flat_out_dims(depth, C, Cff)
+                var names = sdxl_lora_prefixes(prefixes_for_lycoris[i], depth)
+                var active = _sdxl_flat_active(depth, train_cfg.lokr_targets)
+                var weights = _sdxl_flat_weights(
+                    stw, prefixes_for_lycoris[i], depth, C, Cff, train_cfg.lokr_targets,
+                )
+                var ms = build_flat_oft_set_from_weights(
+                    ins, outs, names, weights, active, SDXL_OFT_BLOCK_SIZE,
+                )
+                carrier_bytes_total += flat_oft_carrier_total_bytes(ms)
+                oft_sets.append(ms^)
+                lokr_sets.append(empty_flat_lokr_set())
+                loha_sets.append(empty_flat_loha_set())
+                dora_sets.append(empty_flat_dora_set())
+        print("[SDXL-lycoris] carrier device bytes:", carrier_bytes_total, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes_total > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("SDXL LyCORIS carrier set needs ")
+                + String(carrier_bytes_total) + String(" bytes on device (> budget ")
+                + String(LOKR_CARRIER_MAX_DEVICE_BYTES) + String(")")
+            )
+        if dora_active:
+            flat_dora_preflight(dora_sets[0], LOKR_CARRIER_MAX_DEVICE_BYTES)
+        elif oft_active:
+            flat_oft_preflight(oft_sets[0], LOKR_CARRIER_MAX_DEVICE_BYTES)
+        for i in range(N_ST):
+            if lokr_active:
+                var carriers = flat_lokr_carrier_list(lokr_sets[i])
+                lora.append(SdxlLoraSet(carriers^, sdxl_st_depth(i), train_cfg.lora_rank))
+            elif loha_active:
+                var carriers = flat_loha_carrier_list(loha_sets[i])
+                lora.append(SdxlLoraSet(carriers^, sdxl_st_depth(i), train_cfg.lora_rank))
+            elif dora_active:
+                var carriers = flat_dora_carrier_list(dora_sets[i])
+                lora.append(SdxlLoraSet(carriers^, sdxl_st_depth(i), train_cfg.lora_rank))
+            else:
+                var carriers = flat_oft_carrier_list(oft_sets[i])
+                lora.append(SdxlLoraSet(carriers^, sdxl_st_depth(i), SDXL_OFT_BLOCK_SIZE))
+    else:
+        for i in range(N_ST):
+            var ls = build_sdxl_lora_set(
+                sdxl_st_depth(i), sdxl_st_C(i), CCTX, sdxl_st_Cff(i),
+                train_cfg.lora_rank, train_cfg.lora_alpha,
+            )
+            n_adapters += ls.num_blocks * SDXL_SLOTS
+            lora.append(ls^)
+            lokr_sets.append(empty_flat_lokr_set())
+            loha_sets.append(empty_flat_loha_set())
+            dora_sets.append(empty_flat_dora_set())
+            oft_sets.append(empty_flat_oft_set())
     print("[lora] sets:", N_ST, " adapters:", n_adapters)
 
     var b_absum_init = Float32(0.0)
-    for s in range(N_ST):
-        for i in range(len(lora[s].ad)):
-            b_absum_init += _absum(lora[s].ad[i].b)
-    print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
+    if lokr_active:
+        for s in range(N_ST):
+            b_absum_init += Float32(flat_lokr_zero_leg_l1(lokr_sets[s]))
+        print("[SDXL-lokr] zero-leg L1 at init =", b_absum_init, " (expect 0.0)")
+    elif loha_active:
+        for s in range(N_ST):
+            b_absum_init += Float32(flat_loha_zero_leg_l1(loha_sets[s]))
+        print("[SDXL-loha] zero-leg L1 at init =", b_absum_init, " (expect 0.0)")
+    elif dora_active:
+        for s in range(N_ST):
+            b_absum_init += Float32(flat_dora_zero_leg_l1(dora_sets[s]))
+        print("[SDXL-dora] zero-leg L1 at init =", b_absum_init, " (expect 0.0)")
+    elif oft_active:
+        for s in range(N_ST):
+            b_absum_init += Float32(flat_oft_vec_l1(oft_sets[s]))
+        print("[SDXL-oft] vec L1 at init =", b_absum_init, " (expect 0.0)")
+    else:
+        for s in range(N_ST):
+            for i in range(len(lora[s].ad)):
+                b_absum_init += _absum(lora[s].ad[i].b)
+        print("[lora] LoRA-B |.|_1 at init =", b_absum_init, " (expect 0.0)")
 
     # ── load ONE cache sample (FIXED smoke reuses it every step) ──
     var files = _list_safetensors(cache_dir)
@@ -683,28 +1097,150 @@ def main() raises:
         # ── backward -> per-ST LoRA grads ──
         var grads = sdxl_real_backward[LATENT_HW, LATENT_HW](go, fwd.acts, w, lora, ctx)
 
-        # ── global-norm clip(1.0) ──
-        var gn_before = _clip(grads, train_cfg.max_grad_norm)
-
-        # ── AdamW on every adapter ──
+        # ── global-norm clip + optimizer ──
         var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-        _adamw_all(
-            lora, grads, k, step_lr, ctx,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
-        )
+        var gn_before: Float64
+        var progress_label = String("SDXL-lora")
+        if lokr_active:
+            progress_label = String("SDXL-lokr")
+            var mg_sets = List[FlatLoKrGrads]()
+            var sq = Float64(0.0)
+            for s in range(N_ST):
+                var mg = flat_lokr_chain_all(lokr_sets[s], grads.d_a[s], grads.d_b[s])
+                var mn = flat_lokr_grad_norm(mg)
+                sq += mn * mn
+                mg_sets.append(mg^)
+            gn_before = sqrt(sq)
+            if gn_before > Float64(train_cfg.max_grad_norm):
+                var clip_scale = train_cfg.max_grad_norm / Float32(gn_before)
+                for s in range(N_ST):
+                    flat_lokr_clip_grads(mg_sets[s], clip_scale)
+            for s in range(N_ST):
+                flat_lokr_adamw_step(
+                    lokr_sets[s], mg_sets[s], k, step_lr,
+                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                    train_cfg.weight_decay,
+                )
+                var carriers = flat_lokr_carrier_list(lokr_sets[s])
+                lora[s].ad = carriers^
+            print("[SDXL-lokr] step=", k, " master_grad_norm=", Float32(gn_before),
+                  " zero_leg_l1=", flat_lokr_zero_leg_l1(lokr_sets[0]))
+        elif loha_active:
+            progress_label = String("SDXL-loha")
+            var mg_sets = List[FlatLoHaGrads]()
+            var sq = Float64(0.0)
+            for s in range(N_ST):
+                var mg = flat_loha_chain_all(loha_sets[s], grads.d_a[s], grads.d_b[s])
+                var mn = flat_loha_grad_norm(mg)
+                sq += mn * mn
+                mg_sets.append(mg^)
+            gn_before = sqrt(sq)
+            if gn_before > Float64(train_cfg.max_grad_norm):
+                var clip_scale = train_cfg.max_grad_norm / Float32(gn_before)
+                for s in range(N_ST):
+                    flat_loha_clip_grads(mg_sets[s], clip_scale)
+            for s in range(N_ST):
+                flat_loha_adamw_step(
+                    loha_sets[s], mg_sets[s], k, step_lr,
+                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                    train_cfg.weight_decay,
+                )
+                var carriers = flat_loha_carrier_list(loha_sets[s])
+                lora[s].ad = carriers^
+            print("[SDXL-loha] step=", k, " master_grad_norm=", Float32(gn_before),
+                  " zero_leg_l1=", flat_loha_zero_leg_l1(loha_sets[0]))
+        elif dora_active:
+            progress_label = String("SDXL-dora")
+            var mg_sets = List[FlatDoRAGrads]()
+            var sq = Float64(0.0)
+            for s in range(N_ST):
+                var mg = flat_dora_chain_all(dora_sets[s], grads.d_a[s], grads.d_b[s])
+                var mn = flat_dora_grad_norm(mg)
+                sq += mn * mn
+                mg_sets.append(mg^)
+            gn_before = sqrt(sq)
+            if gn_before > Float64(train_cfg.max_grad_norm):
+                var clip_scale = train_cfg.max_grad_norm / Float32(gn_before)
+                for s in range(N_ST):
+                    flat_dora_clip_grads(mg_sets[s], clip_scale)
+            for s in range(N_ST):
+                flat_dora_adamw_step(
+                    dora_sets[s], mg_sets[s], k, step_lr,
+                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                    train_cfg.weight_decay,
+                )
+                var carriers = flat_dora_carrier_list(dora_sets[s])
+                lora[s].ad = carriers^
+            print("[SDXL-dora] step=", k, " master_grad_norm=", Float32(gn_before),
+                  " zero_leg_l1=", flat_dora_zero_leg_l1(dora_sets[0]))
+        elif oft_active:
+            progress_label = String("SDXL-oft")
+            var mg_sets = List[FlatOFTGrads]()
+            var sq = Float64(0.0)
+            for s in range(N_ST):
+                var mg = flat_oft_chain_all(oft_sets[s], grads.d_a[s], grads.d_b[s])
+                var mn = flat_oft_grad_norm(mg)
+                sq += mn * mn
+                mg_sets.append(mg^)
+            gn_before = sqrt(sq)
+            if gn_before > Float64(train_cfg.max_grad_norm):
+                var clip_scale = train_cfg.max_grad_norm / Float32(gn_before)
+                for s in range(N_ST):
+                    flat_oft_clip_grads(mg_sets[s], clip_scale)
+            for s in range(N_ST):
+                flat_oft_adamw_step(
+                    oft_sets[s], mg_sets[s], k, step_lr,
+                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                    train_cfg.weight_decay,
+                )
+                var carriers = flat_oft_carrier_list(oft_sets[s])
+                lora[s].ad = carriers^
+            print("[SDXL-oft] step=", k, " master_grad_norm=", Float32(gn_before),
+                  " vec_l1=", flat_oft_vec_l1(oft_sets[0]))
+        else:
+            gn_before = _clip(grads, train_cfg.max_grad_norm)
+            _adamw_all(
+                lora, grads, k, step_lr, ctx,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
         var b_absum = Float32(0.0)
         var b_nonzero = 0
-        for s in range(N_ST):
-            for i in range(len(lora[s].ad)):
-                var bs2 = _absum(lora[s].ad[i].b)
+        if lokr_active:
+            for s in range(N_ST):
+                var bs2 = Float32(flat_lokr_zero_leg_l1(lokr_sets[s]))
                 b_absum += bs2
                 if bs2 > 0.0:
                     b_nonzero += 1
+        elif loha_active:
+            for s in range(N_ST):
+                var bs2 = Float32(flat_loha_zero_leg_l1(loha_sets[s]))
+                b_absum += bs2
+                if bs2 > 0.0:
+                    b_nonzero += 1
+        elif dora_active:
+            for s in range(N_ST):
+                var bs2 = Float32(flat_dora_zero_leg_l1(dora_sets[s]))
+                b_absum += bs2
+                if bs2 > 0.0:
+                    b_nonzero += 1
+        elif oft_active:
+            for s in range(N_ST):
+                var bs2 = Float32(flat_oft_vec_l1(oft_sets[s]))
+                b_absum += bs2
+                if bs2 > 0.0:
+                    b_nonzero += 1
+        else:
+            for s in range(N_ST):
+                for i in range(len(lora[s].ad)):
+                    var bs2 = _absum(lora[s].ad[i].b)
+                    b_absum += bs2
+                    if bs2 > 0.0:
+                        b_nonzero += 1
         print_trainer_progress(
-            String("SDXL-lora"), k, run_steps, 1,
+            progress_label, k, run_steps, 1,
             loss, Float64(gn_before), secs, 0.0,
             Float64(t1 - train_start) / 1.0e9,
         )
@@ -716,20 +1252,38 @@ def main() raises:
             var prefixes = sdxl_st_prefixes()
             for s in range(N_ST):
                 var save_path = sdxl_output_lora_path_for_st(train_cfg, k, s)
-                _ = save_sdxl_lora(lora[s], prefixes[s], save_path, ctx)
-                var state_path = save_path + String(".state.safetensors")
-                _ = save_sdxl_lora_state(lora[s], prefixes[s], state_path, ctx)
+                if lokr_active:
+                    _ = save_flat_lokr(lokr_sets[s], save_path, ctx)
+                elif loha_active:
+                    _ = save_flat_loha(loha_sets[s], save_path, ctx)
+                elif dora_active:
+                    _ = save_flat_dora(dora_sets[s], save_path, ctx)
+                elif oft_active:
+                    _ = save_flat_oft(oft_sets[s], save_path, ctx)
+                else:
+                    _ = save_sdxl_lora(lora[s], prefixes[s], save_path, ctx)
+                    var state_path = save_path + String(".state.safetensors")
+                    _ = save_sdxl_lora_state(lora[s], prefixes[s], state_path, ctx)
             saved_this_step = True
-            print("[SDXL-lora] save_state step=", k, " per-ST files=", N_ST)
+            print("[SDXL-lycoris] save step=", k, " per-ST files=", N_ST)
         if sample_enabled and should_sample_completed_step(sample_cadence, k):
             if sdxl_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var sample_prefixes = sdxl_st_prefixes()
                 for s in range(N_ST):
                     var sample_path = sdxl_output_lora_path_for_st(train_cfg, k, s)
-                    _ = save_sdxl_lora(lora[s], sample_prefixes[s], sample_path, ctx)
-                    var sample_state = sample_path + String(".state.safetensors")
-                    _ = save_sdxl_lora_state(lora[s], sample_prefixes[s], sample_state, ctx)
-                print("[SDXL-lora] save_before_sample step=", k, " per-ST files=", N_ST)
+                    if lokr_active:
+                        _ = save_flat_lokr(lokr_sets[s], sample_path, ctx)
+                    elif loha_active:
+                        _ = save_flat_loha(loha_sets[s], sample_path, ctx)
+                    elif dora_active:
+                        _ = save_flat_dora(dora_sets[s], sample_path, ctx)
+                    elif oft_active:
+                        _ = save_flat_oft(oft_sets[s], sample_path, ctx)
+                    else:
+                        _ = save_sdxl_lora(lora[s], sample_prefixes[s], sample_path, ctx)
+                        var sample_state = sample_path + String(".state.safetensors")
+                        _ = save_sdxl_lora_state(lora[s], sample_prefixes[s], sample_state, ctx)
+                print("[SDXL-lycoris] save_before_sample step=", k, " per-ST files=", N_ST)
             print(
                 "[cadence] sample due at completed_step=", k,
                 " sample_file=", sample_cadence.sample_definition_file_name,
@@ -744,27 +1298,48 @@ def main() raises:
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
     var b_absum_final = Float32(0.0)
-    for s in range(N_ST):
-        for i in range(len(lora[s].ad)):
-            b_absum_final += _absum(lora[s].ad[i].b)
+    if lokr_active:
+        for s in range(N_ST):
+            b_absum_final += Float32(flat_lokr_zero_leg_l1(lokr_sets[s]))
+    elif loha_active:
+        for s in range(N_ST):
+            b_absum_final += Float32(flat_loha_zero_leg_l1(loha_sets[s]))
+    elif dora_active:
+        for s in range(N_ST):
+            b_absum_final += Float32(flat_dora_zero_leg_l1(dora_sets[s]))
+    elif oft_active:
+        for s in range(N_ST):
+            b_absum_final += Float32(flat_oft_vec_l1(oft_sets[s]))
+    else:
+        for s in range(N_ST):
+            for i in range(len(lora[s].ad)):
+                b_absum_final += _absum(lora[s].ad[i].b)
     var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0)
     if trains and (last_loss == last_loss):
-        print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
+        var train_label = String("LyCORIS zero-leg") if carrier_active else String("LoRA-B")
+        print("RESULT: REAL run OK — ", train_label, " grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         # save each ST's adapters under its real prefix (kohya-loadable PEFT).
         var prefixes = sdxl_st_prefixes()
         for s in range(N_ST):
             var save_path = sdxl_output_lora_path_for_st(train_cfg, run_steps, s)
-            _ = save_sdxl_lora(lora[s], prefixes[s], save_path, ctx)
-            var state_path = save_path + String(".state.safetensors")
-            _ = save_sdxl_lora_state(lora[s], prefixes[s], state_path, ctx)
-        print("[SDXL-lora] save_state step=", run_steps, " per-ST files=", N_ST)
+            if lokr_active:
+                _ = save_flat_lokr(lokr_sets[s], save_path, ctx)
+            elif loha_active:
+                _ = save_flat_loha(loha_sets[s], save_path, ctx)
+            elif dora_active:
+                _ = save_flat_dora(dora_sets[s], save_path, ctx)
+            elif oft_active:
+                _ = save_flat_oft(oft_sets[s], save_path, ctx)
+            else:
+                _ = save_sdxl_lora(lora[s], prefixes[s], save_path, ctx)
+                var state_path = save_path + String(".state.safetensors")
+                _ = save_sdxl_lora_state(lora[s], prefixes[s], state_path, ctx)
+        print("[SDXL-lycoris] save step=", run_steps, " per-ST files=", N_ST)
     else:
         print("RESULT: FAIL trains=", trains)
 
-
-from std.os import listdir, makedirs
 def _list_safetensors(dir: String) raises -> List[String]:
     var raw = listdir(dir)
     var fs = List[String]()

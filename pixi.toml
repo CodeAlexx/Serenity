@@ -13,7 +13,10 @@ version = "0.0.1"
 
 [tasks]
 build-mojoui = "make -C /home/alex/MojoUI/c_floor"
-ideogram4-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm src/serenity_trainer/trainer/Ideogram4LiveTrainer.mojo -o target/serenity_ideogram4_live_trainer"
+# Ideogram4 inline sampler uses the shared forward-only cuDNN SDPA shim in its
+# no-save sample stack, so the runner needs the same CUDA/cshim link+RUNPATH set
+# as the flash-backed config runners.
+ideogram4-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/Ideogram4LiveTrainer.mojo -o target/serenity_ideogram4_live_trainer"
 # Klein 9B (UI wave 2, 2026-06-12): the UI klein runner is now the config-
 # driven serenitymojo train_klein_real (argv: <train_config.json> <steps>) —
 # it consumes the T1 levers (loss/optimizer/EMA/caption-dropout) the UI
@@ -81,6 +84,10 @@ flux-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/al
 # cuDNN is unused here (see serenitymojo/ops/cshim/build.sh). The old task linked
 # only -lm and never linked the shim, so it failed on flame_cudnn_sdpa_* symbols.
 zimage-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_zimage_real.mojo -o target/serenity_zimage_live_trainer"
+# Krea-2 Raw lives in mojodiffusion as the shared model/runtime vertical. Serenity
+# builds it into a live trainer binary and launches argv:
+#   <cache.safetensors> <steps> <train_config.json>
+krea2-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib /home/alex/mojodiffusion/serenitymojo/models/krea2/train_krea2.mojo -o target/serenity_krea2_live_trainer"
 # Pulled into serenity-trainer (2026-06-23): the l2p trainer DRIVER now lives
 # here (src/serenity_trainer/trainer/train_l2p_real.mojo) and uses serenitymojo
 # ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link

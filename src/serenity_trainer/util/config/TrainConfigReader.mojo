@@ -151,11 +151,20 @@ def _adapter_algo_int(s: String) raises -> Int:
         return 7
     elif s == "loha" or s == "LOHA":
         return 2
+    elif s == "dora" or s == "DORA":
+        return 3
     elif s == "lokr" or s == "LOKR":
         return 4
+    elif s == "oft" or s == "OFT":
+        return 5
+    elif s == "boft" or s == "BOFT":
+        raise Error(
+            "JSON config: adapter algorithm 'boft' is intentionally unsupported; "
+            + "expected lora|locon|loha|lokr|dora|oft"
+        )
     raise Error(
         String("JSON config: unknown adapter algorithm '") + s
-        + "' (expected lora|locon|loha|lokr)"
+        + "' (expected lora|locon|loha|lokr|dora|oft)"
     )
 
 

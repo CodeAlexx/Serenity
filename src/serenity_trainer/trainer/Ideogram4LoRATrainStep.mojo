@@ -62,6 +62,7 @@ from serenity_trainer.model.Ideogram4LoRABlock import (
     ideogram4_stack_lora_backward,
     ideogram4_stack_lora_backward_graph,
     ideogram4_stack_lora_forward_resident,
+    ideogram4_stack_lora_forward_resident_nosave,
     ideogram4_stack_lora_backward_resident,
     ideogram4_stack_lora_backward_graph_resident,
 )
@@ -98,6 +99,7 @@ from serenity_trainer.modelSampler.Ideogram4Sampler import (
     IDEOGRAM4_MROPE_SECTION_1,
     IDEOGRAM4_MROPE_SECTION_2,
     IDEOGRAM4_MROPE_THETA,
+    IDEOGRAM4_IMAGE_OFFSET,
     IDEOGRAM4_LLM_TOKEN_INDICATOR,
     IDEOGRAM4_OUTPUT_IMAGE_INDICATOR,
 )
@@ -307,6 +309,98 @@ def ideogram4_lora_embed_resident(
     return Ideogram4EmbedOut(h^, adaln_input^)
 
 
+def ideogram4_lora_embed_resident_split[
+    NT: Int, GH: Int, GW: Int
+](
+    rw: Ideogram4Weights,
+    noisy_latents: Tensor,
+    llm_features: Tensor,
+    model_t: Tensor,
+    hidden: Int,
+    ctx: DeviceContext,
+    text_len: Int = NT,
+) raises -> Ideogram4EmbedOut:
+    comptime NIMG = GH * GW
+    comptime SEQ = NT + NIMG
+
+    var real_len = text_len
+    if real_len > NT:
+        real_len = NT
+    if real_len < 0:
+        real_len = 0
+
+    var text_mask_v = List[Float32]()
+    var img_ids = List[Int]()
+    for i in range(NT):
+        if i < real_len:
+            text_mask_v.append(Float32(1.0))
+        else:
+            text_mask_v.append(Float32(0.0))
+        img_ids.append(0)
+    for _ in range(NIMG):
+        img_ids.append(1)
+    var text_mask = Tensor.from_host(text_mask_v^, [1, NT, 1], STDtype.BF16, ctx)
+
+    var text_h: Tensor
+    if real_len == 0:
+        text_h = zeros_device([1, NT, hidden], STDtype.BF16, ctx)
+    else:
+        var llm_bf = cast_tensor(llm_features, STDtype.BF16, ctx)
+        var llm = mul(llm_bf, text_mask, ctx)
+        llm = rms_norm(llm, rw.w(String("llm_cond_norm.weight")), Float32(1.0e-6), ctx)
+        var lcpw = _resident_w_fp8(rw, String("llm_cond_proj.weight"), ctx)
+        text_h = mul(
+            linear(
+                llm,
+                lcpw,
+                Optional[Tensor](rw.w(String("llm_cond_proj.bias")).clone(ctx)),
+                ctx,
+            ),
+            text_mask,
+            ctx,
+        )
+
+    var img_perm = permute(noisy_latents, [0, 2, 3, 1], ctx)
+    var image_tokens = reshape(
+        img_perm, [1, NIMG, IDEOGRAM4_PACKED_CHANNELS], ctx
+    )
+    var x_bf = cast_tensor(image_tokens, STDtype.BF16, ctx)
+    var ipw = _resident_w_fp8(rw, String("input_proj.weight"), ctx)
+    var image_h = linear(
+        x_bf, ipw, Optional[Tensor](rw.w(String("input_proj.bias")).clone(ctx)), ctx
+    )
+
+    var miw = _resident_w_fp8(rw, String("t_embedding.mlp_in.weight"), ctx)
+    var mow = _resident_w_fp8(rw, String("t_embedding.mlp_out.weight"), ctx)
+    var t_cond = reshape(
+        ideogram4_t_embedding(
+            model_t,
+            hidden,
+            miw,
+            rw.w(String("t_embedding.mlp_in.bias")).clone(ctx),
+            mow,
+            rw.w(String("t_embedding.mlp_out.bias")).clone(ctx),
+            ctx,
+        ),
+        [1, 1, hidden], ctx,
+    )
+    var apw = _resident_w_fp8(rw, String("adaln_proj.weight"), ctx)
+    var adaln_input = silu(
+        linear(t_cond, apw, Optional[Tensor](rw.w(String("adaln_proj.bias")).clone(ctx)), ctx),
+        ctx,
+    )
+
+    var h = concat(1, ctx, text_h, image_h)
+    var iemb = reshape(
+        gather_rows(rw.w(String("embed_image_indicator.weight")), img_ids, ctx),
+        [1, SEQ, hidden],
+        ctx,
+    )
+    h = add(h, iemb, ctx)
+
+    return Ideogram4EmbedOut(h^, adaln_input^)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FINAL forward (FROZEN) — dit lines 295-300 (pre-final) + 317-320 (final linear).
 #   fscale = 1 + final_layer.adaln_modulation(silu(adaln_input))    [1,1,Hidden]
@@ -506,6 +600,91 @@ def ideogram4_lora_train_forward_resident[
         velocity^, stack_fwd^, h^, fin.fscale.clone(ctx), fin.flw.clone(ctx),
         emb.adaln_input.clone(ctx), cosf^, sinf^,
     )
+
+
+def ideogram4_lora_sample_position_ids[
+    NT: Int, GH: Int, GW: Int
+](
+    ctx: DeviceContext,
+    text_len: Int = NT,
+) raises -> Tensor:
+    comptime NIMG = GH * GW
+    comptime SEQ = NT + NIMG
+
+    var real_len = text_len
+    if real_len > NT:
+        real_len = NT
+    if real_len < 0:
+        real_len = 0
+
+    var pos_host = List[Float32]()
+    for i in range(NT):
+        var p = i
+        if i >= real_len:
+            p = real_len - 1
+        if p < 0:
+            p = 0
+        pos_host.append(Float32(p))
+        pos_host.append(Float32(p))
+        pos_host.append(Float32(p))
+    for tok in range(NIMG):
+        var h = tok // GW
+        var w = tok % GW
+        pos_host.append(Float32(IDEOGRAM4_IMAGE_OFFSET))
+        pos_host.append(Float32(h + IDEOGRAM4_IMAGE_OFFSET))
+        pos_host.append(Float32(w + IDEOGRAM4_IMAGE_OFFSET))
+    return Tensor.from_host(pos_host^, [1, SEQ, 3], STDtype.F32, ctx)
+
+
+def ideogram4_lora_sample_velocity_resident[
+    NT: Int, GH: Int, GW: Int
+](
+    rw: Ideogram4Weights,
+    noisy_latents: Tensor,
+    t_flow: Float32,
+    llm_features: Tensor,
+    loras: Ideogram4LoraSet,
+    ctx: DeviceContext,
+    text_len: Int = NT,
+) raises -> Tensor:
+    comptime NIMG = GH * GW
+    comptime SEQ = NT + NIMG
+
+    var tv = List[Float32]()
+    tv.append(Float32(1.0) - t_flow)
+    var model_t = Tensor.from_host(tv^, [1], STDtype.F32, ctx)
+
+    var sec = List[Int]()
+    sec.append(IDEOGRAM4_MROPE_SECTION_0)
+    sec.append(IDEOGRAM4_MROPE_SECTION_1)
+    sec.append(IDEOGRAM4_MROPE_SECTION_2)
+    var position_ids = ideogram4_lora_sample_position_ids[NT, GH, GW](
+        ctx, text_len
+    )
+    var cs = build_ideogram4_mrope(
+        position_ids, IDEOGRAM4_HEAD_DIM, sec, IDEOGRAM4_MROPE_THETA,
+        ctx, STDtype.BF16,
+    )
+    var cosf = cs[0].clone(ctx)
+    var sinf = cs[1].clone(ctx)
+
+    var emb = ideogram4_lora_embed_resident_split[NT, GH, GW](
+        rw, noisy_latents, llm_features, model_t, IDEOGRAM4_HIDDEN, ctx,
+        text_len,
+    )
+
+    var h = ideogram4_stack_lora_forward_resident_nosave[
+        SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+        IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+    ](emb.x_in, emb.adaln_input, cosf, sinf, rw, loras, ctx)
+
+    var fin = ideogram4_lora_final_forward_resident(rw, h, emb.adaln_input, ctx)
+
+    var image_velocity = slice(fin.out, 1, NT, NIMG, ctx)
+    var iv4 = reshape(image_velocity, [1, GH, GW, IDEOGRAM4_PACKED_CHANNELS], ctx)
+    var iv = permute(iv4, [0, 3, 1, 2], ctx)
+    var velocity = mul_scalar(iv, Float32(-1.0), ctx)
+    return velocity^
 
 
 # ──────────────────────────────────────────────────────────────────────────────

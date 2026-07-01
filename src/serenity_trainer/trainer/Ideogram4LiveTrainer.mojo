@@ -17,16 +17,19 @@
 #                             emits for the config-driven runners; carries
 #                             loss_fn/min_snr_gamma_flow/ema_*/optimizer*/
 #                             caption_dropout_prob; "-" or absent = all
-#                             default-off). NOTE (gap, documented):
-#                             TrainerRuntimeBridge currently launches this
-#                             runner with only argv 1-9, so the UI's lever
-#                             widgets do NOT reach ideogram4 until the bridge
-#                             appends argv 10/11 (bridge is not owned by this
-#                             wiring pass). The recipe scalars argv already
-#                             carries (lr/rank/alpha/steps/save) keep winning
-#                             over the JSON — the JSON contributes ONLY the
-#                             lever keys (Ideogram4LoRATrainer syncs the shared
-#                             scalars from the argv-built TrainConfig).
+#                             default-off).
+#  12 sample_every_steps     (0 or "-" disables inline sampling)
+#  13 sample_steps           (optional, default Ideogram4LoRATrainer setting)
+#  14 sample_cfg             (optional, default Ideogram4LoRATrainer setting)
+#  15 sample_seed            (optional, default Ideogram4LoRATrainer setting)
+#  16 resume_lora_path       (optional; "-" = initialize a new LoRA)
+#  17 sample_prompt_json     (optional JSON string or path to a JSON prompt file)
+#  18 sample_resolution      (optional square px: 512, 1024, or 2048)
+#
+# The recipe scalars argv already carries (lr/rank/alpha/steps/save) keep winning
+# over the JSON — the JSON contributes ONLY the lever keys. Sampling is explicit
+# argv so the UI can enable the resident inline sampler without forcing a levers
+# JSON just to carry cadence.
 #
 # The UI launches this as a background process. Progress is written as
 # Serenity-shaped callback lines so TrainerRuntimeBridge can tail the file.
@@ -42,6 +45,7 @@ from serenity_trainer.trainer.Ideogram4LoRATrainer import (
     train_ideogram4_lora_from_cache,
 )
 from serenity_trainer.util.config.TrainConfig import TrainConfig
+from serenity_trainer.util.config.TrainConfigReader import _read_file_bytes
 
 
 comptime DEFAULT_TRANSFORMER = "/home/alex/.serenity/models/ideogram-4-fp8/transformer/diffusion_pytorch_model.safetensors"
@@ -68,6 +72,21 @@ def _append_status(path: String, text: String) raises:
     )
     f.write("\n")
     f.close()
+
+
+def _looks_like_json_prompt(prompt: String) -> Bool:
+    var bs = prompt.as_bytes()
+    for i in range(prompt.byte_length()):
+        var ch = bs[i]
+        if ch == 0x20 or ch == 0x09 or ch == 0x0A or ch == 0x0D:
+            continue
+        return ch == 0x7B or ch == 0x5B
+    return False
+
+
+def _read_text_file(path: String) raises -> String:
+    var bytes = _read_file_bytes(path)
+    return String(unsafe_from_utf8=bytes)
 
 
 def main() raises:
@@ -141,10 +160,61 @@ def main() raises:
         if v.byte_length() > 0 and v != String("-"):
             levers_config_path = v^
 
+    # Inline sample-during-training controls (argv 12-15). Defaults keep the
+    # resident sampler disabled unless the launcher explicitly provides cadence.
+    var sample_every_steps = 0
+    if len(args) > 12:
+        var v = String(args[12])
+        if v.byte_length() > 0 and v != String("-"):
+            sample_every_steps = atol(v)
+
+    var sample_steps = 0
+    if len(args) > 13:
+        var v = String(args[13])
+        if v.byte_length() > 0 and v != String("-"):
+            sample_steps = atol(v)
+
+    var sample_cfg = Float32(0.0)
+    if len(args) > 14:
+        var v = String(args[14])
+        if v.byte_length() > 0 and v != String("-"):
+            sample_cfg = Float32(atof(v))
+
+    var sample_seed = UInt64(0)
+    var sample_seed_set = False
+    if len(args) > 15:
+        var v = String(args[15])
+        if v.byte_length() > 0 and v != String("-"):
+            sample_seed = UInt64(atol(v))
+            sample_seed_set = True
+
+    var resume_lora_path = String("")
+    if len(args) > 16:
+        var v = String(args[16])
+        if v.byte_length() > 0 and v != String("-"):
+            resume_lora_path = v^
+
+    var sample_prompt_json = String("")
+    if len(args) > 17:
+        var v = String(args[17])
+        if v.byte_length() > 0 and v != String("-"):
+            if _looks_like_json_prompt(v):
+                sample_prompt_json = v^
+            else:
+                sample_prompt_json = _read_text_file(v)
+
+    var sample_resolution = 0
+    if len(args) > 18:
+        var v = String(args[18])
+        if v.byte_length() > 0 and v != String("-"):
+            sample_resolution = atol(v)
+
     if steps < 1:
         steps = 1
     if save_every_steps < 0:
         save_every_steps = 0
+    if sample_every_steps < 0:
+        sample_every_steps = 0
 
     makedirs(output, exist_ok=True)
     _clear_progress(progress_file)
@@ -181,6 +251,35 @@ def main() raises:
     run_cfg.checkpoint_every_steps = save_every_steps
     run_cfg.progress_file_path = progress_file.copy()
     run_cfg.caption_dropout_prob = caption_dropout_prob
+    run_cfg.resume_lora_path = resume_lora_path.copy()
+    run_cfg.sample_every_steps = sample_every_steps
+    if sample_steps > 0:
+        run_cfg.sample_steps = sample_steps
+    if sample_cfg > Float32(0.0):
+        run_cfg.sample_cfg = sample_cfg
+    if sample_seed_set:
+        run_cfg.sample_seed = sample_seed
+    if sample_resolution > 0:
+        run_cfg.sample_resolution = sample_resolution
+    if sample_prompt_json.byte_length() > 0:
+        run_cfg.sample_prompts.append(sample_prompt_json.copy())
+    if run_cfg.resume_lora_path.byte_length() > 0:
+        print("[Ideogram4-lora] resume LoRA ", run_cfg.resume_lora_path)
+    if run_cfg.sample_every_steps > 0:
+        print(
+            "[Ideogram4-lora] inline sampler every ",
+            run_cfg.sample_every_steps,
+            " steps | sample_steps ",
+            run_cfg.sample_steps,
+            " | sample_cfg ",
+            run_cfg.sample_cfg,
+            " | sample_seed ",
+            run_cfg.sample_seed,
+            " | sample_resolution ",
+            run_cfg.sample_resolution,
+            " | prompt_json_count ",
+            len(run_cfg.sample_prompts),
+        )
     if levers_config_path.byte_length() > 0:
         # Lever keys (loss_fn / min_snr_gamma_flow / ema_* / optimizer* /
         # caption_dropout_prob fallback) come from the JSON; the shared recipe

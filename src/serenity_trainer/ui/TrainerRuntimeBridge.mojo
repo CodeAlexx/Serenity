@@ -204,6 +204,14 @@ def _is_hidream_target(target: String) -> Bool:
     return target == String("hidream")
 
 
+def _is_krea2_target(target: String) -> Bool:
+    # Krea-2 Raw: mojodiffusion train_krea2.mojo built into
+    # target/serenity_krea2_live_trainer. Positional argv:
+    #   <cache.safetensors> <steps> <train_config.json>
+    # Progress streams on stdout like the config-driven runners.
+    return target == String("krea2")
+
+
 def _backend_label(target: String) -> String:
     if target == String("klein"):
         return String("Klein 9B")
@@ -211,6 +219,8 @@ def _backend_label(target: String) -> String:
         return String("Ideogram4")
     if _is_hidream_target(target):
         return String("HiDream O1")
+    if _is_krea2_target(target):
+        return String("Krea 2")
     if target == String("chroma"):
         return String("Chroma1 HD")
     if target == String("ernie"):
@@ -227,19 +237,19 @@ def _backend_label(target: String) -> String:
 
 
 def _runner_path(target: String) -> String:
-    if _is_config_runner_target(target) or _is_hidream_target(target):
+    if _is_config_runner_target(target) or _is_hidream_target(target) or _is_krea2_target(target):
         return String("target/serenity_") + target.copy() + String("_live_trainer")
     return String(IDEOGRAM4_LIVE_RUNNER)
 
 
 def _pid_path(target: String) -> String:
-    if _is_config_runner_target(target) or _is_hidream_target(target):
+    if _is_config_runner_target(target) or _is_hidream_target(target) or _is_krea2_target(target):
         return String("target/serenity_") + target.copy() + String("_live_trainer.pid")
     return String(IDEOGRAM4_LIVE_PID)
 
 
 def _log_path(target: String) -> String:
-    if _is_config_runner_target(target) or _is_hidream_target(target):
+    if _is_config_runner_target(target) or _is_hidream_target(target) or _is_krea2_target(target):
         # Config-driven runners stream progress on stdout only; tee their
         # stdout straight into the polled progress file so the legacy
         # progress-line bridge picks it up live.
@@ -249,6 +259,20 @@ def _log_path(target: String) -> String:
 
 def _runner_train_config_path(target: String) -> String:
     return String("target/serenity_") + target.copy() + String("_train_config.json")
+
+
+def _ideogram4_sample_prompt_path() -> String:
+    return String("target/serenity_ideogram4_sample_prompt.json")
+
+
+def _write_ideogram4_sample_prompt(cfg: TrainerUIConfig) raises -> String:
+    if len(cfg.samples) == 0:
+        raise Error("Ideogram4 inline sampling needs a JSON sample prompt")
+    var path = _ideogram4_sample_prompt_path()
+    var f = open(path.copy(), "w")
+    f.write(cfg.samples[0].prompt.copy())
+    f.close()
+    return path^
 
 
 def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
@@ -265,8 +289,22 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
     if save_every < 0:
         save_every = 0
     var target = cfg.backend_target.copy()
+    var ideogram4_sample_prompt_arg = String("-")
+    if target == String("ideogram4") and Int(cfg.sample_after) > 0 and len(cfg.samples) > 0:
+        ideogram4_sample_prompt_arg = _ideogram4_sample_prompt_path()
     var args: String
-    if _is_config_runner_target(target):
+    if _is_krea2_target(target):
+        # train_krea2 keeps the cache path positional because the cache is the
+        # primary dataset artifact. The TrainConfig JSON still carries checkpoint,
+        # VAE, recipe, sampler cadence, workspace, and lever keys.
+        args = (
+            _shell_quote(cfg.cache_dir.copy())
+            + String(" ")
+            + String(steps)
+            + String(" ")
+            + _shell_quote(_runner_train_config_path(target.copy()))
+        )
+    elif _is_config_runner_target(target):
         # serenitymojo train_<m>_real runners: `<train_config.json> <steps>`.
         # The recipe (lr/rank/alpha/steps/save/cache/ckpt) is in the config
         # JSON written at launch by trainer_ui_launch_live_runner.
@@ -317,6 +355,12 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
             # argv 10 = caption_dropout_prob (0.0 default = never drop);
             # argv 11 = levers config JSON path, or "-" when every lever is
             # default-off so default runs stay byte-identical (C13).
+            # argv 12-15 = inline sampler cadence/steps/CFG/seed. Sampling is
+            # not a T1 lever; it is delivered positionally so resident sampling
+            # works even when the lever JSON is skipped.
+            # argv 16 = optional resume LoRA path (UI skip sentinel here).
+            # argv 17 = JSON prompt file for the real inline sampler.
+            # argv 18 = requested square sample resolution.
             + String(" ")
             + String(cfg.caption_dropout)
             + String(" ")
@@ -325,12 +369,33 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
                     cfg, _runner_train_config_path(target.copy())
                 )
             )
+            + String(" ")
+            + String(Int(cfg.sample_after))
+            + String(" ")
+            + String(Int(cfg.sample_steps))
+            + String(" ")
+            + String(cfg.sample_cfg)
+            + String(" ")
+            + String(Int(cfg.seed))
+            + String(" - ")
+            + _shell_quote(ideogram4_sample_prompt_arg)
+            + String(" ")
+            + cfg.resolution.copy()
         )
     var mkdirs = String("")
     if _is_hidream_target(target.copy()):
         # train_hidream_o1_real saves into out_dir without creating it.
         mkdirs = String(
             "mkdir -p /home/alex/mojodiffusion/output/hidream_o1_lora && "
+        )
+    if _is_krea2_target(target.copy()):
+        # train_krea2 saves LoRAs and inline sample PNGs under workspace_dir.
+        mkdirs = (
+            String("mkdir -p ")
+            + _shell_quote(cfg.workspace_dir.copy())
+            + String(" ")
+            + _shell_quote(cfg.workspace_dir.copy() + String("/samples"))
+            + String(" && ")
         )
     if _is_config_runner_target(target.copy()):
         # The config-driven runners save to fixed per-model output dirs and do
@@ -377,7 +442,7 @@ def _live_runner_command(cfg: TrainerUIConfig, rt: TrainerUIRuntime) -> String:
 
 
 def _any_live_runner_active() -> Bool:
-    var rc = _sys_system(String("pgrep -f '^(/home/alex/serenity-trainer/)?target/[s]erenity_(ideogram4|klein|chroma|ernie|anima|sdxl|zimage|l2p|hidream)_live_trainer( |$)' > /dev/null 2>&1"))
+    var rc = _sys_system(String("pgrep -f '^(/home/alex/serenity-trainer/)?target/[s]erenity_(ideogram4|klein|chroma|ernie|anima|sdxl|zimage|l2p|hidream|krea2)_live_trainer( |$)' > /dev/null 2>&1"))
     return rc == 0
 
 
@@ -458,6 +523,7 @@ def trainer_ui_launch_live_runner(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime
         cfg.backend_target != String("ideogram4")
         and not _is_config_runner_target(cfg.backend_target.copy())
         and not _is_hidream_target(cfg.backend_target.copy())
+        and not _is_krea2_target(cfg.backend_target.copy())
     ):
         _append_runtime_log(
             rt,
@@ -481,6 +547,7 @@ def trainer_ui_launch_live_runner(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime
     var needs_runner_config = (
         _is_config_runner_target(rt.backend_target.copy())
         or _is_hidream_target(rt.backend_target.copy())
+        or _is_krea2_target(rt.backend_target.copy())
         # ideogram4: write the levers JSON ONLY when a lever is set — the
         # no-levers launch passes "-" (argv 11 skip sentinel, C13).
         or (
@@ -495,6 +562,14 @@ def trainer_ui_launch_live_runner(cfg: TrainerUIConfig, mut rt: TrainerUIRuntime
         except e:
             _append_runtime_log(rt, String("runner train config write failed: ") + String(e))
             rt.status_text = String("Runner config write failed")
+            return False
+    if rt.backend_target == String("ideogram4") and Int(cfg.sample_after) > 0:
+        try:
+            var prompt_path = _write_ideogram4_sample_prompt(cfg)
+            _append_runtime_log(rt, String("wrote Ideogram4 JSON sample prompt: ") + prompt_path.copy())
+        except e:
+            _append_runtime_log(rt, String("Ideogram4 sample prompt write failed: ") + String(e))
+            rt.status_text = String("Sample prompt write failed")
             return False
     var rc = _sys_system(_live_runner_command(cfg, rt))
     if rc == 0:

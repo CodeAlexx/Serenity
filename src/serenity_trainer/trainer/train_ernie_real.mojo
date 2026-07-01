@@ -72,12 +72,56 @@ from serenitymojo.models.ernie.ernie_stack_lora import (
     ErnieLoraSet, ErnieLoraGrads, build_ernie_lora_set,
     ernie_lora_set_to_device,
     ernie_stack_lora_forward_resident_device, ernie_stack_lora_backward_resident_device,
+    ernie_stack_direct_dora_forward_resident_device,
+    ernie_stack_direct_dora_backward_resident_device,
+    ernie_stack_direct_oft_forward_resident_device,
+    ernie_stack_direct_oft_backward_resident_device,
     ernie_lora_adamw_step, save_ernie_lora,
     save_ernie_lora_state, load_ernie_lora_state,
 )
+from serenitymojo.models.ernie.ernie_lycoris_stack import (
+    ERNIE_LYCORIS_TGT_ATTN,
+    ErnieLoKrSet, empty_ernie_lokr_set, build_ernie_lokr_set,
+    ernie_lokr_carrier_set, ernie_lokr_carrier_total_bytes,
+    ernie_lokr_chain_all, ernie_lokr_adamw_step, ernie_lokr_grad_norm,
+    ernie_lokr_clip_grads, ernie_lokr_zero_leg_l1, save_ernie_lokr,
+    ErnieLoHaSet, empty_ernie_loha_set, build_ernie_loha_set,
+    ernie_loha_carrier_set, ernie_loha_carrier_total_bytes,
+    ernie_loha_chain_all, ernie_loha_adamw_step, ernie_loha_grad_norm,
+    ernie_loha_clip_grads, ernie_loha_zero_leg_l1, save_ernie_loha,
+    ernie_full_delta_carrier_bytes_estimate, ernie_full_delta_preflight,
+    ErnieDoRASet, empty_ernie_dora_set, build_ernie_dora_set_from_checkpoint,
+    ernie_dora_carrier_set, ernie_dora_carrier_total_bytes, ernie_dora_preflight,
+    ernie_dora_chain_all, ernie_dora_adamw_step, ernie_dora_grad_norm,
+    ernie_dora_clip_grads, ernie_dora_zero_leg_l1, save_ernie_dora,
+    ErnieOFTSet, empty_ernie_oft_set, build_ernie_oft_set_from_checkpoint,
+    ernie_oft_carrier_set, ernie_oft_carrier_total_bytes, ernie_oft_preflight,
+    ernie_oft_chain_all, ernie_oft_adamw_step, ernie_oft_grad_norm,
+    ernie_oft_clip_grads, ernie_oft_vec_l1, save_ernie_oft,
+    empty_ernie_direct_dora_set, empty_ernie_direct_oft_set,
+    ernie_direct_dense_carrier_bytes,
+    ernie_direct_dora_preflight, ernie_direct_oft_preflight,
+    build_ernie_direct_dora_set_from_blocks, build_ernie_direct_oft_set,
+    ernie_direct_dora_trainable_bytes, ernie_direct_oft_trainable_bytes,
+    save_ernie_direct_dora, save_ernie_direct_oft,
+)
 from serenitymojo.io.train_config_reader import read_model_config
-from serenitymojo.training.train_config import TrainConfig
-from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
+from serenitymojo.training.train_config import (
+    TrainConfig,
+    TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOCON, TRAIN_ADAPTER_ALGO_LOHA,
+    TRAIN_ADAPTER_ALGO_DORA, TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
+)
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectOFTSet,
+    flat_direct_dora_grad_norm, flat_direct_dora_clip_grads,
+    flat_direct_dora_adamw_step, flat_direct_dora_zero_leg_l1,
+    flat_direct_oft_grad_norm, flat_direct_oft_clip_grads,
+    flat_direct_oft_adamw_step, flat_direct_oft_vec_l1,
+)
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -120,6 +164,8 @@ comptime TEXT_IN = 3072        # REAL Mistral hidden (text_in_dim)
 comptime OUT_CH = 128          # REAL out channels
 comptime NUM_LAYERS = 36       # REAL depth
 comptime EPS = Float32(1e-06)
+comptime ERNIE_OFT_BLOCK_SIZE = 4
+comptime ERNIE_CARRIER_RUNTIME_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 
 # ── cache geometry: latent [1,128,32,32] -> 32x32 = 1024 image tokens ─────────
 comptime IMG_H = 32
@@ -259,6 +305,28 @@ def _count_nonfinite(v: List[Float32]) -> Int:
         if not isfinite(v[i]):
             bad += 1
     return bad
+
+
+struct _LossGrad(Movable):
+    var loss: Float32
+    var d_out: List[Float32]
+
+    def __init__(out self, loss: Float32, var d_out: List[Float32]):
+        self.loss = loss
+        self.d_out = d_out^
+
+
+def _mse_loss_grad(pred: List[Float32], target: List[Float32]) raises -> _LossGrad:
+    if len(pred) != len(target):
+        raise Error("_mse_loss_grad: pred/target length mismatch")
+    var sse = Float64(0.0)
+    var d_out = List[Float32]()
+    var inv_n = Float32(2.0) / Float32(len(pred))
+    for i in range(len(pred)):
+        var diff = pred[i] - target[i]
+        sse += Float64(diff) * Float64(diff)
+        d_out.append(diff * inv_n)
+    return _LossGrad(Float32(sse / Float64(len(pred))), d_out^)
 
 
 # ── deterministic gaussian noise (Box-Muller on a PCG stream), F32 ────────────
@@ -436,7 +504,49 @@ def _step_lora_path(save_path: String, step: Int) -> String:
 
 
 def validate_ernie_train_config(cfg: TrainConfig) raises:
-    require_lora_or_locon_linear(cfg, String("ERNIE"))
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[Ernie-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
+        print("[Ernie-lokr] network_algorithm=lokr: using carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
+        print("[Ernie-loha] network_algorithm=loha: using carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA or cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
+        var target_mode = ERNIE_LYCORIS_TGT_ATTN if cfg.lokr_targets == ERNIE_LYCORIS_TGT_ATTN else 2
+        var dense_bytes = ernie_direct_dense_carrier_bytes(
+            NUM_LAYERS, D, F, cfg.lokr_targets,
+        )
+        if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA:
+            var direct_bytes = ernie_direct_dora_preflight(
+                NUM_LAYERS, D, F, cfg.lora_rank, target_mode,
+                LOKR_CARRIER_MAX_DEVICE_BYTES,
+            )
+            print(
+                "[Ernie-dora] network_algorithm=dora: using direct W_eff substitution",
+                " dense_carrier_bytes=", dense_bytes,
+                " direct_trainable_bytes=", direct_bytes,
+                " budget=", LOKR_CARRIER_MAX_DEVICE_BYTES,
+            )
+        else:
+            var direct_bytes = ernie_direct_oft_preflight(
+                NUM_LAYERS, D, F, ERNIE_OFT_BLOCK_SIZE, target_mode,
+                LOKR_CARRIER_MAX_DEVICE_BYTES,
+            )
+            print(
+                "[Ernie-oft] network_algorithm=oft: using direct W_eff substitution",
+                " dense_carrier_bytes=", dense_bytes,
+                " direct_trainable_bytes=", direct_bytes,
+                " budget=", LOKR_CARRIER_MAX_DEVICE_BYTES,
+            )
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("ERNIE trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("ERNIE trainer: full finetune is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("ERNIE trainer: network_algorithm=")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+        )
     if cfg.name != String("ernie_image"):
         raise Error(String("ERNIE trainer config requires model_type=ernie_image, got ") + cfg.name)
     if cfg.checkpoint == String(""):
@@ -535,6 +645,57 @@ def _save_lora_and_state(
     print("[Ernie-lora] save_state step=", step, " path=", state_path, " pairs=", nstate)
 
 
+def _require_ernie_carrier_runtime_vram(
+    label: String, carrier_bytes: Int, free_after_blocks: UInt,
+) raises:
+    var free_bytes = Int(free_after_blocks)
+    var need = carrier_bytes + ERNIE_CARRIER_RUNTIME_RESERVE_BYTES
+    if need > free_bytes:
+        raise Error(
+            String("ERNIE ") + label
+            + String(": full-delta carrier needs ")
+            + String(carrier_bytes)
+            + String(" device bytes plus ")
+            + String(ERNIE_CARRIER_RUNTIME_RESERVE_BYTES)
+            + String(" bytes runtime reserve, but only ")
+            + String(free_bytes)
+            + String(" bytes were free after resident BF16 block load. This does not meet the 24 GB target; use LoKr/LoHa/LoRA or lower DoRA/OFT to a direct W_eff path.")
+        )
+
+
+def _save_adapter_for_algo(
+    lora: ErnieLoraSet,
+    lokr_masters: ErnieLoKrSet,
+    loha_masters: ErnieLoHaSet,
+    dora_masters: ErnieDoRASet,
+    oft_masters: ErnieOFTSet,
+    direct_dora: FlatDirectDoRASet,
+    direct_oft: FlatDirectOFTSet,
+    lokr_active: Bool,
+    loha_active: Bool,
+    dora_active: Bool,
+    oft_active: Bool,
+    lora_path: String,
+    step: Int,
+    ctx: DeviceContext,
+) raises:
+    _mkdir_parent(lora_path)
+    if lokr_active:
+        var npairs = save_ernie_lokr(lokr_masters, lora_path, ctx)
+        print("[Ernie-lokr] save step=", step, " path=", lora_path, " modules=", npairs)
+    elif loha_active:
+        var npairs = save_ernie_loha(loha_masters, lora_path, ctx)
+        print("[Ernie-loha] save step=", step, " path=", lora_path, " modules=", npairs)
+    elif dora_active:
+        var npairs = save_ernie_direct_dora(direct_dora, lora_path, ctx)
+        print("[Ernie-dora-direct] save step=", step, " path=", lora_path, " modules=", npairs)
+    elif oft_active:
+        var npairs = save_ernie_direct_oft(direct_oft, lora_path, ctx)
+        print("[Ernie-oft-direct] save step=", step, " path=", lora_path, " modules=", npairs)
+    else:
+        _save_lora_and_state(lora, lora_path, step, ctx)
+
+
 def _sample_ernie_prompt(
     base: ErnieStackBase,
     blocks: List[ErnieBlockWeights],
@@ -617,6 +778,16 @@ def main() raises:
         run_steps = 25
     if run_steps < 1:
         raise Error("run_steps must be >= 1")
+    if (
+        mode == String("resume_smoke")
+        and (
+            train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+            or train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+            or train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+            or train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+        )
+    ):
+        raise Error("ERNIE LyCORIS resume_smoke is not wired; carrier runs save adapter weights but no master optimizer-state sidecar")
 
     var sample_cadence = ernie_sample_cadence_from_train_config(cfg_path, train_cfg)
     var sample_enabled = ernie_sampling_enabled(sample_cadence)
@@ -627,6 +798,11 @@ def main() raises:
     if sample_enabled:
         if sample_cadence.sample_definition_file_name == String(""):
             raise Error("ERNIE trainer sampling requires validation_prompts_file or sample_definition_file_name")
+        if (
+            train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+            or train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+        ):
+            raise Error("ERNIE direct DoRA/OFT sample-during-training is not wired; disable sample cadence for this runtime gate")
         sample_cfg = read_sample_prompt_config(sample_cadence.sample_definition_file_name)
         if len(sample_cfg.prompts) == 0:
             raise Error("ERNIE trainer requires at least one validation prompt when sampling is enabled")
@@ -673,8 +849,112 @@ def main() raises:
     var lora = build_ernie_lora_set(NUM_LAYERS, D, F, train_cfg.lora_rank, train_cfg.lora_alpha)
     var baseline_lora = build_ernie_lora_set(NUM_LAYERS, D, F, train_cfg.lora_rank, train_cfg.lora_alpha)
     var n_adapters = NUM_LAYERS * ERNIE_SLOTS
+    var lokr_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var dora_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var direct_active = dora_active or oft_active
+    var carrier_active = lokr_active or loha_active
+    var direct_targets = ERNIE_LYCORIS_TGT_ATTN if train_cfg.lokr_targets == ERNIE_LYCORIS_TGT_ATTN else 2
+    var lokr_masters = empty_ernie_lokr_set()
+    var loha_masters = empty_ernie_loha_set()
+    var dora_masters = empty_ernie_dora_set()
+    var oft_masters = empty_ernie_oft_set()
+    var direct_dora = empty_ernie_direct_dora_set()
+    var direct_oft = empty_ernie_direct_oft_set()
+    if lokr_active:
+        lokr_masters = build_ernie_lokr_set(
+            NUM_LAYERS, D, F,
+            train_cfg.lora_rank, train_cfg.lora_alpha,
+            train_cfg.lokr_factor, train_cfg.lokr_factor_attn,
+            train_cfg.lokr_factor_ff,
+            train_cfg.lokr_decompose_both, train_cfg.lokr_full_matrix,
+            train_cfg.lokr_targets, UInt64(700301),
+        )
+        var carrier_bytes = ernie_lokr_carrier_total_bytes(lokr_masters, D, F)
+        print("[Ernie-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("ERNIE LoKr: carrier set needs ")
+                + String(carrier_bytes)
+                + String(" bytes (> budget). Use a smaller lokr_factor/rank or restrict lokr_targets.")
+            )
+        lora = ernie_lokr_carrier_set(lokr_masters, D, F)
+        print("[Ernie-lokr] carrier set materialized:", len(lora.ad), "adapters")
+    elif loha_active:
+        loha_masters = build_ernie_loha_set(
+            NUM_LAYERS, D, F,
+            train_cfg.lora_rank, train_cfg.lora_alpha,
+            train_cfg.lokr_targets, UInt64(800301),
+        )
+        var carrier_bytes = ernie_loha_carrier_total_bytes(loha_masters, D, F)
+        print("[Ernie-loha] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("ERNIE LoHa: carrier set needs ")
+                + String(carrier_bytes)
+                + String(" bytes (> budget). Reduce lora_rank or restrict lokr_targets.")
+            )
+        lora = ernie_loha_carrier_set(loha_masters, D, F)
+        print("[Ernie-loha] carrier set materialized:", len(lora.ad), "adapters")
+    elif dora_active:
+        var dense_bytes = ernie_direct_dense_carrier_bytes(
+            NUM_LAYERS, D, F, direct_targets,
+        )
+        var direct_bytes = ernie_direct_dora_preflight(
+            NUM_LAYERS, D, F, train_cfg.lora_rank, direct_targets,
+            LOKR_CARRIER_MAX_DEVICE_BYTES,
+        )
+        print("[Ernie-dora-direct] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES,
+              " targets:", direct_targets)
+        direct_dora = build_ernie_direct_dora_set_from_blocks(
+            blocks, D, F, train_cfg.lora_rank, train_cfg.lora_alpha,
+            direct_targets, UInt64(900301), ctx,
+        )
+        print("[Ernie-dora-direct] trainable bytes:",
+              ernie_direct_dora_trainable_bytes(direct_dora),
+              " slots:", len(direct_dora.ad))
+    elif oft_active:
+        var dense_bytes = ernie_direct_dense_carrier_bytes(
+            NUM_LAYERS, D, F, direct_targets,
+        )
+        var direct_bytes = ernie_direct_oft_preflight(
+            NUM_LAYERS, D, F, ERNIE_OFT_BLOCK_SIZE, direct_targets,
+            LOKR_CARRIER_MAX_DEVICE_BYTES,
+        )
+        print("[Ernie-oft-direct] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES,
+              " targets:", direct_targets,
+              " block_size:", ERNIE_OFT_BLOCK_SIZE)
+        direct_oft = build_ernie_direct_oft_set(
+            NUM_LAYERS, D, F, ERNIE_OFT_BLOCK_SIZE, direct_targets,
+        )
+        print("[Ernie-oft-direct] trainable bytes:",
+              ernie_direct_oft_trainable_bytes(direct_oft),
+              " slots:", len(direct_oft.ad))
     print("  LoRA adapters:", n_adapters, " (7 slots x", NUM_LAYERS, "layers)")
-    print("  LoRA-B |.|_1 at init =", _lora_b_abs_sum(lora), " (expect 0.0)")
+    if carrier_active:
+        print("  carrier LoRA-B |.|_1 at init =", _lora_b_abs_sum(lora))
+    elif direct_active:
+        print("  direct LyCORIS path active; dense LoRA carrier is not materialized")
+    else:
+        print("  LoRA-B |.|_1 at init =", _lora_b_abs_sum(lora), " (expect 0.0)")
+    var carrier_zero_init = Float64(0.0)
+    if lokr_active:
+        carrier_zero_init = ernie_lokr_zero_leg_l1(lokr_masters)
+        print("[Ernie-lokr] zero-leg L1 at init =", carrier_zero_init)
+    elif loha_active:
+        carrier_zero_init = ernie_loha_zero_leg_l1(loha_masters)
+        print("[Ernie-loha] zero-leg L1 at init =", carrier_zero_init)
+    elif dora_active:
+        carrier_zero_init = flat_direct_dora_zero_leg_l1(direct_dora)
+        print("[Ernie-dora-direct] zero-leg L1 at init =", carrier_zero_init)
+    elif oft_active:
+        carrier_zero_init = flat_direct_oft_vec_l1(direct_oft)
+        print("[Ernie-oft-direct] vec L1 at init =", carrier_zero_init)
 
     # ── RoPE tables (image-first/text-second 3-axis half-split) ──
     # OneTrainer's image RoPE axis-0 position == the per-sample TEXT real length
@@ -728,8 +1008,11 @@ def main() raises:
             real_len = N_TXT
 
         # ── RoPE tables for THIS sample (image axis-0 position = real_len) ──
+        # The ERNIE training stack still stages block activations through the
+        # established host-list F32 path. RoPE tables are compute constants, so
+        # keep them F32 here instead of forcing an activation/storage dtype cast.
         var rope = build_ernie_rope_tables[N_IMG, N_TXT, H, Dh](
-            IMG_H, IMG_W, real_len, ctx, STDtype.BF16
+            IMG_H, IMG_W, real_len, ctx, STDtype.F32
         )
 
         # ── sigma + flow-match noise/target (F32; train_ernie.rs:904-949) ──
@@ -754,55 +1037,130 @@ def main() raises:
         var f_scale = src[1].copy()
         var f_shift = src[2].copy()
 
-        # ── device-resident LoRA forward (BF16 base blocks loaded once) ──
-        var lora_dev = ernie_lora_set_to_device(lora, STDtype.BF16, ctx)
-        var fwd = ernie_stack_lora_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
-            noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
-            f_scale.copy(), f_shift.copy(), rope[0], rope[1],
-            D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
-            real_len,
-        )
-        var pred = fwd.out.copy()                          # [N_IMG, OUT_CH]
-
-        # ── MSE loss + upstream grad d_loss = (2/N)*(pred - target) ──
-        var n_out = N_IMG * OUT_CH
-        var sse = Float64(0.0)
-        var d_out = List[Float32]()
-        var inv_n = Float32(2.0) / Float32(n_out)
-        for i in range(n_out):
-            var diff = pred[i] - target[i]
-            sse += Float64(diff) * Float64(diff)
-            d_out.append(diff * inv_n)
-        var loss = Float32(sse / Float64(n_out))
-
-        # ── resident LoRA backward -> all 7*36 adapter grads ──
-        var grads = ernie_stack_lora_backward_resident_device[H, Dh, N_IMG, N_TXT, S](
-            d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
-            f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd,
-            D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
-            real_len,
-        )
-
-        # ── global-norm clip then AdamW on every adapter ──
-        var gn = _clip_grads(grads, train_cfg.max_grad_norm)
         var done_step = step + 1
         var step_lr = ot_lr_for_optimizer_step(train_cfg, done_step)
-        ernie_lora_adamw_step(
-            lora, grads, done_step, step_lr, ctx,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
-        )
+        var loss = Float32(0.0)
+        var gn = Float64(0.0)
+        var nonfinite_grads = 0
+        var progress_label = String("Ernie-lora")
+
+        if dora_active:
+            progress_label = String("Ernie-dora")
+            var fwd_dora = ernie_stack_direct_dora_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
+                noisy_tokens.copy(), txt_tokens.copy(), base, blocks,
+                direct_dora, direct_targets, mv,
+                f_scale.copy(), f_shift.copy(), rope[0], rope[1],
+                D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                real_len,
+            )
+            var lg = _mse_loss_grad(fwd_dora.out, target)
+            loss = lg.loss
+            var dg = ernie_stack_direct_dora_backward_resident_device[H, Dh, N_IMG, N_TXT, S](
+                lg.d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks,
+                direct_dora, direct_targets, mv,
+                f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd_dora,
+                D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                real_len,
+            )
+            gn = flat_direct_dora_grad_norm(dg.grads)
+            if gn > Float64(train_cfg.max_grad_norm):
+                flat_direct_dora_clip_grads(dg.grads, train_cfg.max_grad_norm / Float32(gn))
+            flat_direct_dora_adamw_step(
+                direct_dora, dg.grads, done_step, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
+            nonfinite_grads = dg.nonfinite_grads
+            print("[Ernie-dora-direct] step=", done_step, " master_grad_norm=", Float32(gn),
+                  " zero_leg_l1=", flat_direct_dora_zero_leg_l1(direct_dora))
+        elif oft_active:
+            progress_label = String("Ernie-oft")
+            var fwd_oft = ernie_stack_direct_oft_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
+                noisy_tokens.copy(), txt_tokens.copy(), base, blocks,
+                direct_oft, direct_targets, mv,
+                f_scale.copy(), f_shift.copy(), rope[0], rope[1],
+                D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                real_len,
+            )
+            var lg = _mse_loss_grad(fwd_oft.out, target)
+            loss = lg.loss
+            var og = ernie_stack_direct_oft_backward_resident_device[H, Dh, N_IMG, N_TXT, S](
+                lg.d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks,
+                direct_oft, direct_targets, mv,
+                f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd_oft,
+                D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                real_len,
+            )
+            gn = flat_direct_oft_grad_norm(og.grads)
+            if gn > Float64(train_cfg.max_grad_norm):
+                flat_direct_oft_clip_grads(og.grads, train_cfg.max_grad_norm / Float32(gn))
+            flat_direct_oft_adamw_step(
+                direct_oft, og.grads, done_step, step_lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+            )
+            nonfinite_grads = og.nonfinite_grads
+            print("[Ernie-oft-direct] step=", done_step, " master_grad_norm=", Float32(gn),
+                  " vec_l1=", flat_direct_oft_vec_l1(direct_oft))
+        else:
+            # ── device-resident LoRA/carrier forward (BF16 base blocks resident) ──
+            var lora_dev = ernie_lora_set_to_device(lora, STDtype.BF16, ctx)
+            var fwd = ernie_stack_lora_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
+                noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
+                f_scale.copy(), f_shift.copy(), rope[0], rope[1],
+                D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                real_len,
+            )
+            var lg = _mse_loss_grad(fwd.out, target)
+            loss = lg.loss
+            var grads = ernie_stack_lora_backward_resident_device[H, Dh, N_IMG, N_TXT, S](
+                lg.d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
+                f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd,
+                D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                real_len,
+            )
+
+            gn = _clip_grads(grads, train_cfg.max_grad_norm)
+            nonfinite_grads = grads.nonfinite_lora_grads
+            if lokr_active:
+                var mg = ernie_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
+                var mnorm = ernie_lokr_grad_norm(mg)
+                if mnorm > Float64(train_cfg.max_grad_norm):
+                    ernie_lokr_clip_grads(mg, train_cfg.max_grad_norm / Float32(mnorm))
+                ernie_lokr_adamw_step(
+                    lokr_masters, mg, done_step, step_lr,
+                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+                )
+                lora = ernie_lokr_carrier_set(lokr_masters, D, F)
+                print("[Ernie-lokr] step=", done_step, " master_grad_norm=", Float32(mnorm),
+                      " zero_leg_l1=", ernie_lokr_zero_leg_l1(lokr_masters))
+            elif loha_active:
+                var mg = ernie_loha_chain_all(loha_masters, grads.d_a, grads.d_b)
+                var mnorm = ernie_loha_grad_norm(mg)
+                if mnorm > Float64(train_cfg.max_grad_norm):
+                    ernie_loha_clip_grads(mg, train_cfg.max_grad_norm / Float32(mnorm))
+                ernie_loha_adamw_step(
+                    loha_masters, mg, done_step, step_lr,
+                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+                )
+                lora = ernie_loha_carrier_set(loha_masters, D, F)
+                print("[Ernie-loha] step=", done_step, " master_grad_norm=", Float32(mnorm),
+                      " zero_leg_l1=", ernie_loha_zero_leg_l1(loha_masters))
+            else:
+                ernie_lora_adamw_step(
+                    lora, grads, done_step, step_lr, ctx,
+                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+                )
 
         var now = perf_counter()
         var step_secs = now - step_t0
         var elapsed = now - t_start
         print_trainer_progress(
-            String("Ernie-lora"), done_step, run_steps, len(cache_files),
+            progress_label, done_step, run_steps, len(cache_files),
             loss, gn, step_secs, 0.0, elapsed,
         )
-        if grads.nonfinite_lora_grads != 0:
+        if nonfinite_grads != 0:
             print(
-                "[Ernie-lora] nonfinite_lora_grads step=", done_step,
-                " count=", grads.nonfinite_lora_grads,
+                "[", progress_label, "] nonfinite adapter grads step=", done_step,
+                " count=", nonfinite_grads,
             )
 
         var saved_this_step = False
@@ -810,7 +1168,12 @@ def main() raises:
 
         if mode == String("resume_smoke") and done_step == 10:
             var smoke_lora = _step_lora_path(save_path, done_step)
-            _save_lora_and_state(lora, smoke_lora, done_step, ctx)
+            _save_adapter_for_algo(
+                lora, lokr_masters, loha_masters, dora_masters, oft_masters,
+                direct_dora, direct_oft,
+                lokr_active, loha_active, dora_active, oft_active,
+                smoke_lora, done_step, ctx,
+            )
             saved_this_step = True
             saved_lora_path = smoke_lora.copy()
             if sample_enabled:
@@ -822,30 +1185,65 @@ def main() raises:
 
         if ernie_should_save_checkpoint(train_cfg, done_step) and not saved_this_step:
             var save_cadence_lora = _step_lora_path(save_path, done_step)
-            _save_lora_and_state(lora, save_cadence_lora, done_step, ctx)
+            _save_adapter_for_algo(
+                lora, lokr_masters, loha_masters, dora_masters, oft_masters,
+                direct_dora, direct_oft,
+                lokr_active, loha_active, dora_active, oft_active,
+                save_cadence_lora, done_step, ctx,
+            )
             saved_this_step = True
             saved_lora_path = save_cadence_lora.copy()
 
         if sample_enabled and should_sample_completed_step(sample_cadence, done_step):
             var cadence_lora = _step_lora_path(save_path, done_step)
             if ernie_should_save_before_sample(sample_cadence, done_step, saved_this_step):
-                _save_lora_and_state(lora, cadence_lora, done_step, ctx)
+                _save_adapter_for_algo(
+                    lora, lokr_masters, loha_masters, dora_masters, oft_masters,
+                    direct_dora, direct_oft,
+                    lokr_active, loha_active, dora_active, oft_active,
+                    cadence_lora, done_step, ctx,
+                )
                 saved_lora_path = cadence_lora.copy()
             _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, done_step, ctx)
             last_sample_step = done_step
-            if sample_cadence.save_before_sample and saved_lora_path == cadence_lora:
+            if (
+                sample_cadence.save_before_sample
+                and saved_lora_path == cadence_lora
+                and not carrier_active
+            ):
                 var cadence_state = _state_path_for_lora(cadence_lora)
                 lora = load_ernie_lora_state(NUM_LAYERS, train_cfg.lora_rank, train_cfg.lora_alpha, cadence_state, ctx)
                 print("[Ernie-lora] resume_state step=", done_step, " path=", cadence_state)
 
-    # ── final LoRA-B growth report + save ──
-    var b_sum = _lora_b_abs_sum(lora)
-    var b_nz = _lora_b_nonzero_slots(lora)
+    # ── final adapter growth report + save ──
+    var b_sum = Float64(0.0)
+    var b_nz = 0
+    if not direct_active:
+        b_sum = _lora_b_abs_sum(lora)
+        b_nz = _lora_b_nonzero_slots(lora)
     print("")
     print("==== RESULT ====")
-    print("  LoRA-B |.|_1 after training =", b_sum, " (init 0.0)")
-    print("  LoRA-B nonzero slots =", b_nz, "/", n_adapters,
-          " ratio =", Float32(b_nz) / Float32(n_adapters))
-    _save_lora_and_state(lora, save_path, run_steps, ctx)
+    if not direct_active:
+        print("  LoRA-B |.|_1 after training =", b_sum, " (init 0.0)")
+        print("  LoRA-B nonzero slots =", b_nz, "/", n_adapters,
+              " ratio =", Float32(b_nz) / Float32(n_adapters))
+    if lokr_active:
+        print("[Ernie-lokr] zero-leg L1 after training =", ernie_lokr_zero_leg_l1(lokr_masters),
+              " (init ", carrier_zero_init, ")")
+    elif loha_active:
+        print("[Ernie-loha] zero-leg L1 after training =", ernie_loha_zero_leg_l1(loha_masters),
+              " (init ", carrier_zero_init, ")")
+    elif dora_active:
+        print("[Ernie-dora-direct] zero-leg L1 after training =", flat_direct_dora_zero_leg_l1(direct_dora),
+              " (init ", carrier_zero_init, ")")
+    elif oft_active:
+        print("[Ernie-oft-direct] vec L1 after training =", flat_direct_oft_vec_l1(direct_oft),
+              " (init ", carrier_zero_init, ")")
+    _save_adapter_for_algo(
+        lora, lokr_masters, loha_masters, dora_masters, oft_masters,
+        direct_dora, direct_oft,
+        lokr_active, loha_active, dora_active, oft_active,
+        save_path, run_steps, ctx,
+    )
     if sample_enabled and last_sample_step != run_steps:
         _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, run_steps, ctx)

@@ -19,6 +19,7 @@ from serenitymojo.training.train_config import (
     LOSS_FN_MSE, LOSS_FN_HUBER, LOSS_FN_SMOOTH_L1,
     TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
     TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_ADAMW_8BIT,
+    TRAIN_OPTIMIZER_AUTOMAGIC3,
 )
 
 
@@ -292,6 +293,21 @@ def _gate_optimizer_runner() raises:
     _check(String("optimizer-adamw8bit"),
            c8.optimizer == TRAIN_OPTIMIZER_ADAMW_8BIT,
            String("optimizer=") + String(c8.optimizer))
+
+    # flipped: AUTOMAGIC3 (dropdown index 6, appended after SCHEDULE_FREE_ADAMW)
+    # — emits "AUTOMAGIC3" verbatim, round-trips to TRAIN_OPTIMIZER_AUTOMAGIC3
+    # (ai-toolkit adaptive optimizer, serenitymojo training/automagic3.mojo via
+    # the levers dispatch).
+    ui.optimizer_index = 6
+    var json_am = trainer_ui_runner_train_config_json(ui)
+    var pam = String("/tmp/serenity_ui_optimizer_automagic3_gate.json")
+    var fam = open(pam.copy(), "w")
+    fam.write(json_am)
+    fam.close()
+    var cam = read_model_config(pam.copy())
+    _check(String("optimizer-automagic3"),
+           cam.optimizer == TRAIN_OPTIMIZER_AUTOMAGIC3,
+           String("optimizer=") + String(cam.optimizer))
 
     # unsupported dropdown value (CAME, index 2) fails loud at config load
     ui.optimizer_index = 2

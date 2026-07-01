@@ -96,7 +96,7 @@
 # Template: serenitymojo/configs/hidream_o1.json (all levers default-off).
 
 from std.gpu.host import DeviceContext
-from std.math import sqrt, exp, log as flog, cos as fcos, sin as fsin, pi
+from std.math import sqrt, exp, log as flog, cos as fcos, sin as fsin, pi, isfinite
 from std.memory import ArcPointer
 from std.collections import Optional
 from std.time import perf_counter_ns
@@ -113,7 +113,9 @@ from serenitymojo.ops.linalg_backward import linear_backward_dx, linear_backward
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.norm_backward import rms_norm_backward_dx
 from serenitymojo.ops.layout import patchify
-from serenitymojo.ops.tensor_algebra import concat, slice as ta_slice, add as ta_add
+from serenitymojo.ops.tensor_algebra import (
+    concat, slice as ta_slice, add as ta_add, reshape_owned,
+)
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.activation_backward import silu_backward
 from serenitymojo.ops.embeddings import timestep_embedding
@@ -121,6 +123,18 @@ from serenitymojo.ops.embeddings import timestep_embedding
 from serenitymojo.models.zimage.lora_block import (
     zimage_lora_apply_device,
     zimage_lora_bwd_device_resident_tensors,
+    ZImageBlockDirectLycoris,
+    ZImageBlockDirectGrads,
+    ZImageDirectProjectionGrad,
+    ZIMAGE_DIRECT_ALGO_DORA,
+    ZIMAGE_DIRECT_ALGO_OFT,
+    SLOT_Q,
+    SLOT_K,
+    SLOT_V,
+    SLOT_O,
+    SLOT_W1,
+    zimage_direct_projection_forward_device,
+    zimage_direct_projection_backward_device,
 )
 from serenitymojo.tokenizer.tokenizer import Qwen3Tokenizer
 from serenitymojo.models.dit.hidream_o1 import (
@@ -134,8 +148,18 @@ from serenitymojo.models.dit.hidream_o1 import (
 from serenitymojo.offload.block_loader import Block
 from serenitymojo.models.zimage.lora_block import ZImageLoraAdapterDevice
 from serenitymojo.io.train_config_reader import read_model_config
-from serenitymojo.training.train_config import TrainConfig
-from serenitymojo.training.adapter_algo_policy import require_lora_or_locon_linear
+from serenitymojo.training.train_config import (
+    TrainConfig,
+    TRAIN_ADAPTER_ALGO_LORA,
+    TRAIN_ADAPTER_ALGO_FULL,
+    TRAIN_ADAPTER_ALGO_LOHA,
+    TRAIN_ADAPTER_ALGO_LOKR,
+    TRAIN_ADAPTER_ALGO_DORA,
+    TRAIN_ADAPTER_ALGO_OFT,
+    TRAIN_ADAPTER_ALGO_BOFT,
+    TRAIN_ADAPTER_ALGO_LOCON,
+)
+from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.levers import (
     caption_dropout_pick, levers_loss_active, levers_loss_grad,
@@ -153,11 +177,40 @@ from serenitymojo.training.lora_ema import (
     LoraEmaState, lora_ema_track, ema_update,
     ema_shadow_a_bf16, ema_shadow_b_bf16, ema_path_for_lora,
 )
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
+from serenitymojo.training.flat_lycoris_stack import (
+    FlatLoKrSet, empty_flat_lokr_set, build_flat_lokr_set,
+    flat_lokr_carrier_list, flat_lokr_carrier_total_bytes,
+    flat_lokr_chain_all, flat_lokr_grad_norm, flat_lokr_clip_grads,
+    flat_lokr_adamw_step, flat_lokr_zero_leg_l1, save_flat_lokr,
+    save_flat_lokr_pair,
+    FlatLoHaSet, empty_flat_loha_set, build_flat_loha_set,
+    flat_loha_carrier_list, flat_loha_carrier_total_bytes,
+    flat_loha_chain_all, flat_loha_grad_norm, flat_loha_clip_grads,
+    flat_loha_adamw_step, flat_loha_zero_leg_l1, save_flat_loha,
+    save_flat_loha_pair,
+)
+from serenitymojo.training.dora_adapter import DoRAGrads
+from serenitymojo.training.dora_save import NamedDoRA, save_dora_onetrainer
+from serenitymojo.training.flat_direct_lycoris_stack import (
+    FlatDirectDoRASet, FlatDirectDoRAGrads, FlatDirectOFTSet, FlatDirectOFTGrads,
+    empty_flat_direct_dora_set, empty_flat_direct_oft_set,
+    flat_direct_dora_append_from_weight, flat_direct_oft_append,
+    flat_direct_dora_grad_norm, flat_direct_dora_clip_grads,
+    flat_direct_dora_adamw_step, flat_direct_dora_zero_leg_l1,
+    flat_direct_dora_trainable_bytes,
+    flat_direct_oft_grad_norm, flat_direct_oft_clip_grads,
+    flat_direct_oft_adamw_step, flat_direct_oft_vec_l1,
+    flat_direct_oft_trainable_bytes,
+)
 from serenitymojo.models.dit.hidream_o1_train_block import (
     HiDreamO1BlockWeights,
     HiDreamO1BlockLora,
+    HiDreamO1BlockForward,
     hidream_o1_block_lora_forward,
     hidream_o1_block_lora_backward,
+    hidream_o1_block_direct_lycoris_forward,
+    hidream_o1_block_direct_lycoris_backward,
 )
 # T2.B fp8-quantized-resident base (default-off): encode = ops/fp8_quant.mojo
 # (new, RNE per-row absmax), decode = the parity-gated Ideogram-4 dequant.
@@ -283,6 +336,234 @@ def _head_save_name(h: Int) raises -> String:
         String("diffusion_model.final_layer2.linear"),
     ]
     return names[h].copy()
+
+
+def validate_hidream_adapter_config(cfg: TrainConfig) raises:
+    if cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOCON:
+        print("[HiDreamO1-locon] network_algorithm=locon: using the linear LoRA-compatible down/up path")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR:
+        print("[HiDreamO1-lokr] network_algorithm=lokr: using resident carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA:
+        print("[HiDreamO1-loha] network_algorithm=loha: using resident carrier dispatch through the LoRA stack")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA or cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT:
+        print("[HiDreamO1-" + adapter_algo_name(cfg.adapter_algo) + "] direct W_eff dispatch over 36 blocks + 5 resident heads")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_BOFT:
+        raise Error("HiDream O1 trainer: BOFT is intentionally excluded; use lora, locon, loha, lokr, dora, or oft where wired")
+    elif cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        raise Error("HiDream O1 trainer: full finetune is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+    elif cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA:
+        raise Error(
+            String("HiDream O1 trainer: adapter algorithm ")
+            + adapter_algo_name(cfg.adapter_algo)
+            + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
+        )
+
+
+def _hidream_block_in_dims() raises -> List[Int]:
+    var out = List[Int]()
+    for _li in range(LAYERS):
+        for sl in range(7):
+            var dims = _slot_dims(sl)
+            out.append(dims[0])
+    return out^
+
+
+def _hidream_block_out_dims() raises -> List[Int]:
+    var out = List[Int]()
+    for _li in range(LAYERS):
+        for sl in range(7):
+            var dims = _slot_dims(sl)
+            out.append(dims[1])
+    return out^
+
+
+def _hidream_block_prefixes() raises -> List[String]:
+    var out = List[String]()
+    for li in range(LAYERS):
+        for sl in range(7):
+            out.append(
+                String("diffusion_model.language_model.layers.")
+                + String(li) + "." + _slot_name(sl)
+            )
+    return out^
+
+
+def _hidream_head_in_dims() raises -> List[Int]:
+    var out = List[Int]()
+    for h in range(N_HEADS):
+        var dims = _head_dims(h)
+        out.append(dims[0])
+    return out^
+
+
+def _hidream_head_out_dims() raises -> List[Int]:
+    var out = List[Int]()
+    for h in range(N_HEADS):
+        var dims = _head_dims(h)
+        out.append(dims[1])
+    return out^
+
+
+def _hidream_head_prefixes() raises -> List[String]:
+    var out = List[String]()
+    for h in range(N_HEADS):
+        out.append(_head_save_name(h))
+    return out^
+
+
+def _build_hidream_lokr(
+    in_dims: List[Int], out_dims: List[Int], prefixes: List[String],
+    cfg: TrainConfig, seed: UInt64,
+) raises -> FlatLoKrSet:
+    return build_flat_lokr_set(
+        in_dims, out_dims, prefixes, cfg.lora_rank, cfg.lora_alpha,
+        cfg.lokr_factor, cfg.lokr_decompose_both, cfg.lokr_full_matrix, seed,
+    )
+
+
+def _build_hidream_loha(
+    in_dims: List[Int], out_dims: List[Int], prefixes: List[String],
+    cfg: TrainConfig, seed: UInt64,
+) raises -> FlatLoHaSet:
+    return build_flat_loha_set(
+        in_dims, out_dims, prefixes, cfg.lora_rank, cfg.lora_alpha, seed,
+    )
+
+
+struct HiDreamBlockResident(Movable):
+    var opt_state: LoraAdamWPlainDeviceState
+    var loras: List[HiDreamO1BlockLora]
+
+    def __init__(
+        out self, var opt_state: LoraAdamWPlainDeviceState,
+        var loras: List[HiDreamO1BlockLora],
+    ):
+        self.opt_state = opt_state^
+        self.loras = loras^
+
+
+struct HiDreamHeadResident(Movable):
+    var opt_state: LoraAdamWPlainDeviceState
+    var loras: List[ZImageLoraAdapterDevice]
+
+    def __init__(
+        out self, var opt_state: LoraAdamWPlainDeviceState,
+        var loras: List[ZImageLoraAdapterDevice],
+    ):
+        self.opt_state = opt_state^
+        self.loras = loras^
+
+
+def _hidream_block_resident_views(
+    host_ads: List[LoraAdapter], ctx: DeviceContext,
+) raises -> HiDreamBlockResident:
+    var opt_state = lora_adamw_plain_device_state_init(host_ads, 0, len(host_ads), ctx)
+    var loras = List[HiDreamO1BlockLora]()
+    for li in range(LAYERS):
+        var ads = List[Optional[ZImageLoraAdapterDevice]]()
+        for sl in range(7):
+            var i = li * 7 + sl
+            var n_a = len(host_ads[i].a)
+            var n_b = len(host_ads[i].b)
+            var a_off = opt_state.elem_offset(i, False)
+            var b_off = opt_state.elem_offset(i, True)
+            ads.append(Optional[ZImageLoraAdapterDevice](ZImageLoraAdapterDevice(
+                TArc(Tensor(
+                    opt_state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+                    [host_ads[i].rank, host_ads[i].in_f], STDtype.BF16,
+                )),
+                TArc(Tensor(
+                    opt_state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+                    [host_ads[i].out_f, host_ads[i].rank], STDtype.BF16,
+                )),
+                host_ads[i].rank, host_ads[i].in_f, host_ads[i].out_f,
+                host_ads[i].scale,
+            )))
+        loras.append(HiDreamO1BlockLora(
+            ads[0].copy(), ads[1].copy(), ads[2].copy(), ads[3].copy(),
+            ads[4].copy(), ads[5].copy(), ads[6].copy(),
+        ))
+    return HiDreamBlockResident(opt_state^, loras^)
+
+
+def _hidream_head_resident_views(
+    head_ads: List[LoraAdapter], ctx: DeviceContext,
+) raises -> HiDreamHeadResident:
+    var opt_state = lora_adamw_plain_device_state_init(head_ads, 0, len(head_ads), ctx)
+    var head_loras = List[ZImageLoraAdapterDevice]()
+    for h in range(N_HEADS):
+        var n_a = len(head_ads[h].a)
+        var n_b = len(head_ads[h].b)
+        var a_off = opt_state.elem_offset(h, False)
+        var b_off = opt_state.elem_offset(h, True)
+        head_loras.append(ZImageLoraAdapterDevice(
+            TArc(Tensor(
+                opt_state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+                [head_ads[h].rank, head_ads[h].in_f], STDtype.BF16,
+            )),
+            TArc(Tensor(
+                opt_state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+                [head_ads[h].out_f, head_ads[h].rank], STDtype.BF16,
+            )),
+            head_ads[h].rank, head_ads[h].in_f, head_ads[h].out_f,
+            head_ads[h].scale,
+        ))
+    return HiDreamHeadResident(opt_state^, head_loras^)
+
+
+def _hidream_block_lora_views(
+    host_ads: List[LoraAdapter], opt_state: LoraAdamWPlainDeviceState,
+) raises -> List[HiDreamO1BlockLora]:
+    var loras = List[HiDreamO1BlockLora]()
+    for li in range(LAYERS):
+        var ads = List[Optional[ZImageLoraAdapterDevice]]()
+        for sl in range(7):
+            var i = li * 7 + sl
+            var n_a = len(host_ads[i].a)
+            var n_b = len(host_ads[i].b)
+            var a_off = opt_state.elem_offset(i, False)
+            var b_off = opt_state.elem_offset(i, True)
+            ads.append(Optional[ZImageLoraAdapterDevice](ZImageLoraAdapterDevice(
+                TArc(Tensor(
+                    opt_state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+                    [host_ads[i].rank, host_ads[i].in_f], STDtype.BF16,
+                )),
+                TArc(Tensor(
+                    opt_state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+                    [host_ads[i].out_f, host_ads[i].rank], STDtype.BF16,
+                )),
+                host_ads[i].rank, host_ads[i].in_f, host_ads[i].out_f,
+                host_ads[i].scale,
+            )))
+        loras.append(HiDreamO1BlockLora(
+            ads[0].copy(), ads[1].copy(), ads[2].copy(), ads[3].copy(),
+            ads[4].copy(), ads[5].copy(), ads[6].copy(),
+        ))
+    return loras^
+
+
+def _hidream_head_lora_views(
+    head_ads: List[LoraAdapter], opt_state: LoraAdamWPlainDeviceState,
+) raises -> List[ZImageLoraAdapterDevice]:
+    var head_loras = List[ZImageLoraAdapterDevice]()
+    for h in range(N_HEADS):
+        var n_a = len(head_ads[h].a)
+        var n_b = len(head_ads[h].b)
+        var a_off = opt_state.elem_offset(h, False)
+        var b_off = opt_state.elem_offset(h, True)
+        head_loras.append(ZImageLoraAdapterDevice(
+            TArc(Tensor(
+                opt_state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
+                [head_ads[h].rank, head_ads[h].in_f], STDtype.BF16,
+            )),
+            TArc(Tensor(
+                opt_state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
+                [head_ads[h].out_f, head_ads[h].rank], STDtype.BF16,
+            )),
+            head_ads[h].rank, head_ads[h].in_f, head_ads[h].out_f,
+            head_ads[h].scale,
+        ))
+    return head_loras^
 
 
 def _lcg_pattern(n: Int, seed: UInt64, amp: Float32) -> List[Float32]:
@@ -474,6 +755,382 @@ def _block_weights_q(
     )
 
 
+# ── Direct DoRA/OFT for HiDream's 36 block linears + 5 resident heads ───────
+comptime HIDREAM_DIRECT_24_GIB = 24 * 1024 * 1024 * 1024
+comptime HIDREAM_OFT_BLOCK_SIZE = 4
+comptime HIDREAM_DIRECT_TARGETS_ALL = 2
+
+
+def _zeros_f32(n: Int) -> List[Float32]:
+    var out = List[Float32]()
+    for _ in range(n):
+        out.append(Float32(0.0))
+    return out^
+
+
+def _hidream_direct_total_slots() -> Int:
+    return LAYERS * 7 + N_HEADS
+
+
+def _hidream_direct_head_base() -> Int:
+    return LAYERS * 7
+
+
+def _hidream_direct_head_slot(h: Int) raises -> Int:
+    if h == 0:
+        return SLOT_Q
+    if h == 1:
+        return SLOT_K
+    if h == 2:
+        return SLOT_V
+    if h == 3:
+        return SLOT_O
+    if h == 4:
+        return SLOT_W1
+    raise Error("HiDream O1 direct head slot out of range")
+
+
+def _hidream_direct_prefix_block(li: Int, slot: Int) raises -> String:
+    return (
+        String("diffusion_model.language_model.layers.")
+        + String(li) + "." + _slot_name(slot)
+    )
+
+
+def _hidream_direct_prefix_head(h: Int) raises -> String:
+    return _head_save_name(h)
+
+
+def _hidream_direct_block_for_dora(
+    dora: FlatDirectDoRASet, li: Int,
+) raises -> ZImageBlockDirectLycoris:
+    return ZImageBlockDirectLycoris(
+        ZIMAGE_DIRECT_ALGO_DORA, dora.copy(), empty_flat_direct_oft_set(),
+        li * 7, HIDREAM_DIRECT_TARGETS_ALL,
+    )
+
+
+def _hidream_direct_block_for_oft(
+    oft: FlatDirectOFTSet, li: Int,
+) raises -> ZImageBlockDirectLycoris:
+    return ZImageBlockDirectLycoris(
+        ZIMAGE_DIRECT_ALGO_OFT, empty_flat_direct_dora_set(), oft.copy(),
+        li * 7, HIDREAM_DIRECT_TARGETS_ALL,
+    )
+
+
+def _hidream_direct_head_for_dora(
+    dora: FlatDirectDoRASet,
+) raises -> ZImageBlockDirectLycoris:
+    return ZImageBlockDirectLycoris(
+        ZIMAGE_DIRECT_ALGO_DORA, dora.copy(), empty_flat_direct_oft_set(),
+        _hidream_direct_head_base(), HIDREAM_DIRECT_TARGETS_ALL,
+    )
+
+
+def _hidream_direct_head_for_oft(
+    oft: FlatDirectOFTSet,
+) raises -> ZImageBlockDirectLycoris:
+    return ZImageBlockDirectLycoris(
+        ZIMAGE_DIRECT_ALGO_OFT, empty_flat_direct_dora_set(), oft.copy(),
+        _hidream_direct_head_base(), HIDREAM_DIRECT_TARGETS_ALL,
+    )
+
+
+def _hidream_block_weight_for_slot(
+    w: HiDreamO1BlockWeights, slot: Int, ctx: DeviceContext,
+) raises -> List[Float32]:
+    if slot == 0:
+        return w.qw[].to_host(ctx)
+    if slot == 1:
+        return w.kw[].to_host(ctx)
+    if slot == 2:
+        return w.vw[].to_host(ctx)
+    if slot == 3:
+        return w.ow[].to_host(ctx)
+    if slot == 4:
+        return w.gw[].to_host(ctx)
+    if slot == 5:
+        return w.uw[].to_host(ctx)
+    if slot == 6:
+        return w.dw[].to_host(ctx)
+    raise Error("HiDream O1 direct: bad block slot")
+
+
+def _hidream_head_weight_for_slot(
+    h: Int,
+    xe_w1: TArc, xe_w2: TArc, te_w0: TArc, te_w2: TArc, final_w: TArc,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    if h == 0:
+        return xe_w1[].to_host(ctx)
+    if h == 1:
+        return xe_w2[].to_host(ctx)
+    if h == 2:
+        return te_w0[].to_host(ctx)
+    if h == 3:
+        return te_w2[].to_host(ctx)
+    if h == 4:
+        return final_w[].to_host(ctx)
+    raise Error("HiDream O1 direct: bad head slot")
+
+
+def hidream_direct_dense_carrier_bytes() raises -> Int:
+    var elems = 0
+    for _li in range(LAYERS):
+        for sl in range(7):
+            var dims = _slot_dims(sl)
+            elems += dims[0] * dims[0] + dims[1] * dims[0]
+    for h in range(N_HEADS):
+        var hd = _head_dims(h)
+        elems += hd[0] * hd[0] + hd[1] * hd[0]
+    return elems * 2
+
+
+def hidream_direct_dora_trainable_bytes_estimate(
+    rank: Int, wd_on_out: Bool = False,
+) raises -> Int:
+    var total = 0
+    for _li in range(LAYERS):
+        for sl in range(7):
+            var dims = _slot_dims(sl)
+            var in_f = dims[0]
+            var out_f = dims[1]
+            var mlen = out_f if wd_on_out else in_f
+            var bf16_elems = rank * in_f + out_f * rank
+            var f32_elems = mlen + (2 * rank * in_f) + (2 * out_f * rank) + (2 * mlen)
+            total += bf16_elems * 2 + f32_elems * 4
+    for h in range(N_HEADS):
+        var hd = _head_dims(h)
+        var in_f = hd[0]
+        var out_f = hd[1]
+        var mlen = out_f if wd_on_out else in_f
+        var bf16_elems = rank * in_f + out_f * rank
+        var f32_elems = mlen + (2 * rank * in_f) + (2 * out_f * rank) + (2 * mlen)
+        total += bf16_elems * 2 + f32_elems * 4
+    return total
+
+
+def hidream_direct_oft_trainable_bytes_estimate(block_size: Int) raises -> Int:
+    var total = 0
+    var ne = block_size * (block_size - 1) // 2
+    for _li in range(LAYERS):
+        for sl in range(7):
+            var dims = _slot_dims(sl)
+            if dims[0] % block_size != 0:
+                raise Error("HiDream O1 direct OFT: block slot input dim not divisible by block size")
+            total += 3 * (dims[0] // block_size) * ne * 4
+    for h in range(N_HEADS):
+        var hd = _head_dims(h)
+        if hd[0] % block_size != 0:
+            raise Error("HiDream O1 direct OFT: head input dim not divisible by block size")
+        total += 3 * (hd[0] // block_size) * ne * 4
+    return total
+
+
+def hidream_direct_dora_preflight(rank: Int, budget_bytes: Int) raises -> Int:
+    var direct = hidream_direct_dora_trainable_bytes_estimate(rank)
+    if direct > budget_bytes:
+        raise Error(
+            String("HiDream O1 direct DoRA trainable state needs ")
+            + String(direct) + String(" bytes (> budget ")
+            + String(budget_bytes) + String(")")
+        )
+    return direct
+
+
+def hidream_direct_oft_preflight(block_size: Int, budget_bytes: Int) raises -> Int:
+    var direct = hidream_direct_oft_trainable_bytes_estimate(block_size)
+    if direct > budget_bytes:
+        raise Error(
+            String("HiDream O1 direct OFT trainable state needs ")
+            + String(direct) + String(" bytes (> budget ")
+            + String(budget_bytes) + String(")")
+        )
+    return direct
+
+
+def build_hidream_direct_dora_set(
+    resident_blocks: List[Block],
+    fp8_resident: Bool,
+    xe_w1: TArc, xe_w2: TArc, te_w0: TArc, te_w2: TArc, final_w: TArc,
+    rank: Int, alpha: Float32, seed: UInt64,
+    ctx: DeviceContext,
+) raises -> FlatDirectDoRASet:
+    var set = empty_flat_direct_dora_set()
+    for li in range(LAYERS):
+        var bwts = _block_weights_q(resident_blocks[li], li, fp8_resident, ctx)
+        for sl in range(7):
+            var dims = _slot_dims(sl)
+            var w_h = _hidream_block_weight_for_slot(bwts, sl, ctx)
+            flat_direct_dora_append_from_weight(
+                set, w_h^, dims[0], dims[1], rank, alpha,
+                _hidream_direct_prefix_block(li, sl),
+                seed + UInt64(li * 7 + sl), False,
+            )
+    for h in range(N_HEADS):
+        var hd = _head_dims(h)
+        var w_h = _hidream_head_weight_for_slot(h, xe_w1, xe_w2, te_w0, te_w2, final_w, ctx)
+        flat_direct_dora_append_from_weight(
+            set, w_h^, hd[0], hd[1], rank, alpha,
+            _hidream_direct_prefix_head(h),
+            seed + UInt64(LAYERS * 7 + h), False,
+        )
+    if len(set.ad) != _hidream_direct_total_slots():
+        raise Error("build_hidream_direct_dora_set: direct slot count mismatch")
+    return set^
+
+
+def build_hidream_direct_oft_set(block_size: Int) raises -> FlatDirectOFTSet:
+    var set = empty_flat_direct_oft_set()
+    for li in range(LAYERS):
+        for sl in range(7):
+            var dims = _slot_dims(sl)
+            flat_direct_oft_append(
+                set, dims[0], dims[1], block_size,
+                _hidream_direct_prefix_block(li, sl),
+            )
+    for h in range(N_HEADS):
+        var hd = _head_dims(h)
+        flat_direct_oft_append(
+            set, hd[0], hd[1], block_size, _hidream_direct_prefix_head(h),
+        )
+    if len(set.ad) != _hidream_direct_total_slots():
+        raise Error("build_hidream_direct_oft_set: direct slot count mismatch")
+    return set^
+
+
+def _hidream_direct_dora_zero_grads(set: FlatDirectDoRASet) -> FlatDirectDoRAGrads:
+    var out = List[DoRAGrads]()
+    for i in range(len(set.ad)):
+        ref d = set.ad[i]
+        out.append(DoRAGrads(
+            _zeros_f32(len(d.a)), _zeros_f32(len(d.b)), _zeros_f32(len(d.m)),
+            List[Float32](),
+        ))
+    return FlatDirectDoRAGrads(out^)
+
+
+def _hidream_direct_oft_zero_grads(set: FlatDirectOFTSet) -> FlatDirectOFTGrads:
+    var out = List[List[Float32]]()
+    for i in range(len(set.ad)):
+        out.append(_zeros_f32(len(set.ad[i].vec)))
+    return FlatDirectOFTGrads(out^)
+
+
+def _hidream_scatter_dora(
+    mut grads: FlatDirectDoRAGrads, slot: Int, g: ZImageDirectProjectionGrad,
+) raises:
+    if slot < 0:
+        return
+    if slot >= len(grads.g):
+        raise Error("HiDream O1 direct DoRA scatter: slot out of range")
+    grads.g[slot] = DoRAGrads(g.d_a.copy(), g.d_b.copy(), g.d_m.copy(), List[Float32]())
+
+
+def _hidream_scatter_oft(
+    mut grads: FlatDirectOFTGrads, slot: Int, g: ZImageDirectProjectionGrad,
+) raises:
+    if slot < 0:
+        return
+    if slot >= len(grads.d_vec):
+        raise Error("HiDream O1 direct OFT scatter: slot out of range")
+    grads.d_vec[slot] = g.d_vec.copy()
+
+
+def _hidream_scatter_dora_block(
+    mut grads: FlatDirectDoRAGrads, direct: ZImageBlockDirectLycoris,
+    g: ZImageBlockDirectGrads,
+) raises:
+    _hidream_scatter_dora(grads, direct.q_slot, g.q)
+    _hidream_scatter_dora(grads, direct.k_slot, g.k)
+    _hidream_scatter_dora(grads, direct.v_slot, g.v)
+    _hidream_scatter_dora(grads, direct.o_slot, g.out_proj)
+    _hidream_scatter_dora(grads, direct.w1_slot, g.w1)
+    _hidream_scatter_dora(grads, direct.w3_slot, g.w3)
+    _hidream_scatter_dora(grads, direct.w2_slot, g.w2)
+
+
+def _hidream_scatter_oft_block(
+    mut grads: FlatDirectOFTGrads, direct: ZImageBlockDirectLycoris,
+    g: ZImageBlockDirectGrads,
+) raises:
+    _hidream_scatter_oft(grads, direct.q_slot, g.q)
+    _hidream_scatter_oft(grads, direct.k_slot, g.k)
+    _hidream_scatter_oft(grads, direct.v_slot, g.v)
+    _hidream_scatter_oft(grads, direct.o_slot, g.out_proj)
+    _hidream_scatter_oft(grads, direct.w1_slot, g.w1)
+    _hidream_scatter_oft(grads, direct.w3_slot, g.w3)
+    _hidream_scatter_oft(grads, direct.w2_slot, g.w2)
+
+
+def _hidream_direct_flat_head(h: Int) -> Int:
+    return _hidream_direct_head_base() + h
+
+
+def _hidream_nonfinite(v: List[Float32]) -> Int:
+    var n = 0
+    for i in range(len(v)):
+        if not isfinite(v[i]):
+            n += 1
+    return n
+
+
+def _hidream_nonfinite_direct(g: ZImageDirectProjectionGrad) -> Int:
+    return (
+        _hidream_nonfinite(g.d_a) + _hidream_nonfinite(g.d_b)
+        + _hidream_nonfinite(g.d_m) + _hidream_nonfinite(g.d_vec)
+    )
+
+
+def _hidream_nonfinite_direct_block(g: ZImageBlockDirectGrads) -> Int:
+    return (
+        _hidream_nonfinite_direct(g.q) + _hidream_nonfinite_direct(g.k)
+        + _hidream_nonfinite_direct(g.v) + _hidream_nonfinite_direct(g.out_proj)
+        + _hidream_nonfinite_direct(g.w1) + _hidream_nonfinite_direct(g.w3)
+        + _hidream_nonfinite_direct(g.w2)
+    )
+
+
+def _hidream_f32_2d(
+    var values: List[Float32], rows: Int, cols: Int, ctx: DeviceContext,
+) raises -> Tensor:
+    var sh = List[Int]()
+    sh.append(rows)
+    sh.append(cols)
+    return Tensor.from_host(values^, sh^, STDtype.F32, ctx)
+
+
+def save_hidream_direct_dora(
+    set: FlatDirectDoRASet, path: String, ctx: DeviceContext,
+) raises -> Int:
+    var named = List[NamedDoRA]()
+    for i in range(len(set.ad)):
+        if set.active[i]:
+            named.append(NamedDoRA(set.prefix[i].copy(), set.ad[i].copy()))
+    return save_dora_onetrainer(named, path, ctx)
+
+
+def save_hidream_direct_oft(
+    set: FlatDirectOFTSet, path: String, ctx: DeviceContext,
+) raises -> Int:
+    var names = List[String]()
+    var tensors = List[TArc]()
+    var nmods = 0
+    for i in range(len(set.ad)):
+        if not set.active[i]:
+            continue
+        ref sl = set.ad[i]
+        var ne = sl.b * (sl.b - 1) // 2
+        names.append(set.prefix[i].copy() + String(".oft_R.weight"))
+        tensors.append(TArc(_hidream_f32_2d(sl.vec.copy(), sl.r, ne, ctx)))
+        nmods += 1
+    if nmods == 0:
+        raise Error("save_hidream_direct_oft: refusing to write an empty OFT file")
+    save_safetensors(names, tensors, path, ctx)
+    return nmods
+
+
 def _adamw_host(
     mut p: List[Float32], g: List[Float32],
     mut m: List[Float32], mut v: List[Float32], m_off: Int,
@@ -538,6 +1195,17 @@ def _clip_grads_all(
     return gn
 
 
+def _dummy_lora_adapters() -> List[LoraAdapter]:
+    var z = List[Float32]()
+    z.append(Float32(0.0))
+    var out = List[LoraAdapter]()
+    out.append(LoraAdapter(
+        z.copy(), z.copy(), 1, 1, 1, Float32(1.0),
+        z.copy(), z.copy(), z.copy(), z.copy(),
+    ))
+    return out^
+
+
 def main() raises:
     var args = argv()
     if len(args) < 3:
@@ -560,7 +1228,13 @@ def main() raises:
         train_cfg = read_model_config(String(args[7]))
         has_config = True
         print("[config] ", String(args[7]))
-    require_lora_or_locon_linear(train_cfg, String("HiDream O1"))
+    validate_hidream_adapter_config(train_cfg)
+    var lokr_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var loha_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    var dora_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
+    var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
+    var carrier_active = lokr_active or loha_active
+    var direct_active = dora_active or oft_active
 
     # argv wins for steps/lr/rank/out_dir when non-"-"; "-" defers to config.
     var steps: Int
@@ -589,6 +1263,8 @@ def main() raises:
     var ema_decay = Float32(0.0)
     if len(args) > 6 and String(args[6]) != "-":
         ema_decay = Float32(atof(String(args[6])))
+    if (carrier_active or direct_active) and ((has_config and train_cfg.ema_enabled) or ema_decay > Float32(0.0)):
+        raise Error("HiDream O1 LyCORIS direct/carrier path: EMA is not wired for LyCORIS masters")
     # Write the EFFECTIVE recipe back into cfg so levers that read cfg
     # directly see argv-resolved values (schedule-free consumes cfg.lr RAW —
     # levers.mojo T1.C LR SEMANTICS).
@@ -608,6 +1284,8 @@ def main() raises:
     # T1.C: fail-loud lever validation (unsupported optimizer tags already
     # failed at config load; this re-asserts for configs built in code).
     levers_optimizer_validate(train_cfg, String("HiDream-O1 trainer"))
+    if (carrier_active or direct_active) and levers_optimizer_active(train_cfg):
+        raise Error("HiDream O1 LyCORIS direct/carrier path: optimizer levers are not wired; use AdamW")
     if levers_optimizer_active(train_cfg):
         print("[optimizer] levers dispatch active, tag ", train_cfg.optimizer)
     # T2.B quantized-resident flag (config-only lever, default-off). The
@@ -643,60 +1321,89 @@ def main() raises:
     # zero-copy sub-buffer VIEWS into state.dev_p, so the in-place fused
     # AdamW update IS the next step's weights (no per-step re-upload; the
     # 98 s/step host-AdamW P2 placeholder measured 2026-06-11 dies here).
+    var block_lokr = empty_flat_lokr_set()
+    var block_loha = empty_flat_loha_set()
+    var head_lokr = empty_flat_lokr_set()
+    var head_loha = empty_flat_loha_set()
+    var direct_dora = empty_flat_direct_dora_set()
+    var direct_oft = empty_flat_direct_oft_set()
     var host_ads = List[LoraAdapter]()
-    for li in range(LAYERS):
-        for sl in range(7):
-            var dims = _slot_dims(sl)
-            var in_f = dims[0]
-            var out_f = dims[1]
-            var amp = Float32(1.0) / sqrt(Float32(in_f))
-            var a_h = _lcg_pattern(rank * in_f, UInt64(li * 7 + sl + 1), amp)
-            var b_h = List[Float32]()
-            for _ in range(out_f * rank):
-                b_h.append(0.0)
-            var z1 = List[Float32]()
-            for _ in range(rank * in_f):
-                z1.append(0.0)
-            var z2 = List[Float32]()
-            for _ in range(rank * in_f):
-                z2.append(0.0)
-            var z3 = List[Float32]()
-            for _ in range(out_f * rank):
-                z3.append(0.0)
-            var z4 = List[Float32]()
-            for _ in range(out_f * rank):
-                z4.append(0.0)
-            host_ads.append(LoraAdapter(
-                a_h^, b_h^, rank, in_f, out_f, Float32(1.0),
-                z1^, z2^, z3^, z4^,
-            ))
-    var opt_state = lora_adamw_plain_device_state_init(host_ads, 0, len(host_ads), ctx)
+    if lokr_active:
+        block_lokr = _build_hidream_lokr(
+            _hidream_block_in_dims(), _hidream_block_out_dims(),
+            _hidream_block_prefixes(), train_cfg, train_cfg.seed * UInt64(67) + UInt64(11),
+        )
+        head_lokr = _build_hidream_lokr(
+            _hidream_head_in_dims(), _hidream_head_out_dims(),
+            _hidream_head_prefixes(), train_cfg, train_cfg.seed * UInt64(67) + UInt64(19),
+        )
+        var carrier_bytes = flat_lokr_carrier_total_bytes(block_lokr) + flat_lokr_carrier_total_bytes(head_lokr)
+        print("[HiDreamO1-lokr] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("HiDream O1 LoKr carrier set needs ")
+                + String(carrier_bytes) + String(" bytes on device (> budget ")
+                + String(LOKR_CARRIER_MAX_DEVICE_BYTES) + String(")")
+            )
+        host_ads = flat_lokr_carrier_list(block_lokr)
+    elif loha_active:
+        block_loha = _build_hidream_loha(
+            _hidream_block_in_dims(), _hidream_block_out_dims(),
+            _hidream_block_prefixes(), train_cfg, train_cfg.seed * UInt64(67) + UInt64(11),
+        )
+        head_loha = _build_hidream_loha(
+            _hidream_head_in_dims(), _hidream_head_out_dims(),
+            _hidream_head_prefixes(), train_cfg, train_cfg.seed * UInt64(67) + UInt64(19),
+        )
+        var carrier_bytes = flat_loha_carrier_total_bytes(block_loha) + flat_loha_carrier_total_bytes(head_loha)
+        print("[HiDreamO1-loha] carrier device bytes:", carrier_bytes, " budget:", LOKR_CARRIER_MAX_DEVICE_BYTES)
+        if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+            raise Error(
+                String("HiDream O1 LoHa carrier set needs ")
+                + String(carrier_bytes) + String(" bytes on device (> budget ")
+                + String(LOKR_CARRIER_MAX_DEVICE_BYTES) + String(")")
+            )
+        host_ads = flat_loha_carrier_list(block_loha)
+    elif direct_active:
+        print("[HiDreamO1-direct] skipping block LoRA carrier; direct trainables build after resident weights load")
+    else:
+        for li in range(LAYERS):
+            for sl in range(7):
+                var dims = _slot_dims(sl)
+                var in_f = dims[0]
+                var out_f = dims[1]
+                var amp = Float32(1.0) / sqrt(Float32(in_f))
+                var a_h = _lcg_pattern(rank * in_f, UInt64(li * 7 + sl + 1), amp)
+                var b_h = List[Float32]()
+                for _ in range(out_f * rank):
+                    b_h.append(0.0)
+                var z1 = List[Float32]()
+                for _ in range(rank * in_f):
+                    z1.append(0.0)
+                var z2 = List[Float32]()
+                for _ in range(rank * in_f):
+                    z2.append(0.0)
+                var z3 = List[Float32]()
+                for _ in range(out_f * rank):
+                    z3.append(0.0)
+                var z4 = List[Float32]()
+                for _ in range(out_f * rank):
+                    z4.append(0.0)
+                host_ads.append(LoraAdapter(
+                    a_h^, b_h^, rank, in_f, out_f, Float32(1.0),
+                    z1^, z2^, z3^, z4^,
+                ))
+    var dummy_block_ads = _dummy_lora_adapters()
+    var opt_state = lora_adamw_plain_device_state_init(
+        dummy_block_ads, 0, len(dummy_block_ads), ctx,
+    )
     var loras = List[HiDreamO1BlockLora]()
-    for li in range(LAYERS):
-        var ads = List[Optional[ZImageLoraAdapterDevice]]()
-        for sl in range(7):
-            var i = li * 7 + sl
-            var dims = _slot_dims(sl)
-            var n_a = rank * dims[0]
-            var n_b = dims[1] * rank
-            var a_off = opt_state.elem_offset(i, False)
-            var b_off = opt_state.elem_offset(i, True)
-            ads.append(Optional[ZImageLoraAdapterDevice](ZImageLoraAdapterDevice(
-                TArc(Tensor(
-                    opt_state.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
-                    [rank, dims[0]], STDtype.BF16,
-                )),
-                TArc(Tensor(
-                    opt_state.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
-                    [dims[1], rank], STDtype.BF16,
-                )),
-                rank, dims[0], dims[1], Float32(1.0),
-            )))
-        loras.append(HiDreamO1BlockLora(
-            ads[0].copy(), ads[1].copy(), ads[2].copy(), ads[3].copy(),
-            ads[4].copy(), ads[5].copy(), ads[6].copy(),
-        ))
-    print("[lora] adapters:", LAYERS * 7, " resident params:", opt_state.total)
+    if not direct_active:
+        opt_state = lora_adamw_plain_device_state_init(host_ads, 0, len(host_ads), ctx)
+        loras = _hidream_block_lora_views(host_ads, opt_state)
+        print("[lora] adapters:", LAYERS * 7, " resident params:", opt_state.total)
+    else:
+        print("[HiDreamO1-direct] block resident LoRA params skipped")
 
     # ── RESIDENT-HEAD LoRA (the +5 that make the count 257; ai-toolkit wraps
     # every transformer Linear, heads included). Own host pack + own fused
@@ -704,52 +1411,50 @@ def main() raises:
     # is untouched. B init = ZERO (lora_B starts at 0 = no-op delta, the
     # ai-toolkit/zimage convention), A init = the same LCG pattern.
     var head_ads = List[LoraAdapter]()
-    for h in range(N_HEADS):
-        var hd = _head_dims(h)
-        var in_f = hd[0]
-        var out_f = hd[1]
-        var amp = Float32(1.0) / sqrt(Float32(in_f))
-        var a_h = _lcg_pattern(rank * in_f, UInt64(10_000 + h + 1), amp)
-        var b_h = List[Float32]()
-        for _ in range(out_f * rank):
-            b_h.append(0.0)
-        var hz1 = List[Float32]()
-        for _ in range(rank * in_f):
-            hz1.append(0.0)
-        var hz2 = List[Float32]()
-        for _ in range(rank * in_f):
-            hz2.append(0.0)
-        var hz3 = List[Float32]()
-        for _ in range(out_f * rank):
-            hz3.append(0.0)
-        var hz4 = List[Float32]()
-        for _ in range(out_f * rank):
-            hz4.append(0.0)
-        head_ads.append(LoraAdapter(
-            a_h^, b_h^, rank, in_f, out_f, Float32(1.0),
-            hz1^, hz2^, hz3^, hz4^,
-        ))
-    var head_opt = lora_adamw_plain_device_state_init(head_ads, 0, len(head_ads), ctx)
+    if lokr_active:
+        head_ads = flat_lokr_carrier_list(head_lokr)
+    elif loha_active:
+        head_ads = flat_loha_carrier_list(head_loha)
+    elif direct_active:
+        print("[HiDreamO1-direct] skipping resident-head LoRA carrier")
+    else:
+        for h in range(N_HEADS):
+            var hd = _head_dims(h)
+            var in_f = hd[0]
+            var out_f = hd[1]
+            var amp = Float32(1.0) / sqrt(Float32(in_f))
+            var a_h = _lcg_pattern(rank * in_f, UInt64(10_000 + h + 1), amp)
+            var b_h = List[Float32]()
+            for _ in range(out_f * rank):
+                b_h.append(0.0)
+            var hz1 = List[Float32]()
+            for _ in range(rank * in_f):
+                hz1.append(0.0)
+            var hz2 = List[Float32]()
+            for _ in range(rank * in_f):
+                hz2.append(0.0)
+            var hz3 = List[Float32]()
+            for _ in range(out_f * rank):
+                hz3.append(0.0)
+            var hz4 = List[Float32]()
+            for _ in range(out_f * rank):
+                hz4.append(0.0)
+            head_ads.append(LoraAdapter(
+                a_h^, b_h^, rank, in_f, out_f, Float32(1.0),
+                hz1^, hz2^, hz3^, hz4^,
+            ))
+    var dummy_head_ads = _dummy_lora_adapters()
+    var head_opt = lora_adamw_plain_device_state_init(
+        dummy_head_ads, 0, len(dummy_head_ads), ctx,
+    )
     var head_loras = List[ZImageLoraAdapterDevice]()
-    for h in range(N_HEADS):
-        var hd = _head_dims(h)
-        var n_a = rank * hd[0]
-        var n_b = hd[1] * rank
-        var a_off = head_opt.elem_offset(h, False)
-        var b_off = head_opt.elem_offset(h, True)
-        head_loras.append(ZImageLoraAdapterDevice(
-            TArc(Tensor(
-                head_opt.dev_p.create_sub_buffer[DType.uint8](a_off * 2, n_a * 2),
-                [rank, hd[0]], STDtype.BF16,
-            )),
-            TArc(Tensor(
-                head_opt.dev_p.create_sub_buffer[DType.uint8](b_off * 2, n_b * 2),
-                [hd[1], rank], STDtype.BF16,
-            )),
-            rank, hd[0], hd[1], Float32(1.0),
-        ))
-    print("[lora] +head adapters:", N_HEADS, " total adapters:",
-          LAYERS * 7 + N_HEADS, " head resident params:", head_opt.total)
+    if not direct_active:
+        head_opt = lora_adamw_plain_device_state_init(head_ads, 0, len(head_ads), ctx)
+        head_loras = _hidream_head_lora_views(head_ads, head_opt)
+        print("[lora] +head adapters:", N_HEADS, " total adapters:",
+              LAYERS * 7 + N_HEADS, " head resident params:", head_opt.total)
+    else:
+        print("[HiDreamO1-direct] resident-head LoRA params skipped")
 
     # T1.B EMA (default-off, training/lora_ema.mojo SimpleTuner semantics):
     # F32 shadows over the host_ads mirrors. Config wins when it enables EMA
@@ -830,6 +1535,31 @@ def main() raises:
     var te_b2 = dit.shared[String("model.t_embedder1.mlp.2.bias")].copy()
     var fl_b = dit.shared[String("model.final_layer2.linear.bias")].copy()
 
+    if dora_active:
+        var dense_bytes = hidream_direct_dense_carrier_bytes()
+        var direct_bytes = hidream_direct_dora_preflight(rank, HIDREAM_DIRECT_24_GIB)
+        print("[HiDreamO1-dora] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " budget:", HIDREAM_DIRECT_24_GIB)
+        direct_dora = build_hidream_direct_dora_set(
+            resident_blocks, fp8_resident, xe_w1, xe_w2, te_w0, te_w2,
+            final_w, rank, train_cfg.lora_alpha,
+            train_cfg.seed * UInt64(67) + UInt64(29), ctx,
+        )
+        print("[HiDreamO1-dora] direct trainable bytes materialized:",
+              flat_direct_dora_trainable_bytes(direct_dora))
+    elif oft_active:
+        var dense_bytes = hidream_direct_dense_carrier_bytes()
+        var direct_bytes = hidream_direct_oft_preflight(
+            HIDREAM_OFT_BLOCK_SIZE, HIDREAM_DIRECT_24_GIB,
+        )
+        print("[HiDreamO1-oft] dense carrier bytes:", dense_bytes,
+              " direct trainable bytes:", direct_bytes,
+              " budget:", HIDREAM_DIRECT_24_GIB)
+        direct_oft = build_hidream_direct_oft_set(HIDREAM_OFT_BLOCK_SIZE)
+        print("[HiDreamO1-oft] direct trainable bytes materialized:",
+              flat_direct_oft_trainable_bytes(direct_oft))
+
     var smooth = Float32(0.0)
     var smooth_init = False
     for step in range(1, steps + 1):
@@ -907,11 +1637,39 @@ def main() raises:
         var freq_c = timestep_embedding(
             te_t, cfg.timestep_freq_dim, ctx, Float32(10000.0), te_dtype
         )                                                      # [1, 256]
-        var te_h0 = linear(freq_c, te_w0[], Optional[Tensor](te_b0[].clone(ctx)), ctx)
-        te_h0 = zimage_lora_apply_device(te_h0^, freq_c, head_loras[2], 1, ctx)  # [1,D]
+        var te_h0: Tensor
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            te_h0 = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(2),
+                freq_c, te_w0[], 1, 256, D, ctx,
+            )
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            te_h0 = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(2),
+                freq_c, te_w0[], 1, 256, D, ctx,
+            )
+        else:
+            te_h0 = linear(freq_c, te_w0[], Optional[Tensor](te_b0[].clone(ctx)), ctx)
+            te_h0 = zimage_lora_apply_device(te_h0^, freq_c, head_loras[2], 1, ctx)  # [1,D]
         var te_silu = silu(te_h0, ctx)                         # [1, D]
-        var t_emb = linear(te_silu, te_w2[], Optional[Tensor](te_b2[].clone(ctx)), ctx)
-        t_emb = zimage_lora_apply_device(t_emb^, te_silu, head_loras[3], 1, ctx)  # [1,D]
+        var t_emb: Tensor
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            t_emb = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(3),
+                te_silu, te_w2[], 1, D, D, ctx,
+            )
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            t_emb = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(3),
+                te_silu, te_w2[], 1, D, D, ctx,
+            )
+        else:
+            t_emb = linear(te_silu, te_w2[], Optional[Tensor](te_b2[].clone(ctx)), ctx)
+            t_emb = zimage_lora_apply_device(t_emb^, te_silu, head_loras[3], 1, ctx)  # [1,D]
 
         var tms_idx = -1
         for i in range(len(samp.text_ids)):
@@ -921,10 +1679,38 @@ def main() raises:
 
         # head 0/1: BottleneckPatchEmbed — proj1(no bias,+LoRA0) -> proj2(bias,
         # +LoRA1). noisy / pe_h1 captured for bwd.
-        var pe_h1 = linear(noisy, xe_w1[], None, ctx)  # [1,IMG_L,1024]
-        pe_h1 = zimage_lora_apply_device(pe_h1^, noisy, head_loras[0], IMG_L, ctx)
-        var patch_emb = linear(pe_h1, xe_w2[], Optional[Tensor](xe_b2[].clone(ctx)), ctx)
-        patch_emb = zimage_lora_apply_device(patch_emb^, pe_h1, head_loras[1], IMG_L, ctx)  # [1,IMG_L,D]
+        var pe_h1: Tensor
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            pe_h1 = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(0),
+                noisy, xe_w1[], IMG_L, PATCH_VEC, XEMB_MID, ctx,
+            )
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            pe_h1 = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(0),
+                noisy, xe_w1[], IMG_L, PATCH_VEC, XEMB_MID, ctx,
+            )
+        else:
+            pe_h1 = linear(noisy, xe_w1[], None, ctx)  # [1,IMG_L,1024]
+            pe_h1 = zimage_lora_apply_device(pe_h1^, noisy, head_loras[0], IMG_L, ctx)
+        var patch_emb: Tensor
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            patch_emb = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(1),
+                pe_h1, xe_w2[], IMG_L, XEMB_MID, D, ctx,
+            )
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            patch_emb = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(1),
+                pe_h1, xe_w2[], IMG_L, XEMB_MID, D, ctx,
+            )
+        else:
+            patch_emb = linear(pe_h1, xe_w2[], Optional[Tensor](xe_b2[].clone(ctx)), ctx)
+            patch_emb = zimage_lora_apply_device(patch_emb^, pe_h1, head_loras[1], IMG_L, ctx)  # [1,IMG_L,D]
         var hidden_t = concat(1, ctx, text_emb_t, patch_emb)
 
         # mrope tables + mask (per step; host)
@@ -954,10 +1740,24 @@ def main() raises:
             # T2.B: flag-off this IS _block_weights (C13); flag-on dequants
             # the fp8-resident linears to bf16 for this block only.
             var bwts = _block_weights_q(resident_blocks[li], li, fp8_resident, ctx)
-            var f = hidream_o1_block_lora_forward[S, H, HKV, Dh](
-                x, bwts, loras[li], cos_q, sin_q, cos_k, sin_k, mask4,
-                D, F, EPS, ctx,
-            )
+            var f: HiDreamO1BlockForward
+            if dora_active:
+                var direct = _hidream_direct_block_for_dora(direct_dora, li)
+                f = hidream_o1_block_direct_lycoris_forward[S, H, HKV, Dh](
+                    x, bwts, direct, cos_q, sin_q, cos_k, sin_k, mask4,
+                    D, F, EPS, ctx,
+                )
+            elif oft_active:
+                var direct = _hidream_direct_block_for_oft(direct_oft, li)
+                f = hidream_o1_block_direct_lycoris_forward[S, H, HKV, Dh](
+                    x, bwts, direct, cos_q, sin_q, cos_k, sin_k, mask4,
+                    D, F, EPS, ctx,
+                )
+            else:
+                f = hidream_o1_block_lora_forward[S, H, HKV, Dh](
+                    x, bwts, loras[li], cos_q, sin_q, cos_k, sin_k, mask4,
+                    D, F, EPS, ctx,
+                )
             x = f.out.copy()
             # f.saved drops here — recompute rebuilds it in the bwd loop.
 
@@ -965,8 +1765,22 @@ def main() raises:
         # the head-4 backward; INLINE (not dit._final_layer) for the delta.
         var final_in = x.copy()
         var final_normed = rms_norm(final_in[], norm_w[], EPS, ctx)
-        var out_full = linear(final_normed, final_w[], Optional[Tensor](fl_b[].clone(ctx)), ctx)
-        out_full = zimage_lora_apply_device(out_full^, final_normed, head_loras[4], S, ctx)  # [1,S,3072]
+        var out_full: Tensor
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            out_full = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(4),
+                final_normed, final_w[], S, D, PATCH_VEC, ctx,
+            )
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            out_full = zimage_direct_projection_forward_device(
+                head_direct, _hidream_direct_head_slot(4),
+                final_normed, final_w[], S, D, PATCH_VEC, ctx,
+            )
+        else:
+            out_full = linear(final_normed, final_w[], Optional[Tensor](fl_b[].clone(ctx)), ctx)
+            out_full = zimage_lora_apply_device(out_full^, final_normed, head_loras[4], S, ctx)  # [1,S,3072]
         var out_h = out_full.to_host(ctx)
 
         # ── loss + d_out (host F32; x-prediction -> velocity chain) ──────────
@@ -1016,15 +1830,38 @@ def main() raises:
         for _ in range(N_HEADS):
             head_g_a.append(List[Float32]())
             head_g_b.append(List[Float32]())
+        var direct_dora_grads = _hidream_direct_dora_zero_grads(direct_dora)
+        var direct_oft_grads = _hidream_direct_oft_zero_grads(direct_oft)
+        var direct_nonfinite = 0
 
-        # final backward: head-4 LoRA grad + dx through BOTH base and LoRA.
-        var h4 = zimage_lora_bwd_device_resident_tensors(
-            d_out_t, final_normed, head_loras[4], S, ctx,
-        )
-        head_g_a[4] = h4.d_a[].to_host(ctx)
-        head_g_b[4] = h4.d_b[].to_host(ctx)
-        var d_final_base = linear_backward_dx(d_out_t, final_w[], S, D, PATCH_VEC, ctx)
-        var d_final_normed = ta_add(d_final_base, h4.d_x[], ctx)
+        # final backward: head-4 adapter grad + dx through base and adapter.
+        var d_final_normed: Tensor
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            var h4 = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(4),
+                d_out_t, final_normed, final_w[], S, D, PATCH_VEC, ctx,
+            )
+            _hidream_scatter_dora(direct_dora_grads, _hidream_direct_flat_head(4), h4.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h4.g)
+            d_final_normed = h4.d_x[].clone(ctx)
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            var h4 = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(4),
+                d_out_t, final_normed, final_w[], S, D, PATCH_VEC, ctx,
+            )
+            _hidream_scatter_oft(direct_oft_grads, _hidream_direct_flat_head(4), h4.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h4.g)
+            d_final_normed = h4.d_x[].clone(ctx)
+        else:
+            var h4 = zimage_lora_bwd_device_resident_tensors(
+                d_out_t, final_normed, head_loras[4], S, ctx,
+            )
+            head_g_a[4] = h4.d_a[].to_host(ctx)
+            head_g_b[4] = h4.d_b[].to_host(ctx)
+            var d_final_base = linear_backward_dx(d_out_t, final_w[], S, D, PATCH_VEC, ctx)
+            d_final_normed = ta_add(d_final_base, h4.d_x[], ctx)
         var d_x = TArc(rms_norm_backward_dx(d_final_normed, final_in[], norm_w[], EPS, ctx))
 
         # ── backward stack: recompute tape per block, P1 backward ────────────
@@ -1040,21 +1877,48 @@ def main() raises:
             # T2.B: same dispatch as forward — backward recompute uses the
             # SAME dequantized weights forward used (deterministic decode).
             var bwts_b = _block_weights_q(resident_blocks[bi], bi, fp8_resident, ctx)
-            var rf = hidream_o1_block_lora_forward[S, H, HKV, Dh](
-                block_in[bi], bwts_b, loras[bi], cos_q, sin_q, cos_k, sin_k,
-                mask4, D, F, EPS, ctx,
-            )
-            var bg = hidream_o1_block_lora_backward[S, H, HKV, Dh](
-                d_x[], bwts_b, loras[bi], rf.saved,
-                cos_q, sin_q, cos_k, sin_k, mask_f32, D, F, EPS, ctx,
-            )
-            d_x = bg.d_hidden.copy()
-            for sl in range(7):
-                if not bg.d_a[sl]:
-                    raise Error("train_hidream_o1: missing adapter grad")
-                var k = bi * 7 + sl
-                g_a[k] = bg.d_a[sl].value()[].to_host(ctx)
-                g_b[k] = bg.d_b[sl].value()[].to_host(ctx)
+            if dora_active:
+                var direct = _hidream_direct_block_for_dora(direct_dora, bi)
+                var rf = hidream_o1_block_direct_lycoris_forward[S, H, HKV, Dh](
+                    block_in[bi], bwts_b, direct, cos_q, sin_q, cos_k, sin_k,
+                    mask4, D, F, EPS, ctx,
+                )
+                var bg = hidream_o1_block_direct_lycoris_backward[S, H, HKV, Dh](
+                    d_x[], bwts_b, direct, rf.saved,
+                    cos_q, sin_q, cos_k, sin_k, mask_f32, D, F, EPS, ctx,
+                )
+                d_x = bg.d_x.copy()
+                _hidream_scatter_dora_block(direct_dora_grads, direct, bg.grads)
+                direct_nonfinite += _hidream_nonfinite_direct_block(bg.grads)
+            elif oft_active:
+                var direct = _hidream_direct_block_for_oft(direct_oft, bi)
+                var rf = hidream_o1_block_direct_lycoris_forward[S, H, HKV, Dh](
+                    block_in[bi], bwts_b, direct, cos_q, sin_q, cos_k, sin_k,
+                    mask4, D, F, EPS, ctx,
+                )
+                var bg = hidream_o1_block_direct_lycoris_backward[S, H, HKV, Dh](
+                    d_x[], bwts_b, direct, rf.saved,
+                    cos_q, sin_q, cos_k, sin_k, mask_f32, D, F, EPS, ctx,
+                )
+                d_x = bg.d_x.copy()
+                _hidream_scatter_oft_block(direct_oft_grads, direct, bg.grads)
+                direct_nonfinite += _hidream_nonfinite_direct_block(bg.grads)
+            else:
+                var rf = hidream_o1_block_lora_forward[S, H, HKV, Dh](
+                    block_in[bi], bwts_b, loras[bi], cos_q, sin_q, cos_k, sin_k,
+                    mask4, D, F, EPS, ctx,
+                )
+                var bg = hidream_o1_block_lora_backward[S, H, HKV, Dh](
+                    d_x[], bwts_b, loras[bi], rf.saved,
+                    cos_q, sin_q, cos_k, sin_k, mask_f32, D, F, EPS, ctx,
+                )
+                d_x = bg.d_hidden.copy()
+                for sl in range(7):
+                    if not bg.d_a[sl]:
+                        raise Error("train_hidream_o1: missing adapter grad")
+                    var k = bi * 7 + sl
+                    g_a[k] = bg.d_a[sl].value()[].to_host(ctx)
+                    g_b[k] = bg.d_b[sl].value()[].to_host(ctx)
             bi -= 1
 
         # ── resident-head backward (heads 0,1,2,3). d_x now = grad wrt hidden_t
@@ -1063,47 +1927,116 @@ def main() raises:
         # already done before the loop.)
         var d_patch_emb = ta_slice(d_x[], 1, S_TEXT, IMG_L, ctx)   # [1, IMG_L, D]
         # head 1 (proj2): grad wrt proj2 out = d_patch_emb; input = pe_h1.
-        var h1g = zimage_lora_bwd_device_resident_tensors(
-            d_patch_emb, pe_h1, head_loras[1], IMG_L, ctx,
-        )
-        head_g_a[1] = h1g.d_a[].to_host(ctx)
-        head_g_b[1] = h1g.d_b[].to_host(ctx)
-        # dx wrt pe_h1 through BOTH base proj2 and its LoRA.
-        var d_pe_h1_base = linear_backward_dx(d_patch_emb, xe_w2[], IMG_L, XEMB_MID, D, ctx)
-        var d_pe_h1 = ta_add(d_pe_h1_base, h1g.d_x[], ctx)         # [IMG_L, 1024]
+        var d_pe_h1: Tensor
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            var h1g = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(1),
+                d_patch_emb, pe_h1, xe_w2[], IMG_L, XEMB_MID, D, ctx,
+            )
+            _hidream_scatter_dora(direct_dora_grads, _hidream_direct_flat_head(1), h1g.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h1g.g)
+            d_pe_h1 = h1g.d_x[].clone(ctx)
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            var h1g = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(1),
+                d_patch_emb, pe_h1, xe_w2[], IMG_L, XEMB_MID, D, ctx,
+            )
+            _hidream_scatter_oft(direct_oft_grads, _hidream_direct_flat_head(1), h1g.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h1g.g)
+            d_pe_h1 = h1g.d_x[].clone(ctx)
+        else:
+            var h1g = zimage_lora_bwd_device_resident_tensors(
+                d_patch_emb, pe_h1, head_loras[1], IMG_L, ctx,
+            )
+            head_g_a[1] = h1g.d_a[].to_host(ctx)
+            head_g_b[1] = h1g.d_b[].to_host(ctx)
+            # dx wrt pe_h1 through BOTH base proj2 and its LoRA.
+            var d_pe_h1_base = linear_backward_dx(d_patch_emb, xe_w2[], IMG_L, XEMB_MID, D, ctx)
+            d_pe_h1 = ta_add(d_pe_h1_base, h1g.d_x[], ctx)         # [IMG_L, 1024]
         # head 0 (proj1): grad wrt proj1 out = d_pe_h1; input = noisy (data, no
         # further upstream needed).
-        var h0g = zimage_lora_bwd_device_resident_tensors(
-            d_pe_h1, noisy, head_loras[0], IMG_L, ctx,
-        )
-        head_g_a[0] = h0g.d_a[].to_host(ctx)
-        head_g_b[0] = h0g.d_b[].to_host(ctx)
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            var h0g = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(0),
+                d_pe_h1, noisy, xe_w1[], IMG_L, PATCH_VEC, XEMB_MID, ctx,
+            )
+            _hidream_scatter_dora(direct_dora_grads, _hidream_direct_flat_head(0), h0g.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h0g.g)
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            var h0g = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(0),
+                d_pe_h1, noisy, xe_w1[], IMG_L, PATCH_VEC, XEMB_MID, ctx,
+            )
+            _hidream_scatter_oft(direct_oft_grads, _hidream_direct_flat_head(0), h0g.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h0g.g)
+        else:
+            var h0g = zimage_lora_bwd_device_resident_tensors(
+                d_pe_h1, noisy, head_loras[0], IMG_L, ctx,
+            )
+            head_g_a[0] = h0g.d_a[].to_host(ctx)
+            head_g_b[0] = h0g.d_b[].to_host(ctx)
 
         # timestep MLP: the tms-row grad feeds mlp.2 -> SiLU -> mlp.0.
-        var d_t_emb = ta_slice(d_x[], 1, tms_idx, 1, ctx)         # [1, 1, D]
+        var d_t_emb_raw = ta_slice(d_x[], 1, tms_idx, 1, ctx)     # [1, 1, D]
+        var d_t_emb = reshape_owned(d_t_emb_raw^, [1, D])         # [1, D]
         # head 3 (mlp.2): grad wrt mlp.2 out = d_t_emb; input = te_silu.
-        var h3g = zimage_lora_bwd_device_resident_tensors(
-            d_t_emb, te_silu, head_loras[3], 1, ctx,
-        )
-        head_g_a[3] = h3g.d_a[].to_host(ctx)
-        head_g_b[3] = h3g.d_b[].to_host(ctx)
-        var d_te_silu_base = linear_backward_dx(d_t_emb, te_w2[], 1, D, D, ctx)
-        var d_te_silu = ta_add(d_te_silu_base, h3g.d_x[], ctx)    # [1, D]
+        var d_te_silu: Tensor
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            var h3g = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(3),
+                d_t_emb, te_silu, te_w2[], 1, D, D, ctx,
+            )
+            _hidream_scatter_dora(direct_dora_grads, _hidream_direct_flat_head(3), h3g.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h3g.g)
+            d_te_silu = h3g.d_x[].clone(ctx)
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            var h3g = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(3),
+                d_t_emb, te_silu, te_w2[], 1, D, D, ctx,
+            )
+            _hidream_scatter_oft(direct_oft_grads, _hidream_direct_flat_head(3), h3g.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h3g.g)
+            d_te_silu = h3g.d_x[].clone(ctx)
+        else:
+            var h3g = zimage_lora_bwd_device_resident_tensors(
+                d_t_emb, te_silu, head_loras[3], 1, ctx,
+            )
+            head_g_a[3] = h3g.d_a[].to_host(ctx)
+            head_g_b[3] = h3g.d_b[].to_host(ctx)
+            var d_te_silu_base = linear_backward_dx(d_t_emb, te_w2[], 1, D, D, ctx)
+            d_te_silu = ta_add(d_te_silu_base, h3g.d_x[], ctx)    # [1, D]
         # SiLU backward (te_h0 = pre-silu mlp.0 output incl. its LoRA).
         var d_te_h0 = silu_backward(d_te_silu, te_h0, ctx)        # [1, D]
         # head 2 (mlp.0): grad wrt mlp.0 out = d_te_h0; input = freq_c (frozen
         # sinusoid, no further upstream).
-        var h2g = zimage_lora_bwd_device_resident_tensors(
-            d_te_h0, freq_c, head_loras[2], 1, ctx,
-        )
-        head_g_a[2] = h2g.d_a[].to_host(ctx)
-        head_g_b[2] = h2g.d_b[].to_host(ctx)
-
-        # ai-toolkit global grad-norm clip @ 1.0 over ALL 257 adapters' grads
-        # (block 252 + head 5), then each optimizer steps its own set.
-        var grad_norm = _clip_grads_all(
-            g_a, g_b, head_g_a, head_g_b, CLIP_GRAD_NORM,
-        )
+        if dora_active:
+            var head_direct = _hidream_direct_head_for_dora(direct_dora)
+            var h2g = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(2),
+                d_te_h0, freq_c, te_w0[], 1, 256, D, ctx,
+            )
+            _hidream_scatter_dora(direct_dora_grads, _hidream_direct_flat_head(2), h2g.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h2g.g)
+        elif oft_active:
+            var head_direct = _hidream_direct_head_for_oft(direct_oft)
+            var h2g = zimage_direct_projection_backward_device(
+                head_direct, _hidream_direct_head_slot(2),
+                d_te_h0, freq_c, te_w0[], 1, 256, D, ctx,
+            )
+            _hidream_scatter_oft(direct_oft_grads, _hidream_direct_flat_head(2), h2g.g)
+            direct_nonfinite += _hidream_nonfinite_direct(h2g.g)
+        else:
+            var h2g = zimage_lora_bwd_device_resident_tensors(
+                d_te_h0, freq_c, head_loras[2], 1, ctx,
+            )
+            head_g_a[2] = h2g.d_a[].to_host(ctx)
+            head_g_b[2] = h2g.d_b[].to_host(ctx)
 
         # T2.B gate instrumentation (argv[8], default-off): dump the step-1
         # adapter grads BEFORE the optimizer touches anything, for the
@@ -1111,50 +2044,165 @@ def main() raises:
         if step == 1 and grad_dump != String(""):
             var gnames = List[String]()
             var gtensors = List[TArc]()
-            for k in range(LAYERS * 7):
-                gnames.append(String("g_a.") + String(k))
-                gtensors.append(TArc(Tensor.from_host(
-                    g_a[k].copy(), [len(g_a[k])], STDtype.F32, ctx)))
-                gnames.append(String("g_b.") + String(k))
-                gtensors.append(TArc(Tensor.from_host(
-                    g_b[k].copy(), [len(g_b[k])], STDtype.F32, ctx)))
-            for h in range(N_HEADS):
-                gnames.append(String("g_a.head.") + String(h))
-                gtensors.append(TArc(Tensor.from_host(
-                    head_g_a[h].copy(), [len(head_g_a[h])], STDtype.F32, ctx)))
-                gnames.append(String("g_b.head.") + String(h))
-                gtensors.append(TArc(Tensor.from_host(
-                    head_g_b[h].copy(), [len(head_g_b[h])], STDtype.F32, ctx)))
+            if dora_active:
+                for k in range(len(direct_dora_grads.g)):
+                    gnames.append(String("g_a.direct.") + String(k))
+                    gtensors.append(TArc(Tensor.from_host(
+                        direct_dora_grads.g[k].d_a.copy(),
+                        [len(direct_dora_grads.g[k].d_a)], STDtype.F32, ctx)))
+                    gnames.append(String("g_b.direct.") + String(k))
+                    gtensors.append(TArc(Tensor.from_host(
+                        direct_dora_grads.g[k].d_b.copy(),
+                        [len(direct_dora_grads.g[k].d_b)], STDtype.F32, ctx)))
+                    gnames.append(String("g_m.direct.") + String(k))
+                    gtensors.append(TArc(Tensor.from_host(
+                        direct_dora_grads.g[k].d_m.copy(),
+                        [len(direct_dora_grads.g[k].d_m)], STDtype.F32, ctx)))
+            elif oft_active:
+                for k in range(len(direct_oft_grads.d_vec)):
+                    gnames.append(String("g_vec.direct.") + String(k))
+                    gtensors.append(TArc(Tensor.from_host(
+                        direct_oft_grads.d_vec[k].copy(),
+                        [len(direct_oft_grads.d_vec[k])], STDtype.F32, ctx)))
+            else:
+                for k in range(LAYERS * 7):
+                    gnames.append(String("g_a.") + String(k))
+                    gtensors.append(TArc(Tensor.from_host(
+                        g_a[k].copy(), [len(g_a[k])], STDtype.F32, ctx)))
+                    gnames.append(String("g_b.") + String(k))
+                    gtensors.append(TArc(Tensor.from_host(
+                        g_b[k].copy(), [len(g_b[k])], STDtype.F32, ctx)))
+                for h in range(N_HEADS):
+                    gnames.append(String("g_a.head.") + String(h))
+                    gtensors.append(TArc(Tensor.from_host(
+                        head_g_a[h].copy(), [len(head_g_a[h])], STDtype.F32, ctx)))
+                    gnames.append(String("g_b.head.") + String(h))
+                    gtensors.append(TArc(Tensor.from_host(
+                        head_g_b[h].copy(), [len(head_g_b[h])], STDtype.F32, ctx)))
             save_safetensors(gnames, gtensors, grad_dump, ctx)
             print("[grad-dump] ", grad_dump)
-        if levers_optimizer_active(train_cfg):
-            # T1.C optimizer lever (default-off): host adafactor /
-            # schedule-free step on the host_ads mirrors + resident dev_p
-            # sync so the device LoRA views (sub-buffers of opt_state.dev_p)
-            # see the new weights next step (levers.mojo T1.C header). No LR
-            # scheduler here: step_lr == the constant resolved lr.
-            levers_optimizer_step(
-                train_cfg, host_ads, g_a, g_b, step, lr,
-                lev_opt, opt_state, ctx,
+
+        # ai-toolkit global grad-norm clip @ 1.0 over ALL 257 adapters' grads
+        # (block 252 + head 5), then each optimizer steps its own set.
+        var grad_norm: Float64
+        if dora_active:
+            grad_norm = flat_direct_dora_grad_norm(direct_dora_grads)
+            if grad_norm > Float64(train_cfg.max_grad_norm):
+                flat_direct_dora_clip_grads(
+                    direct_dora_grads,
+                    train_cfg.max_grad_norm / Float32(grad_norm),
+                )
+            flat_direct_dora_adamw_step(
+                direct_dora, direct_dora_grads, step, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
             )
+            print("[HiDreamO1-dora] step=", step, " direct_grad_norm=", Float32(grad_norm),
+                  " zero_leg_l1=", flat_direct_dora_zero_leg_l1(direct_dora),
+                  " nonfinite=", direct_nonfinite)
+        elif oft_active:
+            grad_norm = flat_direct_oft_grad_norm(direct_oft_grads)
+            if grad_norm > Float64(train_cfg.max_grad_norm):
+                flat_direct_oft_clip_grads(
+                    direct_oft_grads,
+                    train_cfg.max_grad_norm / Float32(grad_norm),
+                )
+            flat_direct_oft_adamw_step(
+                direct_oft, direct_oft_grads, step, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            print("[HiDreamO1-oft] step=", step, " direct_grad_norm=", Float32(grad_norm),
+                  " vec_l1=", flat_direct_oft_vec_l1(direct_oft),
+                  " nonfinite=", direct_nonfinite)
+        elif lokr_active:
+            var bg = flat_lokr_chain_all(block_lokr, g_a, g_b)
+            var hg = flat_lokr_chain_all(head_lokr, head_g_a, head_g_b)
+            var bn = flat_lokr_grad_norm(bg)
+            var hn = flat_lokr_grad_norm(hg)
+            grad_norm = sqrt(bn * bn + hn * hn)
+            if grad_norm > Float64(train_cfg.max_grad_norm):
+                var clip_scale = train_cfg.max_grad_norm / Float32(grad_norm)
+                flat_lokr_clip_grads(bg, clip_scale)
+                flat_lokr_clip_grads(hg, clip_scale)
+            flat_lokr_adamw_step(
+                block_lokr, bg, step, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            flat_lokr_adamw_step(
+                head_lokr, hg, step, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            host_ads = flat_lokr_carrier_list(block_lokr)
+            head_ads = flat_lokr_carrier_list(head_lokr)
+            opt_state = lora_adamw_plain_device_state_init(host_ads, 0, len(host_ads), ctx)
+            loras = _hidream_block_lora_views(host_ads, opt_state)
+            head_opt = lora_adamw_plain_device_state_init(head_ads, 0, len(head_ads), ctx)
+            head_loras = _hidream_head_lora_views(head_ads, head_opt)
+            print("[HiDreamO1-lokr] step=", step, " master_grad_norm=", Float32(grad_norm),
+                  " zero_leg_l1=", flat_lokr_zero_leg_l1(block_lokr) + flat_lokr_zero_leg_l1(head_lokr))
+        elif loha_active:
+            var bg = flat_loha_chain_all(block_loha, g_a, g_b)
+            var hg = flat_loha_chain_all(head_loha, head_g_a, head_g_b)
+            var bn = flat_loha_grad_norm(bg)
+            var hn = flat_loha_grad_norm(hg)
+            grad_norm = sqrt(bn * bn + hn * hn)
+            if grad_norm > Float64(train_cfg.max_grad_norm):
+                var clip_scale = train_cfg.max_grad_norm / Float32(grad_norm)
+                flat_loha_clip_grads(bg, clip_scale)
+                flat_loha_clip_grads(hg, clip_scale)
+            flat_loha_adamw_step(
+                block_loha, bg, step, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            flat_loha_adamw_step(
+                head_loha, hg, step, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay,
+            )
+            host_ads = flat_loha_carrier_list(block_loha)
+            head_ads = flat_loha_carrier_list(head_loha)
+            opt_state = lora_adamw_plain_device_state_init(host_ads, 0, len(host_ads), ctx)
+            loras = _hidream_block_lora_views(host_ads, opt_state)
+            head_opt = lora_adamw_plain_device_state_init(head_ads, 0, len(head_ads), ctx)
+            head_loras = _hidream_head_lora_views(head_ads, head_opt)
+            print("[HiDreamO1-loha] step=", step, " master_grad_norm=", Float32(grad_norm),
+                  " zero_leg_l1=", flat_loha_zero_leg_l1(block_loha) + flat_loha_zero_leg_l1(head_loha))
         else:
-            # Default fused resident AdamW. cfg hypers == the old literals
-            # 0.9/0.999/1e-8/0.01 when no config (TrainConfig defaults), so
-            # the no-config path is numerically unchanged; a config's
-            # optimizer.{beta1,beta2,eps,weight_decay} overrides.
+            grad_norm = _clip_grads_all(
+                g_a, g_b, head_g_a, head_g_b, CLIP_GRAD_NORM,
+            )
+            if levers_optimizer_active(train_cfg):
+                # T1.C optimizer lever (default-off): host adafactor /
+                # schedule-free step on the host_ads mirrors + resident dev_p
+                # sync so the device LoRA views (sub-buffers of opt_state.dev_p)
+                # see the new weights next step (levers.mojo T1.C header). No LR
+                # scheduler here: step_lr == the constant resolved lr.
+                levers_optimizer_step(
+                    train_cfg, host_ads, g_a, g_b, step, lr,
+                    lev_opt, opt_state, ctx,
+                )
+            else:
+                # Default fused resident AdamW. cfg hypers == the old literals
+                # 0.9/0.999/1e-8/0.01 when no config (TrainConfig defaults), so
+                # the no-config path is numerically unchanged; a config's
+                # optimizer.{beta1,beta2,eps,weight_decay} overrides.
+                fused_lora_adamw_plain_step_resident(
+                    opt_state, host_ads, g_a, g_b, step, lr,
+                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                    train_cfg.weight_decay, ctx,
+                )
+            # Resident-head adapters always step with plain fused AdamW (same
+            # hypers — bitsandbytes AdamW8bit-equivalent eps). The levers optimizer
+            # dispatch above is the block-adapter lever; heads keep the default.
             fused_lora_adamw_plain_step_resident(
-                opt_state, host_ads, g_a, g_b, step, lr,
+                head_opt, head_ads, head_g_a, head_g_b, step, lr,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay, ctx,
             )
-        # Resident-head adapters always step with plain fused AdamW (same
-        # hypers — bitsandbytes AdamW8bit-equivalent eps). The levers optimizer
-        # dispatch above is the block-adapter lever; heads keep the default.
-        fused_lora_adamw_plain_step_resident(
-            head_opt, head_ads, head_g_a, head_g_b, step, lr,
-            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
-            train_cfg.weight_decay, ctx,
-        )
         # T1.B EMA: host_ads mirrors are FRESH here — both optimizer paths
         # write updated P back into them (resident: lora_adamw_plain_fused
         # .mojo:483-502 readback; levers: host step IS the mirror). Heads are
@@ -1169,12 +2217,30 @@ def main() raises:
             smooth = loss
             smooth_init = True
         var b_absum = Float32(0.0)
-        for k in range(LAYERS * 7):
-            for i in range(len(host_ads[k].b)):
-                var av = Float32(host_ads[k].b[i])
-                b_absum += av if av >= 0.0 else -av
+        if lokr_active:
+            b_absum = Float32(flat_lokr_zero_leg_l1(block_lokr) + flat_lokr_zero_leg_l1(head_lokr))
+        elif loha_active:
+            b_absum = Float32(flat_loha_zero_leg_l1(block_loha) + flat_loha_zero_leg_l1(head_loha))
+        elif dora_active:
+            b_absum = Float32(flat_direct_dora_zero_leg_l1(direct_dora))
+        elif oft_active:
+            b_absum = Float32(flat_direct_oft_vec_l1(direct_oft))
+        else:
+            for k in range(LAYERS * 7):
+                for i in range(len(host_ads[k].b)):
+                    var av = Float32(host_ads[k].b[i])
+                    b_absum += av if av >= 0.0 else -av
+        var progress_algo = String("lora")
+        if lokr_active:
+            progress_algo = String("lokr")
+        elif loha_active:
+            progress_algo = String("loha")
+        elif dora_active:
+            progress_algo = String("dora")
+        elif oft_active:
+            progress_algo = String("oft")
         print(
-            "[HiDreamO1-lora] step ", step, "/", steps,
+            "[HiDreamO1-" + progress_algo + "] step ", step, "/", steps,
             " | sigma ", sigma, " | loss ", loss, " | smooth ", smooth,
             " | gnorm ", grad_norm,
             " | B|.|1 ", b_absum,
@@ -1195,6 +2261,31 @@ def main() raises:
     # weight save sits between eval_for_save / train_after_save. No-op for
     # ADAMW / ADAFACTOR.
     levers_optimizer_eval_for_save(train_cfg, lev_opt)
+    var out_path = out_dir + "/hidream_o1_lora_last.safetensors"
+    if lokr_active:
+        var nmods = save_flat_lokr_pair(block_lokr, head_lokr, out_path, ctx)
+        print("[save] ", out_path, " (", nmods, " LoKr adapters)")
+        levers_optimizer_train_after_save(train_cfg, lev_opt)
+        print("DONE: hidream-o1 reached step ", steps)
+        return
+    elif loha_active:
+        var nmods = save_flat_loha_pair(block_loha, head_loha, out_path, ctx)
+        print("[save] ", out_path, " (", nmods, " LoHa adapters)")
+        levers_optimizer_train_after_save(train_cfg, lev_opt)
+        print("DONE: hidream-o1 reached step ", steps)
+        return
+    elif dora_active:
+        var nmods = save_hidream_direct_dora(direct_dora, out_path, ctx)
+        print("[save] ", out_path, " (", nmods, " DoRA adapters)")
+        levers_optimizer_train_after_save(train_cfg, lev_opt)
+        print("DONE: hidream-o1 reached step ", steps)
+        return
+    elif oft_active:
+        var nmods = save_hidream_direct_oft(direct_oft, out_path, ctx)
+        print("[save] ", out_path, " (", nmods, " OFT adapters)")
+        levers_optimizer_train_after_save(train_cfg, lev_opt)
+        print("DONE: hidream-o1 reached step ", steps)
+        return
     # `names` stays BLOCK-ONLY so the EMA save (block adapters only) can reuse
     # it; the main save appends the 5 head keys to a combined list.
     var names = List[String]()
@@ -1225,7 +2316,6 @@ def main() raises:
         all_names.append(hpref + ".lora_B.weight")
         all_tensors.append(TArc(Tensor.from_host_bf16(
             head_ads[h].b.copy(), [hd[1], rank], ctx)))
-    var out_path = out_dir + "/hidream_o1_lora_last.safetensors"
     save_safetensors(all_names, all_tensors, out_path, ctx)
     print("[save] ", out_path, " (", len(all_names) // 2, " adapters)")
     if ema_on:
