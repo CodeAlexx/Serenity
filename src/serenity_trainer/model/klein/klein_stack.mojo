@@ -87,7 +87,7 @@ from serenitymojo.ops.norm import layer_norm
 comptime TArc = ArcPointer[Tensor]
 from serenitymojo.ops.elementwise import modulate
 from serenitymojo.ops.linalg_backward import linear_backward, LinearGrads
-from serenitymojo.ops.norm_backward import layer_norm_backward, LayerNormBackward
+from serenitymojo.ops.norm_backward import layer_norm_backward, layer_norm_backward_dx, LayerNormBackward
 from serenitymojo.ops.elementwise_backward import modulate_backward, ModulateBackward
 
 from serenity_trainer.model.klein.double_block import (
@@ -435,12 +435,12 @@ def klein_stack_backward[
     var d_final_scale = mbf.d_scale.to_host(ctx)
     var d_final_shift = mbf.d_shift.to_host(ctx)
 
-    # ln_img_out = layer_norm(img_out, 1, 0)
-    var lnbf = layer_norm_backward(
+    # ln_img_out = layer_norm(img_out, 1, 0); weight is frozen ones -> d_x-only
+    var lnbf_dx = layer_norm_backward_dx(
         _t(d_ln_img_out, [N_IMG, D], ctx), saved.img_out[],
         _t(_ones(D), [D], ctx), eps, ctx,
     )
-    var d_img_out = lnbf.d_x.to_host(ctx)   # [N_IMG,D]
+    var d_img_out = lnbf_dx.to_host(ctx)   # [N_IMG,D]
 
     # single stack seed: img_out feeds the img rows of the LAST single block's
     # output; txt rows are not read by the final layer -> zero. d_x = [S,D].

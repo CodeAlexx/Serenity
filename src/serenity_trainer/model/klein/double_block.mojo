@@ -702,11 +702,11 @@ def _stream_post_backward(
     var d_scale2 = mb2.d_scale.to_host(ctx)
     var d_shift2 = mb2.d_shift.to_host(ctx)
 
-    # ln2 = layer_norm(attn_res, 1, 0)
-    var lnb2 = layer_norm_backward(mb2.d_x, sv.attn_res[], ones, eps, ctx)
+    # ln2 = layer_norm(attn_res, 1, 0); weight is frozen ones -> d_x-only backward
+    var d_attn_res_norm = layer_norm_backward_dx(mb2.d_x, sv.attn_res[], ones, eps, ctx)
     # attn_res feeds BOTH the residual (grg2.d_x) AND ln2 -> SUM on device
     # (tensor_algebra.add; both [N,D], no host bounce).
-    var d_attn_res_total = TArc(add(grg2.d_x, lnb2.d_x, ctx))
+    var d_attn_res_total = TArc(add(grg2.d_x, d_attn_res_norm, ctx))
 
     # attn_res = residual_gate(x, gate1, proj_out): o = x + gate1*proj_out
     var no_bias = Optional[Tensor](None)
@@ -787,9 +787,9 @@ def _stream_pre_backward[
     var d_scale1 = mb1.d_scale.to_host(ctx)
     var d_shift1 = mb1.d_shift.to_host(ctx)
 
-    # ln1 = layer_norm(x, 1, 0)
-    var lnb1 = layer_norm_backward(mb1.d_x, sv.x[], ones, eps, ctx)
-    var d_x_norm = lnb1.d_x.to_host(ctx)
+    # ln1 = layer_norm(x, 1, 0); weight is frozen ones -> d_x-only backward
+    var d_x_norm_t = layer_norm_backward_dx(mb1.d_x, sv.x[], ones, eps, ctx)
+    var d_x_norm = d_x_norm_t.to_host(ctx)
     return _StreamPreBack(
         d_x_norm^, d_wqkv^, d_q_norm^, d_k_norm^, d_shift1^, d_scale1^
     )

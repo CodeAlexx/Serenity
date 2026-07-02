@@ -95,7 +95,7 @@ from serenitymojo.ops.norm import layer_norm
 from serenitymojo.ops.elementwise import modulate
 from serenitymojo.ops.tensor_algebra import concat
 from serenitymojo.ops.linalg_backward import linear_backward
-from serenitymojo.ops.norm_backward import layer_norm_backward
+from serenitymojo.ops.norm_backward import layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 
 
@@ -756,10 +756,10 @@ def chroma_stack_lora_backward_offload[
         _t(saved.final_scale.copy(), [D], ctx), ctx,
     )
     var d_ln_img_out = mbf.d_x.to_host(ctx)
-    var lnbf = layer_norm_backward(
+    var lnbf = layer_norm_backward_dx(
         _t(d_ln_img_out, [N_IMG, D], ctx), saved.img_out[], _t(_ones(D), [D], ctx), eps, ctx,
     )
-    var d_img_out = lnbf.d_x.to_host(ctx)
+    var d_img_out = lnbf.to_host(ctx)
 
     var d_x = _concat_seq(_zeros(N_TXT * D), d_img_out)
 

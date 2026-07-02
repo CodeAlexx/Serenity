@@ -147,6 +147,7 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
     validate_ot_gradient_checkpointing_policy,
     validate_ot_train_math_policy,
 )
+from serenitymojo.training.lora_adamw_plain_fused import fused_lora_adamw_plain_step
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.ernie_validation_sampler import (
     generate_ernie_lora_shift_pair, load_ernie_sample_text_tokens,
@@ -166,6 +167,17 @@ comptime NUM_LAYERS = 36       # REAL depth
 comptime EPS = Float32(1e-06)
 comptime ERNIE_OFT_BLOCK_SIZE = 4
 comptime ERNIE_CARRIER_RUNTIME_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
+
+# GPU fused plain-AdamW for the flat LoRA adapter list (TRAINING_SPEED_AUDIT
+# 2026-07-01): route the SAME host d_a/d_b grad lists through ONE
+# fused_lora_adamw_plain_step launch over all 7*NUM_LAYERS adapters instead of
+# the per-adapter host scalar loop (ernie_lora_adamw_step -> _lora_adamw ->
+# _adamw_host_list). Identical per-element math (F32 moments, plain RNE bf16
+# param writeback); host-vs-device differs only at the documented FMA
+# ulp class (training/lora_adamw_plain_fused_parity.mojo bars; smoke:
+# smoke/ernie_gpu_adamw_update_parity_smoke.mojo in serenity-trainer).
+# False = old host loop, retained unchanged.
+comptime ERNIE_GPU_ADAMW = True
 
 # ── cache geometry: latent [1,128,32,32] -> 32x32 = 1024 image tokens ─────────
 comptime IMG_H = 32
@@ -1102,6 +1114,14 @@ def main() raises:
                   " vec_l1=", flat_direct_oft_vec_l1(direct_oft))
         else:
             # ── device-resident LoRA/carrier forward (BF16 base blocks resident) ──
+            # NOTE (speed audit 2026-07-01): this per-step upload is NOT dead
+            # weight — both optimizer paths (host loop and ERNIE_GPU_ADAMW
+            # fused step) write updated params back into the HOST lora.ad
+            # lists, and lokr/loha/resume paths reassign `lora` mid-loop, so
+            # this rebuild is how updated weights reach the device. Hoisting
+            # it requires the resident-param design (LoraAdamWPlainDeviceState
+            # dev_p as the live weight buffer, zimage ZIMAGE_V2_ENGINE
+            # pattern), not a simple move.
             var lora_dev = ernie_lora_set_to_device(lora, STDtype.BF16, ctx)
             var fwd = ernie_stack_lora_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
                 noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
@@ -1145,10 +1165,24 @@ def main() raises:
                 print("[Ernie-loha] step=", done_step, " master_grad_norm=", Float32(mnorm),
                       " zero_leg_l1=", ernie_loha_zero_leg_l1(loha_masters))
             else:
-                ernie_lora_adamw_step(
-                    lora, grads, done_step, step_lr, ctx,
-                    train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
-                )
+                comptime if ERNIE_GPU_ADAMW:
+                    # GPU fused plain-AdamW over the whole flat adapter list.
+                    # grads.d_a/d_b were already global-norm clipped on host by
+                    # _clip_grads above, so clip_scale stays at its 1.0 default.
+                    # Updated params land back in the host lora.ad mirrors —
+                    # the per-step ernie_lora_set_to_device upload (top of this
+                    # branch) is still how the device sees the new weights.
+                    fused_lora_adamw_plain_step(
+                        lora.ad, grads.d_a, grads.d_b, 0, len(lora.ad),
+                        done_step, step_lr,
+                        train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                        train_cfg.weight_decay, ctx,
+                    )
+                else:
+                    ernie_lora_adamw_step(
+                        lora, grads, done_step, step_lr, ctx,
+                        train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
+                    )
 
         var now = perf_counter()
         var step_secs = now - step_t0

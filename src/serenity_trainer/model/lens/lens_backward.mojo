@@ -56,7 +56,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.linalg_backward import linear_backward
-from serenitymojo.ops.norm_backward import rms_norm_backward, layer_norm_backward
+from serenitymojo.ops.norm_backward import rms_norm_backward_dx, layer_norm_backward_dx
 from serenitymojo.ops.elementwise_backward import modulate_backward
 from serenitymojo.ops.rope_struct_backward import rope_backward, gate_residual_backward
 from serenitymojo.ops.attention_backward import sdpa_backward
@@ -387,10 +387,10 @@ def _stream_post_backward(
     var mb2 = modulate_backward(_to3d(d_m2, N, DIM, ctx), sv.rn2[], scale2, ctx)
     var d_scale2 = mb2.d_scale.to_host(ctx)
     var d_shift2 = mb2.d_shift.to_host(ctx)
-    # rn2 = rms_norm(attn_res, n2w)
-    var rb2 = rms_norm_backward(mb2.d_x, sv.attn_res[], sv.n2w[], BLOCK_NORM_EPS, ctx)
+    # rn2 = rms_norm(attn_res, n2w)  (n2w FROZEN → d_x-only backward)
+    var rb2_dx = rms_norm_backward_dx(mb2.d_x, sv.attn_res[], sv.n2w[], BLOCK_NORM_EPS, ctx)
     # attn_res feeds BOTH the gate2 residual branch AND rn2 → sum.
-    var d_attn_res = add(grg2.d_x, rb2.d_x, ctx)     # [1,N,DIM]
+    var d_attn_res = add(grg2.d_x, rb2_dx, ctx)      # [1,N,DIM]
 
     # 7) attn_res = residual_gate(x, gate1, proj)
     var grg1 = gate_residual_backward(d_attn_res, sv.x[], gate1, sv.proj[], ctx)
@@ -442,9 +442,8 @@ def _stream_pre_backward(
     var mb1 = modulate_backward(_to3d(bqkv.d_x, N, DIM, ctx), sv.rn1[], scale1, ctx)
     var d_scale1 = mb1.d_scale.to_host(ctx)
     var d_shift1 = mb1.d_shift.to_host(ctx)
-    # rn1 = rms_norm(x, n1w)
-    var rb1 = rms_norm_backward(mb1.d_x, sv.x[], sv.n1w[], BLOCK_NORM_EPS, ctx)
-    var d_x_norm = _clone(rb1.d_x, ctx)
+    # rn1 = rms_norm(x, n1w)  (n1w FROZEN → d_x-only backward; owned Tensor, no clone)
+    var d_x_norm = rms_norm_backward_dx(mb1.d_x, sv.x[], sv.n1w[], BLOCK_NORM_EPS, ctx)
     return _PreBack(d_x_norm^, bqkv.g.copy(), _list_to_t(d_scale1, ctx), _list_to_t(d_shift1, ctx))
 
 
@@ -508,17 +507,18 @@ def lens_block_backward[
     var d_ik_rms = rope_backward(ck.d_0, blk.img_cos[], blk.img_sin[], ROPE_INTERLEAVED, ctx)
     var d_tq_rms = rope_backward(cq.d_1, blk.txt_cos[], blk.txt_sin[], ROPE_INTERLEAVED, ctx)
     var d_tk_rms = rope_backward(ck.d_1, blk.txt_cos[], blk.txt_sin[], ROPE_INTERLEAVED, ctx)
-    var iq = rms_norm_backward(d_iq_rms, blk.img.q_pre[], blk.img.nq[], QK_NORM_EPS, ctx)
-    var ik = rms_norm_backward(d_ik_rms, blk.img.k_pre[], blk.img.nk[], QK_NORM_EPS, ctx)
-    var tq = rms_norm_backward(d_tq_rms, blk.txt.q_pre[], blk.txt.nq[], QK_NORM_EPS, ctx)
-    var tk = rms_norm_backward(d_tk_rms, blk.txt.k_pre[], blk.txt.nk[], QK_NORM_EPS, ctx)
+    # (nq/nk FROZEN → d_x-only backward)
+    var d_iq = rms_norm_backward_dx(d_iq_rms, blk.img.q_pre[], blk.img.nq[], QK_NORM_EPS, ctx)
+    var d_ik = rms_norm_backward_dx(d_ik_rms, blk.img.k_pre[], blk.img.nk[], QK_NORM_EPS, ctx)
+    var d_tq = rms_norm_backward_dx(d_tq_rms, blk.txt.q_pre[], blk.txt.nq[], QK_NORM_EPS, ctx)
+    var d_tk = rms_norm_backward_dx(d_tk_rms, blk.txt.k_pre[], blk.txt.nk[], QK_NORM_EPS, ctx)
 
     # ── PRE per stream → d_x (norm branch) + qkv LoRA grads + scale1/shift1 ──
     var iprb = _stream_pre_backward(
-        iq.d_x, ik.d_x, cv.d_0, blk.img, blk.img_mod_out[], N_IMG, lo_img_qkv, ctx,
+        d_iq, d_ik, cv.d_0, blk.img, blk.img_mod_out[], N_IMG, lo_img_qkv, ctx,
     )
     var tprb = _stream_pre_backward(
-        tq.d_x, tk.d_x, cv.d_1, blk.txt, blk.txt_mod_out[], N_TXT, lo_txt_qkv, ctx,
+        d_tq, d_tk, cv.d_1, blk.txt, blk.txt_mod_out[], N_TXT, lo_txt_qkv, ctx,
     )
 
     # ── stream input grad = residual branch (post) + norm branch (pre) ──
@@ -578,8 +578,8 @@ def lens_backward_full_lora[
     # normed_final = layer_norm(h_final, ones, 0)  → d_h (into last block). The final
     # modulation scale/shift grads (mbf.d_scale/d_shift) feed only norm_out.linear →
     # timestep embedder, a dead branch for this preset, so they are dropped.
-    var lnf = layer_norm_backward(mbf.d_x, saved.h_final[], saved.final_ln_ones[], FINAL_LN_EPS, ctx)
-    var d_h = _clone(lnf.d_x, ctx)                    # [1,N_IMG,DIM]
+    # (weight = ones, no affine → d_x-only backward; owned Tensor, no clone)
+    var d_h = layer_norm_backward_dx(mbf.d_x, saved.h_final[], saved.final_ln_ones[], FINAL_LN_EPS, ctx)  # [1,N_IMG,DIM]
 
     # ── reverse the 48 blocks (last → first). final touches only the img stream,
     #    so the last block's d_txt_out is zero. ──

@@ -55,6 +55,7 @@ from serenity_trainer.trainer.Ideogram4LoRATrainStep import (
     ideogram4_lora_train_compute_resident,
 )
 from serenity_trainer.trainer.Ideogram4StackTrain import (
+    IDEOGRAM4_TELEMETRY_EVERY_STEPS,
     Ideogram4LoraAdamState,
     Ideogram4LeversBridge,
     apply_ideogram4_lora_grads,
@@ -313,6 +314,9 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
 
     var last_loss = Float32(0.0)
     var last_b = Float32(0.0)
+    # Last-known telemetry L1s (MJ-1038): the full-tensor D2H readbacks behind
+    # them are cadence-gated; the progress line holds these between refreshes.
+    var last_grad_l1 = Float32(0.0)
     var train_start = perf_counter()
     var smooth_loss = Float32(0.0)
     var smooth_inited = False
@@ -380,15 +384,27 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
         # holds the per-adapter LoRA-B gradients; to_host upcasts to Float32.
         # Computed BEFORE the optimizer consumes `grads` (grads^), once for both
         # the default-AdamW and levers paths.
-        var step_grad_l1 = Float32(0.0)
-        for gi in range(len(grads.d_b)):
-            var gh = grads.d_b[gi][].to_host(ctx)
-            for gj in range(len(gh)):
-                var gv = gh[gj]
-                if gv < Float32(0.0):
-                    step_grad_l1 -= gv
-                else:
-                    step_grad_l1 += gv
+        # MJ-1038: this was a FULL D2H of every B grad EVERY step (and apply
+        # re-read B grads + B params again). Now the L1 refresh runs only every
+        # IDEOGRAM4_TELEMETRY_EVERY_STEPS steps (plus first and final step so
+        # the summary/save gates always see current values); the progress line
+        # holds the last refresh in between.
+        var telemetry_step = (
+            opt_step % IDEOGRAM4_TELEMETRY_EVERY_STEPS == 0
+            or local_step + 1 == run_cfg.steps
+        )
+        if telemetry_step:
+            var l1 = Float32(0.0)
+            for gi in range(len(grads.d_b)):
+                var gh = grads.d_b[gi][].to_host(ctx)
+                for gj in range(len(gh)):
+                    var gv = gh[gj]
+                    if gv < Float32(0.0):
+                        l1 -= gv
+                    else:
+                        l1 += gv
+            last_grad_l1 = l1
+        var step_grad_l1 = last_grad_l1
         # T1.C optimizer seam: levers host path vs the existing literal fused
         # AdamW call (C13: optimizer=ADAMW routes around the levers entirely).
         var k = opt_step + 1
@@ -401,9 +417,13 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
             _ = grads^
         else:
             var res = apply_ideogram4_lora_grads(
-                loras, opt, grads^, k, cfg, ctx
+                loras, opt, grads^, k, cfg, ctx,
+                want_l1_telemetry=telemetry_step,
             )
-            step_b_l1 = res.adapter_b_l1
+            if telemetry_step:
+                step_b_l1 = res.adapter_b_l1
+            else:
+                step_b_l1 = last_b
         # T1.B EMA, post-optimizer: the default AdamW stepped the params on
         # device, so refresh the host mirrors first; the levers optimizer
         # keeps the mirrors authoritative already.

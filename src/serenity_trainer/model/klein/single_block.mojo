@@ -521,14 +521,14 @@ def single_block_backward[
     var d_scale = mb.d_scale.to_host(ctx)
     var d_shift = mb.d_shift.to_host(ctx)
 
-    # ln = layer_norm(x, 1, 0)
-    var lnb = layer_norm_backward(mb.d_x, saved.x[], ones_t, eps, ctx)
+    # ln = layer_norm(x, 1, 0); weight is frozen ones -> d_x-only backward
+    var lnb_dx = layer_norm_backward_dx(mb.d_x, saved.x[], ones_t, eps, ctx)
 
     # x feeds BOTH the residual (grg.d_x) AND layer_norm(x) -> SUM.
     # gate_residual_backward gives d_x = grad_out (passthrough); sum on host at
     # the boundary readback (both are [S,D] device grads).
     var d_x_res = grg.d_x.to_host(ctx)
-    var d_x_norm = lnb.d_x.to_host(ctx)
+    var d_x_norm = lnb_dx.to_host(ctx)
     var d_x = _add_lists(d_x_res, d_x_norm)
 
     return SingleBlockGrads(

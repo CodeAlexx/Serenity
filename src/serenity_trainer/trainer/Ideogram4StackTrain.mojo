@@ -22,6 +22,17 @@ from serenity_trainer.model.Ideogram4LoRABlock import (
 from serenity_trainer.util.config.TrainConfig import TrainConfig
 from serenity_trainer.util.optimizer.adamw_extensions import adamw_step
 
+# Shared device train-step ABI (MJ-1038 fused optimizer swap): the fused
+# multitensor AdamW packs every adapter a/b into ONE kernel launch through
+# serenitymojo's DeviceTrainableSet/DeviceGradSet/DeviceAdamWState contract
+# (training/device_train_step.mojo:408, training/fused_adamw_multitensor.mojo).
+from serenitymojo.training.device_train_step import (
+    DeviceAdamWState,
+    DeviceGradSet,
+    DeviceTrainableSet,
+    device_adamw_train_step_update,
+)
+
 comptime TArc = ArcPointer[Tensor]
 
 # ── autograd_v2 GRAPH SWAP (P7 rollout, klein KLEIN_V2_GRAPH precedent) ───────
@@ -41,6 +52,47 @@ comptime IDEOGRAM4_V2_ENGINE = True
 # in the else branch (C13). End-to-end trainer N-step anchor pending the eri2 cache.
 comptime IDEOGRAM4_V2_GRAPH = True
 comptime IDEOGRAM4_V2_GRAPH_PATH = IDEOGRAM4_V2_ENGINE and IDEOGRAM4_V2_GRAPH
+
+# ── FUSED MULTITENSOR ADAMW (MJ-1038, TRAINING_SPEED_AUDIT_2026-07-01.md) ─────
+# True  = ONE fused kernel launch updates all 408 tensors (204 adapters × a/b)
+#         through the shared device train-step ABI
+#         (device_adamw_train_step_update -> fused_adamw_step). Replaces the
+#         old per-tensor loop of ~408 adamw_step launches per optimizer step.
+# False = the previous per-tensor adamw_step loop (C13 gate-don't-delete: kept
+#         compiled + reachable in the comptime else branch below).
+#
+# NUMERICS DELTAS on the fused path (documented, NOT bit-identical — the
+# fixture smoke smoke/ideogram4_fused_adamw_parity_smoke.mojo bounds them at
+# ulp-class):
+#   * m/v moment storage is F32 (DeviceAdamWState contract) instead of
+#     Serenity's BF16-quantized moments — strictly higher moment precision.
+#   * param write-back is the fused kernel's plain RNE cast; the fallback's
+#     torch-RNE helper AND cfg.stochastic_rounding are NOT applied. With the
+#     recipe default stochastic_rounding=True this is a semantic change
+#     (bf16 SR exists because RNE can stall sub-ULP updates); flip this flag
+#     to False to restore the exact Serenity-parity update.
+#   * nonfinite grads FAIL LOUD (device_grad_stats) instead of being consumed.
+# Optimizer-state checkpoints save whatever moment dtype is live, so a resume
+# ACROSS a flag flip fails loud in either direction (DeviceAdamWState
+# validate_for on F32-expected, adamw_step's BF16 check on the fallback).
+comptime IDEOGRAM4_FUSED_ADAMW = True
+
+# On-device global-norm grad clip (ai-toolkit trains ideogram4 with
+# max_grad_norm=1.0; this trainer historically applied NO clip — a parity
+# gap). False (default) preserves current numerics: clip_scale is forced to
+# 1.0 by passing max_grad_norm=0.0 into the shared ABI. True folds
+# cfg.clip_grad_norm (config default 1.0, matching ai-toolkit) into the fused
+# update via the device global-norm fold — flipping it is the user's parity
+# decision, not this campaign's. Only meaningful when IDEOGRAM4_FUSED_ADAMW
+# is True (the fallback loop has no clip seam).
+comptime IDEOGRAM4_GRAD_CLIP = False
+
+# Progress-line telemetry cadence (MJ-1038 item 3): the full-tensor D2H L1
+# readbacks (all B grads + all B params) run only every this-many optimizer
+# steps (plus first/final step) instead of EVERY step. The fused path also
+# returns a free per-step device grad_norm scalar (4-byte readback) in
+# Ideogram4StackTrainResult.grad_norm.
+comptime IDEOGRAM4_TELEMETRY_EVERY_STEPS = 10
 
 
 struct Ideogram4LoraAdamState(Movable):
@@ -68,20 +120,33 @@ struct Ideogram4StackTrainResult(Copyable, Movable):
     var slots_per_block: Int
     var grad_b_l1: Float32
     var adapter_b_l1: Float32
+    # Fused-path device scalars (MJ-1038): global L2 grad norm over ALL a/b
+    # grads and the clip fold actually applied (1.0 = no clip). Both 0.0/1.0
+    # on the per-tensor fallback path, which computes neither.
+    var grad_norm: Float32
+    var clip_scale: Float32
 
 
 def make_ideogram4_lora_adam_state(
     loras: Ideogram4LoraSet, ctx: DeviceContext
 ) raises -> Ideogram4LoraAdamState:
+    # Fused shared-ABI AdamW requires F32 m/v moment storage (DeviceAdamWState
+    # contract, device_train_step.mojo:195); the per-tensor fallback keeps
+    # Serenity's BF16-moment policy (adamw_extensions.mojo header). Checkpoints
+    # save the live dtype, so resume across an IDEOGRAM4_FUSED_ADAMW flip
+    # fails loud in either direction.
+    var state_dtype = STDtype.BF16
+    comptime if IDEOGRAM4_FUSED_ADAMW:
+        state_dtype = STDtype.F32
     var m_a = List[TArc]()
     var v_a = List[TArc]()
     var m_b = List[TArc]()
     var v_b = List[TArc]()
     for i in range(len(loras.ad)):
-        m_a.append(TArc(zeros_device(loras.ad[i][].a.shape(), STDtype.BF16, ctx)))
-        v_a.append(TArc(zeros_device(loras.ad[i][].a.shape(), STDtype.BF16, ctx)))
-        m_b.append(TArc(zeros_device(loras.ad[i][].b.shape(), STDtype.BF16, ctx)))
-        v_b.append(TArc(zeros_device(loras.ad[i][].b.shape(), STDtype.BF16, ctx)))
+        m_a.append(TArc(zeros_device(loras.ad[i][].a.shape(), state_dtype, ctx)))
+        v_a.append(TArc(zeros_device(loras.ad[i][].a.shape(), state_dtype, ctx)))
+        m_b.append(TArc(zeros_device(loras.ad[i][].b.shape(), state_dtype, ctx)))
+        v_b.append(TArc(zeros_device(loras.ad[i][].b.shape(), state_dtype, ctx)))
     return Ideogram4LoraAdamState(m_a^, v_a^, m_b^, v_b^)
 
 
@@ -92,6 +157,7 @@ def apply_ideogram4_lora_grads(
     optimizer_step: Int,
     cfg: TrainConfig,
     ctx: DeviceContext,
+    want_l1_telemetry: Bool = True,
 ) raises -> Ideogram4StackTrainResult:
     if len(loras.ad) != len(grads.d_a) or len(loras.ad) != len(grads.d_b):
         raise Error("apply_ideogram4_lora_grads: adapter/grad count mismatch")
@@ -103,50 +169,120 @@ def apply_ideogram4_lora_grads(
     # gradients that drove this step — matches the live trainer's grad_norm and
     # the levers path. Replaces the old grad_b_l1=0.0 / adapter_b_l1=0.0 stubs
     # that made the gate fail and the trainer look dead while it was learning.
+    # MJ-1038: this is a FULL D2H of every B grad, so it is now cadence-gated —
+    # want_l1_telemetry defaults True (gates/tests unchanged) and the live
+    # trainer passes it every IDEOGRAM4_TELEMETRY_EVERY_STEPS steps only.
     var grad_b_l1 = Float32(0.0)
-    for i in range(len(loras.ad)):
-        grad_b_l1 += _l1_sum(grads.d_b[i][], ctx)
+    if want_l1_telemetry:
+        for i in range(len(loras.ad)):
+            grad_b_l1 += _l1_sum(grads.d_b[i][], ctx)
 
-    for i in range(len(loras.ad)):
-        adamw_step(
-            loras.ad[i][].a,
-            state.m_a[i][],
-            state.v_a[i][],
-            grads.d_a[i][],
+    var grad_norm = Float32(0.0)
+    var clip_scale = Float32(1.0)
+    comptime if IDEOGRAM4_FUSED_ADAMW:
+        # ONE fused multitensor update (MJ-1038): alias every live adapter a/b
+        # (DeviceBuffer.copy() is a refcounted handle copy — same allocation,
+        # the lora_adamw_plain_fused.mojo:918 packing precedent) plus the
+        # already-boxed device grads into the shared ABI, then a single
+        # device_adamw_train_step_update = one grad-stats launch + one fused
+        # AdamW launch instead of ~408 per-tensor launches. Params/m/v update
+        # IN PLACE through the shared buffers.
+        var trainables = DeviceTrainableSet()
+        var grad_set = DeviceGradSet()
+        var adamw_state = DeviceAdamWState()
+        for i in range(len(loras.ad)):
+            var key_a = String("adapter.") + String(i) + String(".a")
+            var key_b = String("adapter.") + String(i) + String(".b")
+            trainables.append(
+                key_a,
+                TArc(Tensor(
+                    loras.ad[i][].a.buf.copy(),
+                    loras.ad[i][].a.shape(),
+                    loras.ad[i][].a.dtype(),
+                )),
+                String("ideogram4-lora-a"),
+            )
+            trainables.append(
+                key_b,
+                TArc(Tensor(
+                    loras.ad[i][].b.buf.copy(),
+                    loras.ad[i][].b.shape(),
+                    loras.ad[i][].b.dtype(),
+                )),
+                String("ideogram4-lora-b"),
+            )
+            grad_set.append(key_a, grads.d_a[i], String("ideogram4-lora-a"))
+            grad_set.append(key_b, grads.d_b[i], String("ideogram4-lora-b"))
+            adamw_state.append(state.m_a[i], state.v_a[i])
+            adamw_state.append(state.m_b[i], state.v_b[i])
+        # IDEOGRAM4_GRAD_CLIP=False keeps today's no-clip numerics: max_norm
+        # 0.0 makes device_clip_scale return 1.0 (device_train_step.mojo:378).
+        var max_grad_norm = Float32(0.0)
+        comptime if IDEOGRAM4_GRAD_CLIP:
+            max_grad_norm = cfg.clip_grad_norm
+        var dres = device_adamw_train_step_update(
+            trainables,
+            grad_set,
+            adamw_state,
+            Float32(0.0),          # loss: threaded-through telemetry only
             optimizer_step,
             cfg.learning_rate,
             cfg.beta1,
             cfg.beta2,
             cfg.eps,
             cfg.weight_decay,
-            cfg.stochastic_rounding,
-            cfg.seed + UInt32(optimizer_step + i),
+            max_grad_norm,
             ctx,
         )
-        adamw_step(
-            loras.ad[i][].b,
-            state.m_b[i][],
-            state.v_b[i][],
-            grads.d_b[i][],
-            optimizer_step,
-            cfg.learning_rate,
-            cfg.beta1,
-            cfg.beta2,
-            cfg.eps,
-            cfg.weight_decay,
-            cfg.stochastic_rounding,
-            cfg.seed + UInt32(optimizer_step + 100000 + i),
-            ctx,
-        )
+        grad_norm = dres.grad_norm
+        clip_scale = dres.clip_scale
+    else:
+        # C13 gate-don't-delete fallback: the exact pre-MJ-1038 per-tensor
+        # loop (Serenity BF16 moments + torch-RNE/stochastic-rounding param
+        # write-back), ~408 launches per step.
+        for i in range(len(loras.ad)):
+            adamw_step(
+                loras.ad[i][].a,
+                state.m_a[i][],
+                state.v_a[i][],
+                grads.d_a[i][],
+                optimizer_step,
+                cfg.learning_rate,
+                cfg.beta1,
+                cfg.beta2,
+                cfg.eps,
+                cfg.weight_decay,
+                cfg.stochastic_rounding,
+                cfg.seed + UInt32(optimizer_step + i),
+                ctx,
+            )
+            adamw_step(
+                loras.ad[i][].b,
+                state.m_b[i][],
+                state.v_b[i][],
+                grads.d_b[i][],
+                optimizer_step,
+                cfg.learning_rate,
+                cfg.beta1,
+                cfg.beta2,
+                cfg.eps,
+                cfg.weight_decay,
+                cfg.stochastic_rounding,
+                cfg.seed + UInt32(optimizer_step + 100000 + i),
+                ctx,
+            )
 
     # Post-step LoRA-B param L1 (the live trainer reads result.adapter_b_l1 for
-    # its last_b summary; mirrors the levers path's returned b_l1).
+    # its last_b summary; mirrors the levers path's returned b_l1). Cadence-
+    # gated like grad_b_l1 above (full D2H of every B param).
     var adapter_b_l1 = Float32(0.0)
-    for i in range(len(loras.ad)):
-        adapter_b_l1 += _l1_sum(loras.ad[i][].b, ctx)
+    if want_l1_telemetry:
+        for i in range(len(loras.ad)):
+            adapter_b_l1 += _l1_sum(loras.ad[i][].b, ctx)
 
     return Ideogram4StackTrainResult(
-        len(loras.ad), I4_SLOTS_PER_BLOCK, grad_b_l1, adapter_b_l1
+        len(loras.ad), I4_SLOTS_PER_BLOCK, grad_b_l1, adapter_b_l1,
+        grad_norm, clip_scale,
     )
 
 
