@@ -65,6 +65,7 @@ from serenitymojo.models.dit.ideogram4_resident import Ideogram4Weights
 from serenity_trainer.dataLoader.Ideogram4CacheReader import Ideogram4TrainCache
 from serenity_trainer.model.Ideogram4LoRABlock import (
     Ideogram4LoraSet,
+    Ideogram4StackLoraGrads,
     build_ideogram4_native_lora_set,
 )
 from serenity_trainer.modelLoader.Ideogram4LoRALoader import (
@@ -79,6 +80,7 @@ from serenity_trainer.trainer.Ideogram4LoRATrainStep import (
     ideogram4_lora_train_step_resident,
     ideogram4_lora_train_compute_resident,
     ideogram4_lora_train_compute_resident_handchain,
+    ideogram4_lora_train_compute_resident_b2,
 )
 from serenity_trainer.trainer.Ideogram4StackTrain import (
     IDEOGRAM4_TELEMETRY_EVERY_STEPS,
@@ -282,6 +284,24 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
             " a separate follow-up"
         )
 
+    # ── TRUE batch-2 (row-stacked) fences ───────────────────────────────────────
+    # batch_size==2 → the device-grad b2 path (ideogram4_lora_train_compute_resident_b2:
+    # per-sample frozen embed/final, batched trainable stack, joint 2N-mean loss,
+    # grads SUM both samples = batch gradient into the SAME device optimizer). Only
+    # 1 or 2 are wired. accum>1 already fenced above (so accum+b2 is fenced together).
+    if cfg.batch_size < 1 or cfg.batch_size > 2:
+        raise Error(
+            "train_ideogram4_lora_from_cache: only batch_size 1 or 2 is wired"
+            " (b2 = TRUE row-stacked device-grad path); got "
+            + String(cfg.batch_size)
+        )
+    if cfg.batch_size == 2 and levers_opt:
+        raise Error(
+            "train_ideogram4_lora_from_cache: batch_size=2 supports only the default"
+            " device fused-AdamW optimizer this wave — the T1.C levers host optimizer"
+            " (adafactor/schedule-free) is not wired for b2"
+        )
+
     makedirs(run_cfg.output_dir, exist_ok=True)
     var final_lora_path = _final_lora_path(run_cfg.output_dir)
     var final_state_dir = _final_state_dir(run_cfg.output_dir)
@@ -423,19 +443,62 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
 
         # forward + loss (T1.A lever seam inside) + backward — NO optimizer.
         var step_loss = Float32(0.0)
-        var grads = ideogram4_lora_train_compute_resident[NT, GH, GW](
-            weights,
-            sample.noisy[],
-            sample.clean[],
-            sample.noise[],
-            sample.t_flow,
-            llm_in[],
-            loras,
-            lcfg,
-            step_loss,
-            ctx,
-            text_len_in,
-        )
+        var grads: Ideogram4StackLoraGrads
+        if cfg.batch_size == 2:
+            # ── TRUE batch-2: pair a second cache sample (independent t/seed/dropout
+            # draw). Both frozen embeds carry their own text_len; the trainable stack
+            # runs batched → summed grads = batch gradient into the device optimizer.
+            var sample_index1 = (progress.global_step + 1) % cache.len()
+            var seed1 = (
+                run_cfg.noise_seed + UInt64(opt_step + local_step)
+                + UInt64(0x5EED_00B2)
+            )
+            var t_step1 = sample_timestep_logit_normal_scaled(
+                run_cfg.noise_seed * UInt64(7919)
+                + UInt64(opt_step + local_step) + UInt64(0x00B2_7919),
+                Float32(1.0),
+            )
+            var sample1 = cache.sample[NT, GH, GW](
+                sample_index1, t_step1, seed1, ctx
+            )
+            var llm_in1 = sample1.llm_features.copy()
+            var text_len_in1 = sample1.text_len
+            if caption_dropout_pick(
+                UInt64(opt_step + local_step) + UInt64(0x00B2),
+                run_cfg.noise_seed,
+                drop_p,
+            ):
+                llm_in1 = ArcPointer[Tensor](cache.uncond[NT](ctx))
+                text_len_in1 = cache.uncond_text_len[NT](ctx)
+            var loss0 = Float32(0.0)
+            var loss1 = Float32(0.0)
+            grads = ideogram4_lora_train_compute_resident_b2[NT, GH, GW](
+                weights,
+                sample.noisy[], sample.clean[], sample.noise[], sample.t_flow,
+                llm_in[], text_len_in,
+                sample1.noisy[], sample1.clean[], sample1.noise[], sample1.t_flow,
+                llm_in1[], text_len_in1,
+                loras,
+                lcfg,
+                step_loss,
+                loss0,
+                loss1,
+                ctx,
+            )
+        else:
+            grads = ideogram4_lora_train_compute_resident[NT, GH, GW](
+                weights,
+                sample.noisy[],
+                sample.clean[],
+                sample.noise[],
+                sample.t_flow,
+                llm_in[],
+                loras,
+                lcfg,
+                step_loss,
+                ctx,
+                text_len_in,
+            )
         # Real gradient L1 for the progress line. The apply/levers telemetry
         # returns were stubbed (apply_ideogram4_lora_grads returned grad_b_l1=0.0,
         # adapter_b_l1=0.0) and the progress line hardcoded "grad_norm 0.0000" —

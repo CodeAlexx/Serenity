@@ -241,6 +241,8 @@ def main() raises:
     cfg.lora_rank = rank
     cfg.lora_alpha = alpha
     cfg.learning_rate = lr
+    # batch_size default 1; the levers config JSON (argv 11) may raise it to 2 to
+    # enable the TRUE row-stacked device-grad b2 path (honored after the read below).
     cfg.batch_size = 1
     cfg.gradient_accumulation_steps = 1
     cfg.stochastic_rounding = False
@@ -270,6 +272,10 @@ def main() raises:
         # caption_dropout_prob fallback) come from the JSON; the shared recipe
         # scalars stay argv-owned (the trainer syncs them from `cfg` above).
         run_cfg.levers = read_model_config(levers_config_path)
+        # TRUE batch-2: the config JSON's batch_size (default 1) selects the
+        # row-stacked device-grad b2 path in the trainer. Only 1 or 2 are wired.
+        if run_cfg.levers.batch_size >= 2:
+            cfg.batch_size = 2
         print(
             "[Ideogram4-lora] levers config ", levers_config_path,
             " | loss_fn ", run_cfg.levers.loss_fn,
@@ -277,6 +283,7 @@ def main() raises:
             " | optimizer ", run_cfg.levers.optimizer,
             " | ema_enabled ", run_cfg.levers.ema_enabled,
             " | caption_dropout_prob ", run_cfg.levers.caption_dropout_prob,
+            " | batch_size ", cfg.batch_size,
         )
 
     # Sample-prompt source. argv 17 (sample_prompt_json) is the explicit

@@ -129,6 +129,9 @@ ideogram4-lora-b0-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideo
 ideogram4-lora-train-step-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_lora_train_step_gate.mojo"
 ideogram4-real-lora-file-parity = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_real_lora_file_parity.mojo"
 ideogram4-lora-stream-train-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/ideogram4_lora_stream_train_save_resume_gate.mojo"
+# TRUE batch-2 parity gate (mem-safe -O2; cuDNN fwd shim linked). Runs b2 vs two b1
+# runs on the real predict fixture (distinct text_len/t per sample). GPU process.
+ideogram4-batch2-parity = "mkdir -p target && MEM_MAX=45G MEM_HIGH=38G SWAP_MAX=4G bash /home/alex/mojodiffusion/scripts/mem_safe.sh mojo build --optimization-level 2 --num-threads 2 -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib smoke/ideogram4_batch2_parity.mojo -o target/ideogram4_batch2_parity && target/ideogram4_batch2_parity"
 klein-lora-cached-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm src/serenity_trainer/trainer/KleinLiveTrainer.mojo -o /tmp/serenity_klein_live_trainer_build_gate"
 klein-train-ref-grad-update-gate = "mojo run -I /home/alex/mojodiffusion -I src smoke/klein_train_ref_grad_update_replay.mojo"
 

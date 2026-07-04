@@ -65,6 +65,8 @@ from serenity_trainer.model.Ideogram4LoRABlock import (
     ideogram4_stack_lora_forward_resident_nosave,
     ideogram4_stack_lora_backward_resident,
     ideogram4_stack_lora_backward_graph_resident,
+    ideogram4_stack_lora_forward_resident_b2,
+    ideogram4_stack_lora_backward_resident_b2,
 )
 from serenity_trainer.trainer.Ideogram4StackTrain import (
     IDEOGRAM4_V2_GRAPH_PATH,
@@ -885,6 +887,167 @@ def ideogram4_lora_train_compute_resident_handchain[
         SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
         IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
     ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, rw, loras, fwd.stack_fwd^, ctx)
+    return grads^
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TRUE BATCH-2 (row-stacked) compute — DEVICE-GRAD (mandatory for ideogram4: both
+# arms feed the device optimizer). krea2's b2 is the reference. The FROZEN embed +
+# final layers run PER-SAMPLE (each sample's per-sample text_len pad is baked into
+# its own x_in exactly like krea2's per-sample conditioning); ONLY the 34-block
+# trainable stack is batched ([2,SEQ,Hidden]), so the block GEMMs run over 2*SEQ
+# rows and every LoRA dA/dB SUMS both samples = the batch gradient. The returned
+# Ideogram4StackLoraGrads is the SAME device-tensor grad set the b1 path returns,
+# so apply_ideogram4_lora_grads streams it into the fused multitensor AdamW (or the
+# 408-launch fallback) UNCHANGED — the batch grads land in the device optimizer via
+# the exact same path as b1. Only the default MSE loss is supported (levers fenced).
+#
+# Joint 2N-mean loss: loss_B2 = mean(loss0, loss1); each sample's d_velocity is
+# scaled by 0.5 so the summed grads == the MEAN of the two b1 grads == grad-accum=2.
+# ══════════════════════════════════════════════════════════════════════════════
+struct _I4EmbedRope(Movable):
+    var x_in: Tensor          # [1, SEQ, Hidden] bf16
+    var adaln_input: Tensor   # [1, 1, Adaln]    bf16
+    var cosf: Tensor          # [1, SEQ, Dh]     bf16
+    var sinf: Tensor          # [1, SEQ, Dh]     bf16
+
+    def __init__(
+        out self, var x_in: Tensor, var adaln_input: Tensor,
+        var cosf: Tensor, var sinf: Tensor,
+    ):
+        self.x_in = x_in^
+        self.adaln_input = adaln_input^
+        self.cosf = cosf^
+        self.sinf = sinf^
+
+
+def _ideogram4_embed_rope_resident[
+    NT: Int, GH: Int, GW: Int
+](
+    rw: Ideogram4Weights,
+    noisy_latents: Tensor,
+    t_flow: Float32,
+    llm_features: Tensor,
+    ctx: DeviceContext,
+    text_len: Int = NT,
+) raises -> _I4EmbedRope:
+    """Per-sample FROZEN embed + MRoPE tables (the front half of
+    ideogram4_lora_train_forward_resident, up to but not including the block
+    stack). Each sample owns its text_len (pad zeroing) and its rope table."""
+    var packed = ideogram4_build_packed_inputs[NT, GH, GW](
+        noisy_latents, llm_features, ctx, text_len
+    )
+    var tv = List[Float32]()
+    tv.append(Float32(1.0) - t_flow)
+    var model_t = Tensor.from_host(tv^, [1], STDtype.F32, ctx)
+
+    var sec = List[Int]()
+    sec.append(IDEOGRAM4_MROPE_SECTION_0)
+    sec.append(IDEOGRAM4_MROPE_SECTION_1)
+    sec.append(IDEOGRAM4_MROPE_SECTION_2)
+    var cs = build_ideogram4_mrope(
+        packed.position_ids, IDEOGRAM4_HEAD_DIM, sec, IDEOGRAM4_MROPE_THETA,
+        ctx, STDtype.BF16,
+    )
+    var cosf = cs[0].clone(ctx)
+    var sinf = cs[1].clone(ctx)
+
+    var x_bf = cast_tensor(packed.x, STDtype.BF16, ctx)
+    var llm_bf = cast_tensor(packed.llm_full, STDtype.BF16, ctx)
+    var emb = ideogram4_lora_embed_resident(
+        rw, x_bf, llm_bf, model_t, packed.indicator, IDEOGRAM4_HIDDEN, ctx
+    )
+    # clone (not partial-move) so `emb` stays whole for its synthesized destructor.
+    return _I4EmbedRope(emb.x_in.clone(ctx), emb.adaln_input.clone(ctx), cosf^, sinf^)
+
+
+def _ideogram4_velocity_from_final[
+    NT: Int, GH: Int, GW: Int
+](final_out: Tensor, ctx: DeviceContext) raises -> Tensor:
+    """velocity = -( out[:, NT:].reshape(1,GH,GW,128).permute(0,3,1,2) ) — the same
+    transform ideogram4_lora_train_forward_resident applies, per sample."""
+    comptime NIMG = GH * GW
+    var image_velocity = slice(final_out, 1, NT, NIMG, ctx)
+    var iv4 = reshape(image_velocity, [1, GH, GW, IDEOGRAM4_PACKED_CHANNELS], ctx)
+    var iv = permute(iv4, [0, 3, 1, 2], ctx)
+    return mul_scalar(iv, Float32(-1.0), ctx)
+
+
+def ideogram4_lora_train_compute_resident_b2[
+    NT: Int, GH: Int, GW: Int
+](
+    rw: Ideogram4Weights,
+    noisy0: Tensor, clean0: Tensor, noise0: Tensor, t0: Float32,
+    llm0: Tensor, text_len0: Int,
+    noisy1: Tensor, clean1: Tensor, noise1: Tensor, t1: Float32,
+    llm1: Tensor, text_len1: Int,
+    loras: Ideogram4LoraSet,
+    lcfg: LeversConfig,
+    mut loss_out: Float32,
+    mut loss0_out: Float32,
+    mut loss1_out: Float32,
+    ctx: DeviceContext,
+) raises -> Ideogram4StackLoraGrads:
+    comptime NIMG = GH * GW
+    comptime SEQ = NT + NIMG
+    comptime N = IDEOGRAM4_PACKED_CHANNELS * NIMG
+
+    if levers_loss_active(lcfg):
+        raise Error(
+            "ideogram4 batch_size=2 supports only the default MSE loss this wave"
+            " (loss levers — Huber/smooth-L1/min-SNR — not wired for b2)"
+        )
+
+    # ── per-sample FROZEN embed + rope (each its own text_len/pad + rope table) ──
+    var er0 = _ideogram4_embed_rope_resident[NT, GH, GW](
+        rw, noisy0, t0, llm0, ctx, text_len0
+    )
+    var er1 = _ideogram4_embed_rope_resident[NT, GH, GW](
+        rw, noisy1, t1, llm1, ctx, text_len1
+    )
+
+    # ── row-stack the batched trainable stack inputs ────────────────────────────
+    var x_in_b2 = concat(0, ctx, er0.x_in, er1.x_in)              # [2,SEQ,Hidden]
+    var adaln_b2 = concat(0, ctx, er0.adaln_input, er1.adaln_input)  # [2,1,Adaln]
+    var cos_b2 = concat(1, ctx, er0.cosf, er1.cosf)              # [1,2SEQ,Dh]
+    var sin_b2 = concat(1, ctx, er0.sinf, er1.sinf)
+
+    var stack_fwd = ideogram4_stack_lora_forward_resident_b2[
+        SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+        IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+    ](x_in_b2, adaln_b2, cos_b2, sin_b2, rw, loras, ctx)
+    var h_b2 = stack_fwd.out.clone(ctx)                          # [2,SEQ,Hidden]
+
+    # ── per-sample FROZEN final → velocity → loss → final backward ──────────────
+    var h0 = slice(h_b2, 0, 0, 1, ctx)                          # [1,SEQ,Hidden]
+    var h1 = slice(h_b2, 0, 1, 1, ctx)
+    var fin0 = ideogram4_lora_final_forward_resident(rw, h0, er0.adaln_input, ctx)
+    var fin1 = ideogram4_lora_final_forward_resident(rw, h1, er1.adaln_input, ctx)
+    var vel0 = _ideogram4_velocity_from_final[NT, GH, GW](fin0.out, ctx)
+    var vel1 = _ideogram4_velocity_from_final[NT, GH, GW](fin1.out, ctx)
+    var tgt0 = ideogram4_flow_target(noise0, clean0, ctx)
+    var tgt1 = ideogram4_flow_target(noise1, clean1, ctx)
+    var ld0 = _i4_flow_loss_and_dvel(vel0, tgt0, t0, N, lcfg, ctx)
+    var ld1 = _i4_flow_loss_and_dvel(vel1, tgt1, t1, N, lcfg, ctx)
+    loss0_out = ld0.loss
+    loss1_out = ld1.loss
+    loss_out = Float32(0.5) * (ld0.loss + ld1.loss)             # joint 2N-mean
+
+    # each per-sample d_velocity ×0.5: summed grads == MEAN(g0,g1) == grad-accum=2.
+    var d_vel0 = mul_scalar(ld0.d_velocity, Float32(0.5), ctx)
+    var d_vel1 = mul_scalar(ld1.d_velocity, Float32(0.5), ctx)
+    var d_h0 = ideogram4_lora_final_backward[NT, GH, GW](
+        d_vel0, h0, fin0.fscale, fin0.flw, ctx
+    )
+    var d_h1 = ideogram4_lora_final_backward[NT, GH, GW](
+        d_vel1, h1, fin1.fscale, fin1.flw, ctx
+    )
+    var d_h_b2 = concat(0, ctx, d_h0, d_h1)                     # [2,SEQ,Hidden]
+
+    var grads = ideogram4_stack_lora_backward_resident_b2[
+        SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+        IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+    ](d_h_b2, adaln_b2, cos_b2, sin_b2, rw, loras, stack_fwd^, ctx)
     return grads^
 
 

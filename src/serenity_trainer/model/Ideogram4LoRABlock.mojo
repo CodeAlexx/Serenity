@@ -14,6 +14,11 @@ from serenitymojo.models.ideogram4.block import (
     ideogram4_stack_lora_forward_resident,
     ideogram4_stack_lora_forward_resident_nosave, Ideogram4StackLoraGrads,
     ideogram4_stack_lora_backward, ideogram4_stack_lora_backward_resident,
+    # TRUE batch-2 (row-stacked over a real batch=2 dim; grads SUM both samples =
+    # batch gradient → fed to the SAME device optimizer as b1).
+    ideogram4_block_lora_forward_b2, ideogram4_block_lora_backward_b2,
+    ideogram4_stack_lora_forward_b2, ideogram4_stack_lora_forward_resident_b2,
+    ideogram4_stack_lora_backward_b2, ideogram4_stack_lora_backward_resident_b2,
 )
 # P7 autograd_v2 graph variant of the stack backward (separate file so the
 # import graph stays acyclic; see block_stack_graph.mojo header). Re-exported
