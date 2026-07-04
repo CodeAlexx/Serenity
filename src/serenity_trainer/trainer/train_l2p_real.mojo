@@ -132,6 +132,9 @@ from serenitymojo.training.train_config import (
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
+from serenitymojo.training.grad_accum import (
+    accumulate_grad_group, scale_grad_group, zeros_like_group,
+)
 
 
 # ── arch (Z-Image L2P; IDENTICAL body to Z-Image base) ───────────────────────
@@ -410,6 +413,10 @@ def _train_one_step_l2p(
     beta2: Float32,
     optimizer_eps: Float32,
     weight_decay: Float32,
+    accum_steps: Int,
+    mut acc_a: List[List[Float32]],
+    mut acc_b: List[List[Float32]],
+    mut micro_in_window: Int,
     train_start_ns: UInt,
     ctx: DeviceContext,
 ) raises -> L2PStepResult:
@@ -700,11 +707,51 @@ def _train_one_step_l2p(
         print("[L2P-loha] step=", k, " master_grad_norm=", Float32(mnorm),
               " zero_leg_l1=", zimage_loha_zero_leg_l1(loha_masters))
     else:
-        gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
-        zimage_lora_adamw_step_main_only(
-            lora, grads, k, step_lr, ctx, beta1, beta2, optimizer_eps,
-            weight_decay,
-        )
+        # ── gradient accumulation (plain-LoRA host arm; default-off N==1) ──────
+        # SUM this micro-step's LoRA grad groups into the window buffers (owned by
+        # the caller, persisted across steps via `mut`); on a non-boundary
+        # micro-step return WITHOUT clip+AdamW; on the boundary MEAN (÷window) back
+        # into `grads` and run the UNCHANGED clip+AdamW once, keying the AdamW
+        # bias-correction on the OPTIMIZER step. N==1 => byte-identical.
+        if accum_steps > 1:
+            if micro_in_window == 0:
+                acc_a = zeros_like_group(grads.d_a)
+                acc_b = zeros_like_group(grads.d_b)
+            accumulate_grad_group(acc_a, grads.d_a)
+            accumulate_grad_group(acc_b, grads.d_b)
+            micro_in_window += 1
+            var is_boundary = micro_in_window >= accum_steps or k == run_steps
+            if not is_boundary:
+                var mid1 = perf_counter_ns()
+                var mid_secs = Float64(mid1 - t0) / 1.0e9
+                print_trainer_progress(
+                    progress_label, k, run_steps, 1,
+                    loss, 0.0, mid_secs, 0.0,
+                    Float64(mid1 - train_start_ns) / 1.0e9,
+                )
+                return L2PStepResult(
+                    loss, Float32(0.0), Float32(mid_secs), Float32(0.0),
+                    grads.nonfinite_lora_grads,
+                )
+            var inv_micro = Float32(1.0) / Float32(micro_in_window)
+            scale_grad_group(acc_a, inv_micro)
+            scale_grad_group(acc_b, inv_micro)
+            for i in range(len(grads.d_a)):
+                grads.d_a[i] = acc_a[i].copy()
+                grads.d_b[i] = acc_b[i].copy()
+            micro_in_window = 0
+            var opt_idx = ((k - 1) // accum_steps) + 1
+            gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
+            zimage_lora_adamw_step_main_only(
+                lora, grads, opt_idx, step_lr, ctx, beta1, beta2, optimizer_eps,
+                weight_decay,
+            )
+        else:
+            gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
+            zimage_lora_adamw_step_main_only(
+                lora, grads, k, step_lr, ctx, beta1, beta2, optimizer_eps,
+                weight_decay,
+            )
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()
@@ -959,6 +1006,25 @@ def main() raises:
     var last_loss = Float32(0.0)
     var train_start = perf_counter_ns()
 
+    # ── gradient accumulation (OneTrainer; default-off when N==1) ─────────────
+    # Each loop iteration is one MICRO-step. The plain-LoRA host arm inside
+    # _train_one_step_l2p SUMs grads.d_a/d_b into these caller-owned window buffers
+    # and steps AdamW once per window (MEAN). DoRA/OFT (device-grad) and LoKr/LoHa
+    # (host-chain carrier) arms are fenced below — not wired this wave.
+    var accum_steps = train_cfg.grad_accum_steps
+    if accum_steps < 1:
+        accum_steps = 1
+    if accum_steps > 1 and (lokr_active or loha_active or dora_active or oft_active):
+        raise Error(
+            "train_l2p_real: grad_accum_steps>1 is not wired for the LoKr/LoHa/"
+            "DoRA/OFT arms — use adapter_algo=lora/locon"
+        )
+    var acc_a = List[List[Float32]]()
+    var acc_b = List[List[Float32]]()
+    var micro_in_window = 0
+    if accum_steps > 1:
+        print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
+
     for k in range(start_step + 1, run_steps + 1):
         var slot = (k - 1) % cache.count()
         var step_seed = UInt64(k)
@@ -969,6 +1035,7 @@ def main() raises:
             lokr_masters, loha_masters, direct_dora, direct_oft,
             direct_targets,
             step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
+            accum_steps, acc_a, acc_b, micro_in_window,
             train_start, ctx,
         )
         if k == start_step + 1:

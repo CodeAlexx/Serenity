@@ -262,6 +262,26 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
         return _train_ideogram4_lycoris_from_cache[NT, GH, GW](cfg, run_cfg, lcfg, ctx)
     require_lora_or_locon_linear(lcfg, String("Ideogram4"))
 
+    # ── gradient accumulation: DEVICE-GRAD ARM (fail-loud; not wired this wave) ──
+    # The plain-LoRA path produces DEVICE grad tensors (grads.d_a/d_b). BOTH
+    # optimizer routes consume them on-device: the default fused-multitensor AdamW
+    # (IDEOGRAM4_FUSED_ADAMW=True) and the retained per-tensor fallback
+    # (IDEOGRAM4_FUSED_ADAMW=False, ~408 device adamw_step launches) — the latter
+    # still steps `grads.d_a[i][]`/`grads.d_b[i][]` DEVICE tensors, NOT a host
+    # List[List[Float32]] grad loop. So NO host-grad arm survives to hang host
+    # micro-step accumulation on (that would reintroduce the D2H removed in
+    # MJ-1038, and flipping IDEOGRAM4_FUSED_ADAMW would NOT expose a host route).
+    # Real grad-accum here needs DEVICE-side accumulation into the optimizer
+    # (schedule.grad_accumulate), a separate follow-up. Fail loud rather than
+    # silently ignore N>1 (mirrors the LyCORIS carrier fence).
+    if cfg.gradient_accumulation_steps > 1:
+        raise Error(
+            "train_ideogram4_lora_from_cache: grad_accum_steps>1 is not wired for"
+            " the plain-LoRA arm — both the fused and per-tensor AdamW routes are"
+            " DEVICE-grad (no host-grad arm survives); device-side accumulation is"
+            " a separate follow-up"
+        )
+
     makedirs(run_cfg.output_dir, exist_ok=True)
     var final_lora_path = _final_lora_path(run_cfg.output_dir)
     var final_state_dir = _final_state_dir(run_cfg.output_dir)

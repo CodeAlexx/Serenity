@@ -116,6 +116,9 @@ from serenitymojo.training.train_config import (
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
+from serenitymojo.training.grad_accum import (
+    accumulate_grad_group, scale_grad_group, zeros_like_group,
+)
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -1003,6 +1006,28 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
+    # ── gradient accumulation (OneTrainer; default-off when N==1) ─────────────
+    # Each loop iteration is one MICRO-step. SUM the plain-LoRA host grad groups
+    # (grads.d_a/d_b) across `accum_steps` micro-steps, MEAN (÷window) on the
+    # accumulation boundary, then run the UNCHANGED clip+AdamW once. N==1 makes
+    # every step a boundary (sum of one, /1) => byte-identical to the per-step
+    # path. Carrier arms (LoKr/LoHa/DoRA/OFT) are fenced below (not wired this
+    # wave); only the plain-LoRA arm accumulates.
+    var accum_steps = cfg.grad_accum_steps
+    if accum_steps < 1:
+        accum_steps = 1
+    var use_grad_accum = accum_steps > 1
+    if use_grad_accum and carrier_active:
+        raise Error(
+            "train_anima_real: grad_accum_steps>1 is not wired for the LyCORIS"
+            " (LoKr/LoHa/DoRA/OFT) carrier arms — use adapter_algo=lora/locon"
+        )
+    var acc_da = List[List[Float32]]()
+    var acc_db = List[List[Float32]]()
+    var micro_in_window = 0
+    if use_grad_accum:
+        print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
+
     for step in range(run_steps):
         var step_t0 = perf_counter_ns()
         # ── timestep sampling (sigmoid -> shift -> clamp), rs:328-834 ──
@@ -1057,6 +1082,13 @@ def main() raises:
             sse += diff * diff
             d_out.append(inv_n * diff)
         var loss = sse / Float32(npred)
+        # Capture loss BEFORE the accumulation block: on a mid-window micro-step
+        # the block `continue`s past the rest of the loop, so first_loss/last_loss
+        # must be recorded here (every micro-step) or first_loss stays 0.0 when
+        # step 0 is a non-boundary micro-step (accum_steps>1).
+        if step == 0:
+            first_loss = loss
+        last_loss = loss
 
         # ── backward (streamed) ──
         var grads = anima_stack_lora_backward_streamed[H, Dh, S_IMG, S_TXT](
@@ -1065,11 +1097,44 @@ def main() raises:
             B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
         )
 
+        # ── gradient accumulation (plain-LoRA host arm; default-off N==1) ──────
+        # SUM this micro-step's LoRA grad groups into the window buffers; on a
+        # non-boundary micro-step print progress and skip clip+AdamW+save. On the
+        # boundary MEAN (÷window) into `grads` and fall through to the UNCHANGED
+        # clip+AdamW path below. N==1 => every step is a boundary (byte-identical).
+        if use_grad_accum:
+            if micro_in_window == 0:
+                acc_da = zeros_like_group(grads.d_a)
+                acc_db = zeros_like_group(grads.d_b)
+            accumulate_grad_group(acc_da, grads.d_a)
+            accumulate_grad_group(acc_db, grads.d_b)
+            micro_in_window += 1
+            var is_boundary = micro_in_window >= accum_steps or step == run_steps - 1
+            if not is_boundary:
+                var mid_now = perf_counter_ns()
+                print_trainer_progress(
+                    String("Anima-lora"), step + 1, run_steps, 1,
+                    loss, 0.0,
+                    Float64(mid_now - step_t0) / 1.0e9, 0.0,
+                    Float64(mid_now - t0) / 1.0e9,
+                )
+                continue
+            var inv_micro = Float32(1.0) / Float32(micro_in_window)
+            scale_grad_group(acc_da, inv_micro)
+            scale_grad_group(acc_db, inv_micro)
+            for i in range(len(grads.d_a)):
+                grads.d_a[i] = acc_da[i].copy()
+                grads.d_b[i] = acc_db[i].copy()
+            micro_in_window = 0
+
         # ── global-norm clip (1.0) then AdamW over all adapters ──
         var gn_before = _global_norm(grads)
         _clip(grads, cfg.max_grad_norm)
         var completed_step = step + 1
-        var step_lr = ot_lr_for_optimizer_step(cfg, completed_step)
+        # optimizer-step index (OneTrainer keys LR + AdamW bias-correction on the
+        # OPTIMIZER step, not the micro-step). N==1 => optimizer_step == completed_step.
+        var optimizer_step = ((completed_step - 1) // accum_steps) + 1
+        var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
         if lokr_active:
             var mg = anima_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
             var mnorm = anima_lokr_grad_norm(mg)
@@ -1120,7 +1185,7 @@ def main() raises:
                   " vec_l1=", anima_oft_vec_l1(oft_masters))
         else:
             anima_lora_adamw_step(
-                lora, grads, completed_step, step_lr, ctx,
+                lora, grads, optimizer_step, step_lr, ctx,
                 cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
             )
 
@@ -1137,10 +1202,6 @@ def main() raises:
         for i in range(n_adapters):
             da += _absum(grads.d_a[i])
             db += _absum(grads.d_b[i])
-
-        if step == 0:
-            first_loss = loss
-        last_loss = loss
 
         var step_now = perf_counter_ns()
         print_trainer_progress(

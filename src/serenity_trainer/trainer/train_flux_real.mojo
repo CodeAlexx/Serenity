@@ -145,6 +145,9 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.grad_accum import (
+    accumulate_grad_group, scale_grad_group, zeros_like_group,
+)
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
@@ -958,6 +961,31 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
+    # ── gradient accumulation buffers (OneTrainer micro-batch; default-off == 1) ─
+    # Each loop iteration is one MICRO-step. SUM the AdamW-fed LoRA grad groups —
+    # block-projection (d_a/d_b) AND stack-level (st_d_a/st_d_b) — across
+    # `accum_steps` micro-steps, then MEAN (÷N) and run clip+AdamW once on
+    # accumulation boundaries. accum_steps=1 => every step is a boundary, mean=÷1
+    # => byte-identical to the per-step path. Buffers lazily sized per window.
+    # Wired for PLAIN LoRA only this wave; LyCORIS arms fail loud (mirrors Klein).
+    var accum_steps = train_cfg.grad_accum_steps
+    if accum_steps < 1:
+        accum_steps = 1
+    var use_grad_accum = accum_steps > 1
+    if use_grad_accum and (lokr_active or loha_active or dora_active or oft_active):
+        raise Error(
+            "Flux trainer: grad_accum_steps>1 is wired for plain LoRA only this "
+            + "wave; LoKr/LoHa/DoRA/OFT fail loud (mirrors Klein's honest scope). "
+            + "Use adapter_algo=0 (plain LoRA) with gradient accumulation."
+        )
+    var acc_d_a = List[List[Float32]]()
+    var acc_d_b = List[List[Float32]]()
+    var acc_st_d_a = List[List[Float32]]()
+    var acc_st_d_b = List[List[Float32]]()
+    var micro_in_window = 0
+    if use_grad_accum:
+        print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
+
     var train_start = perf_counter_ns()
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
@@ -1158,18 +1186,64 @@ def main() raises:
             D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
         )
 
+        # ── gradient accumulation (OneTrainer semantics; default-off when N==1) ─
+        # Fast path: accum_steps==1 uses `grads` directly (no zero-clone/copy).
+        if use_grad_accum:
+            # Treat this loop iteration as one micro-step: SUM its four LoRA grad
+            # groups (block d_a/d_b + stack st_d_a/st_d_b) into the window buffers;
+            # on the boundary MEAN (÷N) and copy back into `grads` before
+            # clip+AdamW. Empty stack groups (stack LoRA disabled) accumulate as
+            # no-ops.
+            if micro_in_window == 0:
+                acc_d_a = zeros_like_group(grads.d_a)
+                acc_d_b = zeros_like_group(grads.d_b)
+                acc_st_d_a = zeros_like_group(grads.st_d_a)
+                acc_st_d_b = zeros_like_group(grads.st_d_b)
+            accumulate_grad_group(acc_d_a, grads.d_a)
+            accumulate_grad_group(acc_d_b, grads.d_b)
+            accumulate_grad_group(acc_st_d_a, grads.st_d_a)
+            accumulate_grad_group(acc_st_d_b, grads.st_d_b)
+            micro_in_window += 1
+            var is_boundary = micro_in_window >= accum_steps or k == run_steps
+            if not is_boundary:
+                # mid-window: skip clip/AdamW/save/sample, keep accumulating.
+                var t1m = perf_counter_ns()
+                var secsm = Float64(t1m - t0) / 1.0e9
+                print_trainer_progress(
+                    String("Flux-lora"), k, run_steps, 1,
+                    loss, 0.0, secsm, 0.0,
+                    Float64(t1m - train_start) / 1.0e9,
+                )
+                continue
+            # boundary: MEAN the window, then overwrite grads' groups with it.
+            var inv_micro = Float32(1.0) / Float32(micro_in_window)
+            scale_grad_group(acc_d_a, inv_micro)
+            scale_grad_group(acc_d_b, inv_micro)
+            scale_grad_group(acc_st_d_a, inv_micro)
+            scale_grad_group(acc_st_d_b, inv_micro)
+            for i in range(len(grads.d_a)):
+                grads.d_a[i] = acc_d_a[i].copy()
+                grads.d_b[i] = acc_d_b[i].copy()
+            for i in range(len(grads.st_d_a)):
+                grads.st_d_a[i] = acc_st_d_a[i].copy()
+                grads.st_d_b[i] = acc_st_d_b[i].copy()
+            micro_in_window = 0
+
         # ── grad norm + configured clip (block + stack grads, one global norm) ──
         var gn_before = _clip(grads, train_cfg.max_grad_norm)
 
         # ── AdamW (block adapters, then stack adapters) ──
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        # grad-accum: LR schedule + AdamW step counter advance per OPTIMIZER step,
+        # not per micro-step (N==1 => optimizer_step==k, byte-identical).
+        var optimizer_step = ((k - 1) // accum_steps) + 1
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, optimizer_step)
         if lokr_active:
             var mg = flux_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
             var mnorm = flux_lokr_grad_norm(mg)
             if mnorm > Float64(train_cfg.max_grad_norm):
                 flux_lokr_clip_grads(mg, train_cfg.max_grad_norm / Float32(mnorm))
             flux_lokr_adamw_step(
-                lokr_masters, mg, k, step_lr,
+                lokr_masters, mg, optimizer_step, step_lr,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay,
             )
@@ -1182,7 +1256,7 @@ def main() raises:
             if mnorm > Float64(train_cfg.max_grad_norm):
                 flux_loha_clip_grads(mg, train_cfg.max_grad_norm / Float32(mnorm))
             flux_loha_adamw_step(
-                loha_masters, mg, k, step_lr,
+                loha_masters, mg, optimizer_step, step_lr,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay,
             )
@@ -1191,12 +1265,12 @@ def main() raises:
                   " zero_leg_l1=", flux_loha_zero_leg_l1(loha_masters))
         else:
             flux_lora_adamw_step(
-                lora, grads, k, step_lr, ctx,
+                lora, grads, optimizer_step, step_lr, ctx,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay,
             )
             flux_stack_lora_adamw_step(
-                stack_lora, grads, k, step_lr, ctx,
+                stack_lora, grads, optimizer_step, step_lr, ctx,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay,
             )

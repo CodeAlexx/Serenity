@@ -177,6 +177,9 @@ from serenitymojo.training.lora_ema import (
     LoraEmaState, lora_ema_track, ema_update,
     ema_shadow_a_bf16, ema_shadow_b_bf16, ema_path_for_lora,
 )
+from serenitymojo.training.grad_accum import (
+    accumulate_grad_group, scale_grad_group, zeros_like_group,
+)
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.flat_lycoris_stack import (
     FlatLoKrSet, empty_flat_lokr_set, build_flat_lokr_set,
@@ -1569,6 +1572,30 @@ def main() raises:
 
     var smooth = Float32(0.0)
     var smooth_init = False
+
+    # ── gradient accumulation (OneTrainer; default-off when N==1) ─────────────
+    # Each loop iteration is one MICRO-step. SUM the four plain-LoRA host grad
+    # groups (block g_a/g_b + head_g_a/head_g_b) across `accum_steps` micro-steps,
+    # MEAN (÷window) on the boundary, then clip+fused-AdamW once. N==1 makes every
+    # step a boundary => byte-identical to the per-step path. Carrier/direct arms
+    # (LoKr/LoHa/DoRA/OFT) are fenced (not wired this wave).
+    var accum_steps = train_cfg.grad_accum_steps
+    if accum_steps < 1:
+        accum_steps = 1
+    var use_grad_accum = accum_steps > 1
+    if use_grad_accum and (lokr_active or loha_active or dora_active or oft_active):
+        raise Error(
+            "train_hidream_o1: grad_accum_steps>1 is not wired for the LyCORIS/"
+            "DoRA/OFT arms — use adapter_algo=lora/locon"
+        )
+    var acc_g_a = List[List[Float32]]()
+    var acc_g_b = List[List[Float32]]()
+    var acc_hg_a = List[List[Float32]]()
+    var acc_hg_b = List[List[Float32]]()
+    var micro_in_window = 0
+    if use_grad_accum:
+        print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
+
     for step in range(1, steps + 1):
         var t0 = perf_counter_ns()
         var idx = (step - 1) % n_samples
@@ -2179,6 +2206,45 @@ def main() raises:
             print("[HiDreamO1-loha] step=", step, " master_grad_norm=", Float32(grad_norm),
                   " zero_leg_l1=", flat_loha_zero_leg_l1(block_loha) + flat_loha_zero_leg_l1(head_loha))
         else:
+            # ── gradient accumulation (plain-LoRA host arm; default-off N==1) ──
+            # SUM the four host grad groups into the window buffers; on a
+            # non-boundary micro-step print progress and skip clip+AdamW+EMA. On
+            # the boundary MEAN (÷window) back into the grad lists and fall through
+            # to the UNCHANGED clip+fused-AdamW path. opt_idx keys the AdamW
+            # bias-correction on the OPTIMIZER step (N==1 => opt_idx == step).
+            if use_grad_accum:
+                if micro_in_window == 0:
+                    acc_g_a = zeros_like_group(g_a)
+                    acc_g_b = zeros_like_group(g_b)
+                    acc_hg_a = zeros_like_group(head_g_a)
+                    acc_hg_b = zeros_like_group(head_g_b)
+                accumulate_grad_group(acc_g_a, g_a)
+                accumulate_grad_group(acc_g_b, g_b)
+                accumulate_grad_group(acc_hg_a, head_g_a)
+                accumulate_grad_group(acc_hg_b, head_g_b)
+                micro_in_window += 1
+                var is_boundary = micro_in_window >= accum_steps or step == steps
+                if not is_boundary:
+                    var mid_now = perf_counter_ns()
+                    print_trainer_progress(
+                        String("HiDreamO1"), step, steps, n_samples, loss,
+                        0.0, Float64(mid_now - t0) / 1.0e9, 0.0,
+                        Float64(mid_now - train_start) / 1.0e9,
+                    )
+                    continue
+                var inv_micro = Float32(1.0) / Float32(micro_in_window)
+                scale_grad_group(acc_g_a, inv_micro)
+                scale_grad_group(acc_g_b, inv_micro)
+                scale_grad_group(acc_hg_a, inv_micro)
+                scale_grad_group(acc_hg_b, inv_micro)
+                for i in range(len(g_a)):
+                    g_a[i] = acc_g_a[i].copy()
+                    g_b[i] = acc_g_b[i].copy()
+                for i in range(len(head_g_a)):
+                    head_g_a[i] = acc_hg_a[i].copy()
+                    head_g_b[i] = acc_hg_b[i].copy()
+                micro_in_window = 0
+            var opt_idx = ((step - 1) // accum_steps) + 1
             grad_norm = _clip_grads_all(
                 g_a, g_b, head_g_a, head_g_b, CLIP_GRAD_NORM,
             )
@@ -2189,7 +2255,7 @@ def main() raises:
                 # see the new weights next step (levers.mojo T1.C header). No LR
                 # scheduler here: step_lr == the constant resolved lr.
                 levers_optimizer_step(
-                    train_cfg, host_ads, g_a, g_b, step, lr,
+                    train_cfg, host_ads, g_a, g_b, opt_idx, lr,
                     lev_opt, opt_state, ctx,
                 )
             else:
@@ -2198,7 +2264,7 @@ def main() raises:
                 # the no-config path is numerically unchanged; a config's
                 # optimizer.{beta1,beta2,eps,weight_decay} overrides.
                 fused_lora_adamw_plain_step_resident(
-                    opt_state, host_ads, g_a, g_b, step, lr,
+                    opt_state, host_ads, g_a, g_b, opt_idx, lr,
                     train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                     train_cfg.weight_decay, ctx,
                 )
@@ -2206,7 +2272,7 @@ def main() raises:
             # hypers — bitsandbytes AdamW8bit-equivalent eps). The levers optimizer
             # dispatch above is the block-adapter lever; heads keep the default.
             fused_lora_adamw_plain_step_resident(
-                head_opt, head_ads, head_g_a, head_g_b, step, lr,
+                head_opt, head_ads, head_g_a, head_g_b, opt_idx, lr,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay, ctx,
             )

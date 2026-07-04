@@ -149,6 +149,9 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
 )
 from serenitymojo.training.lora_adamw_plain_fused import fused_lora_adamw_plain_step
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.grad_accum import (
+    accumulate_grad_group, scale_grad_group, zeros_like_group,
+)
 from serenitymojo.training.ernie_validation_sampler import (
     generate_ernie_lora_shift_pair, load_ernie_sample_text_tokens,
 )
@@ -867,6 +870,22 @@ def main() raises:
     var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
     var direct_active = dora_active or oft_active
     var carrier_active = lokr_active or loha_active
+
+    # ── gradient accumulation (item 2h; OneTrainer sum-N-then-mean) ───────────
+    # Each loop iteration is one MICRO-step. We SUM the plain LoRA host grad
+    # groups (grads.d_a/d_b) across grad_accum_steps micro-steps, MEAN (÷N), then
+    # run clip+AdamW once on accumulation boundaries. accum_steps=1 => every step
+    # is a boundary, buffer holds one grad, mean=÷1 => byte-identical baseline.
+    # The LyCORIS algos (lokr/loha carrier + dora/oft direct masters) route the
+    # optimizer through separate chain/master paths; fail loud rather than
+    # silently mis-accumulating them (mirrors klein's honest scope).
+    var accum_steps = train_cfg.grad_accum_steps
+    if accum_steps < 1:
+        accum_steps = 1
+    var use_grad_accum = accum_steps > 1
+    if use_grad_accum and (direct_active or carrier_active):
+        raise Error("ERNIE: grad_accum_steps>1 not wired for LyCORIS (lokr/loha/dora/oft) this wave")
+
     var direct_targets = ERNIE_LYCORIS_TGT_ATTN if train_cfg.lokr_targets == ERNIE_LYCORIS_TGT_ATTN else 2
     var lokr_masters = empty_ernie_lokr_set()
     var loha_masters = empty_ernie_loha_set()
@@ -989,6 +1008,13 @@ def main() raises:
     var rng_state = SEED
     var t_start = perf_counter()
 
+    # gradient-accumulation window buffers (lazily sized at each window start).
+    var acc_a = List[List[Float32]]()
+    var acc_b = List[List[Float32]]()
+    var micro_in_window = 0
+    if use_grad_accum:
+        print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
+
     for step in range(run_steps):
         var step_t0 = perf_counter()
         var cache_idx = step % len(cache_files)
@@ -1050,7 +1076,10 @@ def main() raises:
         var f_shift = src[2].copy()
 
         var done_step = step + 1
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, done_step)
+        # Wave 2A scheduled lr keys on OPTIMIZER steps, not micro-steps; with
+        # accum_steps=1 this is (step//1)+1 == done_step => baseline unchanged.
+        var optimizer_step = (step // accum_steps) + 1
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, optimizer_step)
         var loss = Float32(0.0)
         var gn = Float64(0.0)
         var nonfinite_grads = 0
@@ -1138,6 +1167,33 @@ def main() raises:
                 real_len,
             )
 
+            # ── gradient accumulation (item 2h; default-off when N==1) ────────
+            # SUM this micro-step's grads into the window; on the boundary MEAN
+            # (÷N) and overwrite grads.d_a/d_b so the UNCHANGED clip+AdamW below
+            # run once. (LyCORIS algos are fenced above when N>1.)
+            if use_grad_accum:
+                if micro_in_window == 0:
+                    acc_a = zeros_like_group(grads.d_a)
+                    acc_b = zeros_like_group(grads.d_b)
+                accumulate_grad_group(acc_a, grads.d_a)
+                accumulate_grad_group(acc_b, grads.d_b)
+                micro_in_window += 1
+                var is_boundary = micro_in_window >= accum_steps or step == run_steps - 1
+                if not is_boundary:
+                    var now_m = perf_counter()
+                    print_trainer_progress(
+                        String("Ernie-lora"), done_step, run_steps, len(cache_files),
+                        loss, 0.0, now_m - step_t0, 0.0, now_m - t_start,
+                    )
+                    continue
+                var inv_micro = Float32(1.0) / Float32(micro_in_window)
+                scale_grad_group(acc_a, inv_micro)
+                scale_grad_group(acc_b, inv_micro)
+                for i in range(len(grads.d_a)):
+                    grads.d_a[i] = acc_a[i].copy()
+                    grads.d_b[i] = acc_b[i].copy()
+                micro_in_window = 0
+
             gn = _clip_grads(grads, train_cfg.max_grad_norm)
             nonfinite_grads = grads.nonfinite_lora_grads
             if lokr_active:
@@ -1174,13 +1230,13 @@ def main() raises:
                     # branch) is still how the device sees the new weights.
                     fused_lora_adamw_plain_step(
                         lora.ad, grads.d_a, grads.d_b, 0, len(lora.ad),
-                        done_step, step_lr,
+                        optimizer_step, step_lr,
                         train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                         train_cfg.weight_decay, ctx,
                     )
                 else:
                     ernie_lora_adamw_step(
-                        lora, grads, done_step, step_lr, ctx,
+                        lora, grads, optimizer_step, step_lr, ctx,
                         train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
                     )
 

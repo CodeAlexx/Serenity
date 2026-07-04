@@ -129,6 +129,9 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
+from serenitymojo.training.grad_accum import (
+    accumulate_grad_group, scale_grad_group, zeros_like_group,
+)
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
@@ -892,6 +895,22 @@ def main() raises:
     var direct_active = dora_active or oft_active
     var carrier_active = lokr_active or loha_active
     var lycoris_active = carrier_active or direct_active
+
+    # ── gradient accumulation (item 2h; OneTrainer sum-N-then-mean) ───────────
+    # Each loop iteration is one MICRO-step. We SUM the plain LoRA host grad
+    # groups (grads.d_a/d_b) across grad_accum_steps micro-steps, MEAN (÷N), then
+    # run clip+AdamW once on accumulation boundaries. accum_steps=1 => every step
+    # is a boundary, buffer holds one grad, mean=÷1 => byte-identical baseline.
+    # The LyCORIS algos (lokr/loha carrier + dora/oft direct masters) route the
+    # optimizer through separate chain/master paths; fail loud rather than
+    # silently mis-accumulating them (mirrors klein's honest scope).
+    var accum_steps = train_cfg.grad_accum_steps
+    if accum_steps < 1:
+        accum_steps = 1
+    var use_grad_accum = accum_steps > 1
+    if use_grad_accum and lycoris_active:
+        raise Error("QwenImage: grad_accum_steps>1 not wired for LyCORIS (lokr/loha/dora/oft) this wave")
+
     var direct_targets = train_cfg.lokr_targets
     var direct_oft_block_size = 4
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
@@ -1067,6 +1086,12 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
+    # gradient-accumulation window buffers (lazily sized at each window start).
+    var acc_a = List[List[Float32]]()
+    var acc_b = List[List[Float32]]()
+    var micro_in_window = 0
+    if use_grad_accum:
+        print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
     var train_start = perf_counter_ns()
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
@@ -1294,11 +1319,41 @@ def main() raises:
             Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
         )
 
+        # ── gradient accumulation (item 2h; default-off when N==1) ────────────
+        # SUM this micro-step's grads into the window; on the boundary MEAN (÷N)
+        # and overwrite grads.d_a/d_b so the UNCHANGED clip+AdamW below run once.
+        if use_grad_accum:
+            if micro_in_window == 0:
+                acc_a = zeros_like_group(grads.d_a)
+                acc_b = zeros_like_group(grads.d_b)
+            accumulate_grad_group(acc_a, grads.d_a)
+            accumulate_grad_group(acc_b, grads.d_b)
+            micro_in_window += 1
+            var is_boundary = micro_in_window >= accum_steps or k == run_steps
+            if not is_boundary:
+                var t1m = perf_counter_ns()
+                print_trainer_progress(
+                    String("QwenImage-lora"), k, run_steps, 1,
+                    loss, 0.0, Float64(t1m - t0) / 1.0e9, 0.0,
+                    Float64(t1m - train_start) / 1.0e9,
+                )
+                continue
+            var inv_micro = Float32(1.0) / Float32(micro_in_window)
+            scale_grad_group(acc_a, inv_micro)
+            scale_grad_group(acc_b, inv_micro)
+            for i in range(len(grads.d_a)):
+                grads.d_a[i] = acc_a[i].copy()
+                grads.d_b[i] = acc_b[i].copy()
+            micro_in_window = 0
+
         # ── grad norm + clip(1.0) ──
         var gn_before = _clip(grads, train_cfg.max_grad_norm)
 
         # ── AdamW ──
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        # Wave 2A scheduled lr keys on OPTIMIZER steps, not micro-steps; with
+        # accum_steps=1 this is ((k-1)//1)+1 == k => baseline unchanged.
+        var optimizer_step = ((k - 1) // accum_steps) + 1
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, optimizer_step)
         if lokr_active:
             var mg = qwen_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
             var mnorm = qwen_lokr_grad_norm(mg)
@@ -1325,7 +1380,7 @@ def main() raises:
                   " zero_leg_l1=", qwen_loha_zero_leg_l1(loha_masters))
         else:
             qwen_offload_lora_adamw_step(
-                lora, grads, k, step_lr, ctx,
+                lora, grads, optimizer_step, step_lr, ctx,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
             )
 

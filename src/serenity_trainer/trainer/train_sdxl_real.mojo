@@ -89,6 +89,9 @@ from serenitymojo.training.flat_lycoris_stack import (
     flat_oft_adamw_step, flat_oft_vec_l1, save_flat_oft,
 )
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.grad_accum import (
+    accumulate_grad_group, scale_grad_group, zeros_like_group,
+)
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.sdxl_sample_resident import (
     sdxl_sample_resident, sdxl_decode_latent_to_png,
@@ -922,6 +925,22 @@ def main() raises:
     var dora_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
     var oft_active = train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
     var carrier_active = lokr_active or loha_active or dora_active or oft_active
+
+    # ── gradient accumulation (item 2h; OneTrainer sum-N-then-mean) ───────────
+    # Each loop iteration is one MICRO-step. We SUM the plain LoRA per-ST host
+    # grad groups (grads.d_a/d_b, three-level [ST][slot][elem]) across
+    # grad_accum_steps micro-steps, MEAN (÷N), then run clip+AdamW once on
+    # accumulation boundaries. accum_steps=1 => byte-identical baseline. The
+    # LyCORIS algos (lokr/loha/dora/oft) route the optimizer through separate
+    # chain/master paths; fail loud rather than silently mis-accumulating them
+    # (mirrors klein's honest scope).
+    var accum_steps = train_cfg.grad_accum_steps
+    if accum_steps < 1:
+        accum_steps = 1
+    var use_grad_accum = accum_steps > 1
+    if use_grad_accum and carrier_active:
+        raise Error("SDXL: grad_accum_steps>1 not wired for LyCORIS (lokr/loha/dora/oft) this wave")
+
     if dora_active or oft_active:
         var projected_bytes = _sdxl_full_delta_carrier_bytes_estimate(train_cfg.lokr_targets)
         _require_sdxl_carrier_runtime_vram(
@@ -1162,6 +1181,13 @@ def main() raises:
     var last_loss = Float32(0.0)
     var train_start = perf_counter_ns()
 
+    # gradient-accumulation window buffers (per-ST three-level; lazily sized).
+    var acc_a = List[List[List[Float32]]]()
+    var acc_b = List[List[List[Float32]]]()
+    var micro_in_window = 0
+    if use_grad_accum:
+        print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
+
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
         var t_idx = FIXED_T_IDX if FIXED_SMOKE else Int((SEED_BASE + UInt64(k)) % UInt64(NUM_TRAIN_TIMESTEPS))
@@ -1251,8 +1277,46 @@ def main() raises:
         # ── backward -> per-ST LoRA grads ──
         var grads = sdxl_real_backward[LATENT_HW, LATENT_HW](go, fwd.acts, w, lora, ctx)
 
+        # ── gradient accumulation (item 2h; default-off when N==1) ────────────
+        # SUM this micro-step's per-ST grads into the window; on the boundary
+        # MEAN (÷N) and overwrite grads.d_a/d_b so the UNCHANGED clip+AdamW below
+        # run once. (LyCORIS algos are fenced above when N>1, so only the plain
+        # LoRA path reaches here under accumulation.)
+        if use_grad_accum:
+            if micro_in_window == 0:
+                acc_a = List[List[List[Float32]]]()
+                acc_b = List[List[List[Float32]]]()
+                for s in range(len(grads.d_a)):
+                    acc_a.append(zeros_like_group(grads.d_a[s]))
+                    acc_b.append(zeros_like_group(grads.d_b[s]))
+            for s in range(len(grads.d_a)):
+                accumulate_grad_group(acc_a[s], grads.d_a[s])
+                accumulate_grad_group(acc_b[s], grads.d_b[s])
+            micro_in_window += 1
+            var is_boundary = micro_in_window >= accum_steps or k == run_steps
+            if not is_boundary:
+                var t1m = perf_counter_ns()
+                print_trainer_progress(
+                    String("SDXL-lora"), k, run_steps, 1,
+                    loss, 0.0, Float64(t1m - t0) / 1.0e9, 0.0,
+                    Float64(t1m - train_start) / 1.0e9,
+                )
+                continue
+            var inv_micro = Float32(1.0) / Float32(micro_in_window)
+            for s in range(len(acc_a)):
+                scale_grad_group(acc_a[s], inv_micro)
+                scale_grad_group(acc_b[s], inv_micro)
+            for s in range(len(grads.d_a)):
+                for sl in range(len(grads.d_a[s])):
+                    grads.d_a[s][sl] = acc_a[s][sl].copy()
+                    grads.d_b[s][sl] = acc_b[s][sl].copy()
+            micro_in_window = 0
+
         # ── global-norm clip + optimizer ──
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        # Scheduled lr keys on OPTIMIZER steps, not micro-steps; with
+        # accum_steps=1 this is ((k-1)//1)+1 == k => baseline unchanged.
+        var optimizer_step = ((k - 1) // accum_steps) + 1
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, optimizer_step)
         var gn_before: Float64
         var progress_label = String("SDXL-lora")
         if lokr_active:
@@ -1354,7 +1418,7 @@ def main() raises:
         else:
             gn_before = _clip(grads, train_cfg.max_grad_norm)
             _adamw_all(
-                lora, grads, k, step_lr, ctx,
+                lora, grads, optimizer_step, step_lr, ctx,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
             )
 
