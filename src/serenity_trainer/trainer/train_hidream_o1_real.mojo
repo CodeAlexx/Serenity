@@ -212,6 +212,8 @@ from serenitymojo.models.dit.hidream_o1_train_block import (
     HiDreamO1BlockForward,
     hidream_o1_block_lora_forward,
     hidream_o1_block_lora_backward,
+    hidream_o1_block_lora_forward_b2,
+    hidream_o1_block_lora_backward_b2,
     hidream_o1_block_direct_lycoris_forward,
     hidream_o1_block_direct_lycoris_backward,
 )
@@ -1183,6 +1185,20 @@ def _scale_grads(mut g_a: List[List[Float32]], mut g_b: List[List[Float32]], s: 
             g_b[k][i] = g_b[k][i] * s
 
 
+# TRUE batch-2 helper: element-wise accumulate a per-sample host grad into a
+# destination. On the first sample dst is empty → assign; thereafter sum. Used to
+# combine the two samples' resident-head (0-3) grads into one batch grad (heads run
+# per-sample; head 4 accumulates natively at M=2S).
+def _b2_accum_into(mut dst: List[Float32], src: List[Float32]) raises:
+    if len(dst) == 0:
+        dst = src.copy()
+        return
+    if len(dst) != len(src):
+        raise Error("train_hidream_o1 b2: head grad length mismatch across samples")
+    for i in range(len(src)):
+        dst[i] = dst[i] + src[i]
+
+
 def _clip_grads_all(
     mut g_a: List[List[Float32]], mut g_b: List[List[Float32]],
     mut hg_a: List[List[Float32]], mut hg_b: List[List[Float32]],
@@ -1596,9 +1612,347 @@ def main() raises:
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
+    # ── TRUE batch-2 (row-stacked, 2 samples per optimizer step) ──────────────
+    # Mirrors the krea2 design (git 219ed5f): two samples are row-stacked into ONE
+    # [1,2S,D] forward/backward per step; attention runs per-sample; the joint
+    # 2N-mean loss scales each sample's d_out by 0.5 so the shared LoRA grad ==
+    # mean(g0,g1) == the grad-accum=2 oracle. Only the plain-LoRA host-list arm is
+    # wired (fed to the SAME fused_lora_adamw_plain_step_resident fast arm); b1
+    # (batch_size==1) stays byte-identical (the b2 branch is fully additive and
+    # `continue`s, never touching the b1 code below).
+    var use_b2 = train_cfg.batch_size == 2
+    if train_cfg.batch_size > 2:
+        raise Error(
+            "train_hidream_o1: batch_size>2 is not supported (row-stacked b2 only;"
+            " use batch_size=1 or 2)"
+        )
+    if use_b2 and use_grad_accum:
+        raise Error(
+            "train_hidream_o1: batch_size==2 + grad_accum_steps>1 is not wired"
+            " (b2 IS a 2-sample step; use one or the other)"
+        )
+    if use_b2 and (lokr_active or loha_active or dora_active or oft_active):
+        raise Error(
+            "train_hidream_o1: batch_size==2 is not wired for the LyCORIS/DoRA/OFT"
+            " arms — use adapter_algo=lora/locon"
+        )
+    if use_b2 and levers_loss_active(train_cfg):
+        raise Error(
+            "train_hidream_o1: batch_size==2 is not wired for the loss levers path"
+            " (b2 uses the ai-toolkit plain-MSE velocity loss)"
+        )
+    if use_b2:
+        print("[batch-2] row-stacked TRUE batch-2 active (2 samples/step, plain-LoRA)")
+
     for step in range(1, steps + 1):
         var t0 = perf_counter_ns()
         var idx = (step - 1) % n_samples
+
+        # ══ TRUE batch-2 (row-stacked) plain-LoRA step ═══════════════════════
+        # Fully additive: when batch_size==2 this branch runs a 2-sample row-
+        # stacked step and `continue`s, so the b1 body below is byte-identical.
+        # Consumes a NON-OVERLAPPING sample PAIR per optimizer step (odd tail
+        # self-dups via %n); each sample gets its own caption/sigma/noise/rope/
+        # mask/embeds. The two [1,S,D] hiddens are concat → [1,2S,D] BEFORE the
+        # block loop; attention is per-sample inside the b2 block; the joint
+        # 2N-mean loss scales each sample's d_out by 0.5 so the shared LoRA grad
+        # == mean(g0,g1). Feeds the SAME plain-LoRA fused resident AdamW.
+        if use_b2:
+            comptime NOUT = IMG_L * PATCH_VEC
+            comptime half = Dh // 2
+            var idx0 = (2 * (step - 1)) % n_samples
+            var idx1 = (2 * (step - 1) + 1) % n_samples
+
+            # per-sample conditioning + head-forward captures (collected).
+            var hid_list = List[TArc]()
+            var cosq_list = List[TArc]()
+            var sinq_list = List[TArc]()
+            var cosk_list = List[TArc]()
+            var sink_list = List[TArc]()
+            var mask4_list = List[TArc]()
+            var maskf_list = List[TArc]()
+            var sigma_list = List[Float32]()
+            var wt_list = List[Float32]()
+            var noisyh_list = List[List[Float32]]()
+            var targeth_list = List[List[Float32]]()
+            var freqc_list = List[TArc]()
+            var teh0_list = List[TArc]()
+            var tesilu_list = List[TArc]()
+            var peh1_list = List[TArc]()
+            var noisy_list = List[TArc]()
+            var tms_list = List[Int]()
+
+            for si in range(2):
+                var sidx = idx0 if si == 0 else idx1
+                # per-sample virtual step: two consecutive draws of the b1 RNG
+                # stream per optimizer step (analogous to krea2 pair_lead=2*step).
+                var vstep = 2 * (step - 1) + si + 1
+
+                var img = Tensor.from_view(imgs.tensor_view(String("image.") + String(sidx)), ctx)
+                var img_bf = cast_tensor(img, STDtype.BF16, ctx)
+                var clean = patchify(img_bf, PATCH, ctx)
+                var clean_h = clean.to_host(ctx)
+
+                var caption = _read_text(stage_dir + "/caption." + String(sidx) + ".txt")
+                if caption_dropout_pick(UInt64(vstep), SEED, caption_dropout_p):
+                    caption = String("")
+                var samp: T2ISample
+                while True:
+                    try:
+                        samp = build_t2i_input(tok, cfg, caption, HP, WP, S_TEXT)
+                        break
+                    except:
+                        var keep = caption.byte_length() // 2
+                        if keep < 8:
+                            raise Error("train_hidream_o1 b2: caption cannot fit bucket")
+                        var cut = String("")
+                        var taken = 0
+                        for ch in caption.codepoint_slices():
+                            var l = ch.byte_length()
+                            if taken + l > keep:
+                                break
+                            cut += String(ch)
+                            taken += l
+                        caption = cut^
+
+                # sigma / noise / noisy / target (host F32; per-sample draw)
+                var rng_st = SEED * UInt64(6364136223846793005) + UInt64(vstep)
+                rng_st = rng_st * 6364136223846793005 + 1442695040888963407
+                var t_id = Int((rng_st >> 33) % UInt64(1000))
+                var sigma = sw.sigmas[t_id]
+                var wt = Float32(1.0)
+                if APPLY_GAUSS_SHIFT_WEIGHT:
+                    wt = sw.weights[t_id]
+                var noise = _gauss(IMG_L * PATCH_VEC, SEED * UInt64(7919) + UInt64(vstep))
+                var noisy_h = List[Float32]()
+                var target_h = List[Float32]()
+                for i in range(IMG_L * PATCH_VEC):
+                    var nz = noise[i] * NOISE_SCALE
+                    noisy_h.append((Float32(1.0) - sigma) * clean_h[i] + sigma * nz)
+                    target_h.append(nz - clean_h[i])
+                var noisy = Tensor.from_host(noisy_h.copy(), [1, IMG_L, PATCH_VEC], STDtype.BF16, ctx)
+
+                # embeds (plain-LoRA heads 0-3, INLINE — same math as the b1 body)
+                var text_emb = dit._embed(samp.text_ids, ctx)
+                var model_t = Float32(1.0) - sigma
+                var te_dtype = te_w0[].dtype()
+                var te_t_host: List[Float32] = [model_t * Float32(1000.0)]
+                var te_t = Tensor.from_host(te_t_host^, [1], STDtype.F32, ctx)
+                var freq_c = timestep_embedding(
+                    te_t, cfg.timestep_freq_dim, ctx, Float32(10000.0), te_dtype)
+                var te_h0 = linear(freq_c, te_w0[], Optional[Tensor](te_b0[].clone(ctx)), ctx)
+                te_h0 = zimage_lora_apply_device(te_h0^, freq_c, head_loras[2], 1, ctx)
+                var te_silu = silu(te_h0, ctx)
+                var t_emb = linear(te_silu, te_w2[], Optional[Tensor](te_b2[].clone(ctx)), ctx)
+                t_emb = zimage_lora_apply_device(t_emb^, te_silu, head_loras[3], 1, ctx)
+                var tms_idx = -1
+                for i in range(len(samp.text_ids)):
+                    if samp.text_ids[i] == cfg.tms_token_id:
+                        tms_idx = i
+                var text_emb_t = _scatter_row(text_emb, t_emb, tms_idx, len(samp.text_ids), D, ctx)
+                var pe_h1 = linear(noisy, xe_w1[], None, ctx)
+                pe_h1 = zimage_lora_apply_device(pe_h1^, noisy, head_loras[0], IMG_L, ctx)
+                var patch_emb = linear(pe_h1, xe_w2[], Optional[Tensor](xe_b2[].clone(ctx)), ctx)
+                patch_emb = zimage_lora_apply_device(patch_emb^, pe_h1, head_loras[1], IMG_L, ctx)
+                var hidden_t = concat(1, ctx, text_emb_t, patch_emb)   # [1,S,D]
+
+                # mrope tables + prefix-causal mask (per sample)
+                var tables = _build_mrope_tables(
+                    samp.t_pos, samp.h_pos, samp.w_pos, Dh, cfg.rope_theta,
+                    cfg.mrope_h, cfg.mrope_w)
+                var cq_sh: List[Int] = [S * H * half]
+                var ck_sh: List[Int] = [S * HKV * half]
+                var cos_q = Tensor.from_host(_replicate_heads(tables[0], S, half, H), cq_sh.copy(), STDtype.F32, ctx)
+                var sin_q = Tensor.from_host(_replicate_heads(tables[1], S, half, H), cq_sh^, STDtype.F32, ctx)
+                var cos_k = Tensor.from_host(_replicate_heads(tables[0], S, half, HKV), ck_sh.copy(), STDtype.F32, ctx)
+                var sin_k = Tensor.from_host(_replicate_heads(tables[1], S, half, HKV), ck_sh^, STDtype.F32, ctx)
+                var mask_h = _build_prefix_causal_mask_padded(S, H, samp.ar_len, samp.key_valid)
+                var m4_sh: List[Int] = [1, H, S, S]
+                var mask4 = Tensor.from_host(mask_h.copy(), m4_sh^, STDtype.BF16, ctx)
+                var mhs_sh: List[Int] = [H * S, S]
+                var mask_f32 = Tensor.from_host(mask_h^, mhs_sh^, STDtype.F32, ctx)
+
+                hid_list.append(TArc(hidden_t^))
+                cosq_list.append(TArc(cos_q^))
+                sinq_list.append(TArc(sin_q^))
+                cosk_list.append(TArc(cos_k^))
+                sink_list.append(TArc(sin_k^))
+                mask4_list.append(TArc(mask4^))
+                maskf_list.append(TArc(mask_f32^))
+                sigma_list.append(sigma)
+                wt_list.append(wt)
+                noisyh_list.append(noisy_h^)
+                targeth_list.append(target_h^)
+                freqc_list.append(TArc(freq_c^))
+                teh0_list.append(TArc(te_h0^))
+                tesilu_list.append(TArc(te_silu^))
+                peh1_list.append(TArc(pe_h1^))
+                noisy_list.append(TArc(noisy^))
+                tms_list.append(tms_idx)
+
+            # ── row-stack + pre-tile rope tables to 2S rows ─────────────────
+            var combined = TArc(concat(1, ctx, hid_list[0][], hid_list[1][]))  # [1,2S,D]
+            var cos_q2 = concat(0, ctx, cosq_list[0][], cosq_list[1][])        # [2S*H*half]
+            var sin_q2 = concat(0, ctx, sinq_list[0][], sinq_list[1][])
+            var cos_k2 = concat(0, ctx, cosk_list[0][], cosk_list[1][])        # [2S*HKV*half]
+            var sin_k2 = concat(0, ctx, sink_list[0][], sink_list[1][])
+
+            # ── forward stack (recompute-checkpoint: keep [1,2S,D] inputs) ──
+            var x = combined.copy()
+            var block_in = List[TArc]()
+            for li in range(LAYERS):
+                block_in.append(x.copy())
+                var bwts = _block_weights_q(resident_blocks[li], li, fp8_resident, ctx)
+                var f = hidream_o1_block_lora_forward_b2[S, H, HKV, Dh](
+                    x, bwts, loras[li], cos_q2, sin_q2, cos_k2, sin_k2,
+                    mask4_list[0][], mask4_list[1][], D, F, EPS, ctx)
+                x = f.out.copy()
+
+            # final norm + head-4 linear (token-parallel at M=2S; head4 LoRA
+            # accumulates BOTH samples natively).
+            var final_in = x.copy()
+            var final_normed = rms_norm(final_in[], norm_w[], EPS, ctx)         # [1,2S,D]
+            var out_full = linear(final_normed, final_w[], Optional[Tensor](fl_b[].clone(ctx)), ctx)
+            out_full = zimage_lora_apply_device(out_full^, final_normed, head_loras[4], 2 * S, ctx)
+            var out_h = out_full.to_host(ctx)                                    # [1,2S,PATCH_VEC]
+
+            # ── per-sample loss + joint 2N-mean d_out (each sample 0.5-scaled) ─
+            var d_full = List[Float32]()
+            var loss0 = Float32(0.0)
+            var loss1 = Float32(0.0)
+            for si in range(2):
+                var sigma_div = sigma_list[si] if sigma_list[si] > SIGMA_FLOOR else SIGMA_FLOOR
+                var inv_sigma = Float32(1.0) / sigma_div
+                var wt_si = wt_list[si]
+                var dcoef = -wt_si * Float32(2.0) / Float32(NOUT) * inv_sigma
+                # text rows (S_TEXT) carry no image loss → zeros.
+                for _ in range(S_TEXT * PATCH_VEC):
+                    d_full.append(0.0)
+                var base_si = (si * S + S_TEXT) * PATCH_VEC
+                var sse = 0.0
+                for i in range(NOUT):
+                    var x_pred = out_h[base_si + i]
+                    var v_pred = (noisyh_list[si][i] - x_pred) * inv_sigma
+                    var diff = v_pred - targeth_list[si][i]
+                    sse += Float64(diff) * Float64(diff)
+                    # 0.5 = joint 2N-mean scale: d(total)/d(x_pred) = 0.5 * b1_d.
+                    d_full.append(Float32(0.5) * dcoef * diff)
+                var loss_si = Float32(sse / Float64(NOUT)) * wt_si
+                if si == 0:
+                    loss0 = loss_si
+                else:
+                    loss1 = loss_si
+            var loss = Float32(0.5) * (loss0 + loss1)
+            var d_out_t = Tensor.from_host(d_full^, [1, 2 * S, PATCH_VEC], STDtype.BF16, ctx)
+
+            # ── head-4 backward (M=2S accumulates both samples) + dx into stack ─
+            var head_g_a = List[List[Float32]]()
+            var head_g_b = List[List[Float32]]()
+            for _ in range(N_HEADS):
+                head_g_a.append(List[Float32]())
+                head_g_b.append(List[Float32]())
+            var h4 = zimage_lora_bwd_device_resident_tensors(
+                d_out_t, final_normed, head_loras[4], 2 * S, ctx)
+            head_g_a[4] = h4.d_a[].to_host(ctx)
+            head_g_b[4] = h4.d_b[].to_host(ctx)
+            var d_final_base = linear_backward_dx(d_out_t, final_w[], 2 * S, D, PATCH_VEC, ctx)
+            var d_final_normed = ta_add(d_final_base, h4.d_x[], ctx)
+            var d_x = TArc(rms_norm_backward_dx(d_final_normed, final_in[], norm_w[], EPS, ctx))  # [1,2S,D]
+
+            # ── backward block stack (b2; recompute tape per block) ─────────
+            var g_a = List[List[Float32]]()
+            var g_b = List[List[Float32]]()
+            for _ in range(LAYERS * 7):
+                g_a.append(List[Float32]())
+                g_b.append(List[Float32]())
+            var bi = LAYERS - 1
+            while bi >= 0:
+                var bwts_b = _block_weights_q(resident_blocks[bi], bi, fp8_resident, ctx)
+                var rf = hidream_o1_block_lora_forward_b2[S, H, HKV, Dh](
+                    block_in[bi], bwts_b, loras[bi], cos_q2, sin_q2, cos_k2, sin_k2,
+                    mask4_list[0][], mask4_list[1][], D, F, EPS, ctx)
+                var bg = hidream_o1_block_lora_backward_b2[S, H, HKV, Dh](
+                    d_x[], bwts_b, loras[bi], rf.saved, cos_q2, sin_q2, cos_k2, sin_k2,
+                    maskf_list[0][], maskf_list[1][], D, F, EPS, ctx)
+                d_x = bg.d_hidden.copy()
+                for sl in range(7):
+                    if not bg.d_a[sl]:
+                        raise Error("train_hidream_o1 b2: missing adapter grad")
+                    var kk = bi * 7 + sl
+                    g_a[kk] = bg.d_a[sl].value()[].to_host(ctx)
+                    g_b[kk] = bg.d_b[sl].value()[].to_host(ctx)
+                bi -= 1
+
+            # ── resident-head backward (heads 0-3) PER SAMPLE, grads SUMMED ──
+            # d_x [1,2S,D] = grad wrt combined hidden_t; slice each sample's [1,S,D].
+            for si in range(2):
+                var dxs = ta_slice(d_x[], 1, si * S, S, ctx)               # [1,S,D]
+                # head 1 (proj2): grad wrt out = d_patch_emb; input = pe_h1.
+                var d_patch_emb = ta_slice(dxs, 1, S_TEXT, IMG_L, ctx)     # [1,IMG_L,D]
+                var h1g = zimage_lora_bwd_device_resident_tensors(
+                    d_patch_emb, peh1_list[si][], head_loras[1], IMG_L, ctx)
+                _b2_accum_into(head_g_a[1], h1g.d_a[].to_host(ctx))
+                _b2_accum_into(head_g_b[1], h1g.d_b[].to_host(ctx))
+                var d_pe_h1_base = linear_backward_dx(d_patch_emb, xe_w2[], IMG_L, XEMB_MID, D, ctx)
+                var d_pe_h1 = ta_add(d_pe_h1_base, h1g.d_x[], ctx)         # [IMG_L,1024]
+                # head 0 (proj1): grad wrt out = d_pe_h1; input = noisy (data).
+                var h0g = zimage_lora_bwd_device_resident_tensors(
+                    d_pe_h1, noisy_list[si][], head_loras[0], IMG_L, ctx)
+                _b2_accum_into(head_g_a[0], h0g.d_a[].to_host(ctx))
+                _b2_accum_into(head_g_b[0], h0g.d_b[].to_host(ctx))
+                # timestep MLP: tms-row grad → mlp.2 → SiLU → mlp.0.
+                var d_t_emb_raw = ta_slice(dxs, 1, tms_list[si], 1, ctx)   # [1,1,D]
+                var d_t_emb = reshape_owned(d_t_emb_raw^, [1, D])          # [1,D]
+                var h3g = zimage_lora_bwd_device_resident_tensors(
+                    d_t_emb, tesilu_list[si][], head_loras[3], 1, ctx)
+                _b2_accum_into(head_g_a[3], h3g.d_a[].to_host(ctx))
+                _b2_accum_into(head_g_b[3], h3g.d_b[].to_host(ctx))
+                var d_te_silu_base = linear_backward_dx(d_t_emb, te_w2[], 1, D, D, ctx)
+                var d_te_silu = ta_add(d_te_silu_base, h3g.d_x[], ctx)     # [1,D]
+                var d_te_h0 = silu_backward(d_te_silu, teh0_list[si][], ctx) # [1,D]
+                var h2g = zimage_lora_bwd_device_resident_tensors(
+                    d_te_h0, freqc_list[si][], head_loras[2], 1, ctx)
+                _b2_accum_into(head_g_a[2], h2g.d_a[].to_host(ctx))
+                _b2_accum_into(head_g_b[2], h2g.d_b[].to_host(ctx))
+
+            # ── clip + fused resident AdamW (SAME plain-LoRA fast arm as b1) ──
+            var opt_idx = step   # accum_steps==1 in b2 (fenced above)
+            var grad_norm = _clip_grads_all(g_a, g_b, head_g_a, head_g_b, CLIP_GRAD_NORM)
+            fused_lora_adamw_plain_step_resident(
+                opt_state, host_ads, g_a, g_b, opt_idx, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay, ctx)
+            fused_lora_adamw_plain_step_resident(
+                head_opt, head_ads, head_g_a, head_g_b, opt_idx, lr,
+                train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+                train_cfg.weight_decay, ctx)
+            if ema_on:
+                ema_update(ema, host_ads, step)
+
+            var t1b = perf_counter_ns()
+            if smooth_init:
+                smooth = smooth * Float32(0.99) + loss * Float32(0.01)
+            else:
+                smooth = loss
+                smooth_init = True
+            var b_absum2 = Float32(0.0)
+            for k in range(LAYERS * 7):
+                for i in range(len(host_ads[k].b)):
+                    var av = Float32(host_ads[k].b[i])
+                    b_absum2 += av if av >= 0.0 else -av
+            print(
+                "[HiDreamO1-lora-b2] step ", step, "/", steps,
+                " | pair (", idx0, ",", idx1, ")",
+                " | sigma0 ", sigma_list[0], " | loss ", loss, " | smooth ", smooth,
+                " | gnorm ", grad_norm,
+                " | B|.|1 ", b_absum2,
+                " | ", Float32(Float64(t1b - t0) / 1.0e9), "s/step",
+            )
+            print_trainer_progress(
+                String("HiDreamO1"), step, steps, n_samples, loss,
+                grad_norm, Float64(t1b - t0) / 1.0e9, 0.0,
+                Float64(t1b - train_start) / 1.0e9)
+            continue
 
         # ── data: clean patches + ids/positions/mask ─────────────────────────
         var img = Tensor.from_view(imgs.tensor_view(String("image.") + String(idx)), ctx)
