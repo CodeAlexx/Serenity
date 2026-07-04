@@ -128,3 +128,10 @@ post-AdamW-step movement, save+reopen. ideogram4 twin lives in mojodiffusion
 (models/ideogram4/parity/ideogram4_lycoris_orchestration_smoke.mojo) + 1-step REAL
 gates on the eri2 cache PASS x2 (see LYCORIS_CARRIER_DISPATCH_2026-06-27.md 07-03
 section; MJ-1062/1063).
+
+## 2026-07-03 — config-standardization gates
+- samples-JSON validator (mojodiffusion `output/bin/samples_json_validate` over
+  serenitymojo/configs/*_samples.json): ALL 28 VALID.
+- chroma sampling-contract gates (real binary, 1-step): caps-missing -> FAIL-LOUD
+  naming the file PASS; legacy (empty key) -> loud warning + trains (loss 0.3504) PASS.
+- OPEN: per-model caps safetensors staging -> full caps-render gates for the Tier-B six.
