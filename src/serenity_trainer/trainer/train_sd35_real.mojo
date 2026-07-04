@@ -818,8 +818,48 @@ def main() raises:
     # ── block-swap offload loader ────────────────────────────────────────────
     var plan = build_sd35_large_block_plan()
     var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(ckpt, plan^, cfg, ctx)
+    # fp8_e4m3 pins EVERY block device-resident — skip the whole-DiT pinned
+    # host block store (~16 GB, never read again; 2× concurrent = host OOM).
+    var loader = TurboPlannedLoader.open(
+        ckpt, plan^, cfg, ctx,
+        fill_block_store=train_cfg.quantized_resident != String("fp8_e4m3"),
+    )
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
+
+    # ── T2.B residency policy (MJ-1065, user directive 2026-07-03) ────────────
+    # SD3.5-Large is a ~16GB bf16 DiT; the streamed base re-reads the WHOLE DiT
+    # from the host pin pool EVERY forward (a per-step DISK read forbidden by
+    # policy). fp8_e4m3 = quantize the 2-D matmul weights ONCE to E4M3 + per-row
+    # F32 scale, held resident (~8GB, fits 24GB with LoRA state), dequant per
+    # block in the step → ZERO per-step disk. streamed_base_opt_in = the explicit
+    # slow bf16 disk-stream arm (quality-control A/Bs only). Any other value
+    # (incl the "OFF" default) FAILS LOUD. All adapter paths (lora/dora/oft) +
+    # the inline sampler go through loader.await_block, so pinning here converts
+    # every one at once.
+    var quant_tag = train_cfg.quantized_resident.copy()
+    if quant_tag == String("fp8_e4m3"):
+        print("[quant] fp8_e4m3-resident base: quantizing",
+              loader.block_count(), "blocks ONCE at load ...")
+        var pinned = loader.pin_residents_fp8(20 * 1024 * 1024 * 1024, ctx)
+        if pinned != loader.block_count():
+            raise Error(
+                String("SD3.5 fp8-resident: pinned ") + String(pinned) + String(" of ")
+                + String(loader.block_count())
+                + String(" blocks (budget too small) — MJ-1065 forbids a partial-")
+                + String("resident base that would per-step disk-stream the rest")
+            )
+        print("[quant] fp8_e4m3-resident base: DONE (", pinned,
+              "blocks; NO per-step disk read in the step).")
+    elif quant_tag == String("streamed_base_opt_in"):
+        print("[quant] streamed_base_opt_in: per-step bf16 DISK stream",
+              "(EXPLICIT slow experiment arm).")
+    else:
+        raise Error(
+            String("SD3.5: quantized_resident='") + quant_tag
+            + String("' selects the per-step DISK-STREAM base, forbidden by policy ")
+            + String("MJ-1065. Use \"fp8_e4m3\" (resident base) or ")
+            + String("\"streamed_base_opt_in\" to explicitly run the slow streamed arm.")
+        )
 
     # ── LoRA set (B=0 init -> identity at step 0) ────────────────────────────
     var lora = build_sd35_lora_set(NUM_JOINT, D, FMLP, RANK, ALPHA)
@@ -1097,11 +1137,14 @@ def main() raises:
             continue
 
         # ── forward (offload, full depth) -> velocity [N_IMG, OUT_CH] ──
+        # sd3.5-large block 37 context stream is pre_only IN THE FILE (qkv only,
+        # no proj/mlp — verified from the safetensors header 2026-07-04).
         var fwd = sd35_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
             noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
             base, loader, lora,
             D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
             EPS, QK_EPS, ctx,
+            last_ctx_preonly=True,
         )
 
         # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
@@ -1124,6 +1167,7 @@ def main() raises:
             base, loader, lora, fwd,
             D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
             EPS, QK_EPS, ctx,
+            last_ctx_preonly=True,
         )
 
         # ── grad norm + clip(1.0) ──

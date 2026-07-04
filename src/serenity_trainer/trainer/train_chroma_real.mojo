@@ -716,8 +716,48 @@ def main() raises:
     # ── block-swap offload loader ────────────────────────────────────────────
     var plan = build_chroma1_hd_block_plan()
     var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(ckpt, plan^, cfg, ctx)
+    # fp8_e4m3 pins EVERY block device-resident — skip the whole-DiT pinned
+    # host block store (~17 GB, never read again; 2× concurrent = host OOM).
+    var loader = TurboPlannedLoader.open(
+        ckpt, plan^, cfg, ctx,
+        fill_block_store=train_cfg.quantized_resident != String("fp8_e4m3"),
+    )
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
+
+    # ── T2.B residency policy (MJ-1065, user directive 2026-07-03) ────────────
+    # Chroma1-HD is a ~17GB bf16 DiT; the streamed base re-reads the WHOLE DiT
+    # from the host pin pool EVERY forward (~136-147s/step, a per-step DISK read
+    # forbidden by policy). fp8_e4m3 = quantize the 2-D matmul weights ONCE to
+    # E4M3 + per-row F32 scale, held resident (~9GB, fits 24GB with LoRA state),
+    # dequant per block in the step → ZERO per-step disk. streamed_base_opt_in =
+    # the explicit slow bf16 disk-stream arm (quality-control A/Bs only). Any
+    # other value (incl the "OFF" default) FAILS LOUD — the streamed base is not
+    # a silent default. All adapter paths (lora/dora/oft) + the inline sampler go
+    # through loader.await_block, so pinning here converts every one at once.
+    var quant_tag = train_cfg.quantized_resident.copy()
+    if quant_tag == String("fp8_e4m3"):
+        print("[quant] fp8_e4m3-resident base: quantizing",
+              loader.block_count(), "blocks ONCE at load ...")
+        var pinned = loader.pin_residents_fp8(20 * 1024 * 1024 * 1024, ctx)
+        if pinned != loader.block_count():
+            raise Error(
+                String("Chroma fp8-resident: pinned ") + String(pinned) + String(" of ")
+                + String(loader.block_count())
+                + String(" blocks (budget too small) — MJ-1065 forbids a partial-")
+                + String("resident base that would per-step disk-stream the rest")
+            )
+        print("[quant] fp8_e4m3-resident base: DONE (", pinned,
+              "blocks; NO per-step disk read in the step).")
+    elif quant_tag == String("streamed_base_opt_in"):
+        print("[quant] streamed_base_opt_in: per-step bf16 DISK stream",
+              "(EXPLICIT slow experiment arm).")
+    else:
+        raise Error(
+            String("Chroma: quantized_resident='") + quant_tag
+            + String("' selects the per-step DISK-STREAM base, forbidden by policy ")
+            + String("MJ-1065. Use \"fp8_e4m3\" (resident base) or ")
+            + String("\"streamed_base_opt_in\" to explicitly run the slow streamed arm.")
+        )
 
     # ── 3-axis RoPE tables (positions fixed for 512px; built once, BF16) ─────
     var rope = build_flux1_rope_tables[N_IMG, N_TXT, H, Dh](HT, WT, ctx, STDtype.BF16)

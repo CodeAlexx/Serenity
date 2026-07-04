@@ -198,6 +198,10 @@ comptime SEED_BASE = UInt64(42)
 comptime FIXED_SIGMA_SMOKE = True
 comptime FIXED_SIGMA_IDX = 500   # mid-schedule sigma when FIXED_SIGMA_SMOKE.
 
+# fp8-resident cap (MJ-1065): the 57 flux blocks (~23 GiB bf16) quantized to
+# E4M3 + per-row scale are ~12 GiB — held resident, dequant per block, NO
+# per-step disk stream. 16 GiB cap holds every block (require pinned==count).
+comptime FLUX_FP8_RESIDENT_BUDGET_BYTES = 16 * 1024 * 1024 * 1024
 comptime CKPT = "/home/alex/.serenity/models/checkpoints/flux1-dev.safetensors"
 comptime CACHE_DIR = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_flux_512_smoke"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/alina_flux"
@@ -743,8 +747,46 @@ def main() raises:
     # ── block-swap offload loader (streams attn/mlp blocks one at a time) ────
     var plan = build_flux1_dev_block_plan()
     var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(ckpt, plan^, cfg, ctx)
+    # fp8_e4m3 pins EVERY block device-resident — skip the whole-DiT pinned
+    # host block store (never read again; 2× concurrent = host OOM).
+    var loader = TurboPlannedLoader.open(
+        ckpt, plan^, cfg, ctx,
+        fill_block_store=train_cfg.quantized_resident != String("fp8_e4m3"),
+    )
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
+
+    # ── Residency policy (MJ-1065, 2026-07-03) ──────────────────────────────────
+    # Base weights MUST be device-resident: per-step disk reads are forbidden.
+    #   "fp8_e4m3" (default): quantize the WHOLE block base ONCE to E4M3 + per-row
+    #     scale (~12 GiB), hold resident, dequant per block on await — no streaming.
+    #   "streamed_base_opt_in": the OLD per-step bf16 disk stream (A/B arm).
+    #   empty/OFF/other: FAIL LOUD (the disk-stream default was the violation).
+    # NOTE: flux also holds a ~12.3 GiB F32 stack base resident (load_flux_stack_base,
+    # frozen) — with the ~12 GiB fp8 block base that is TIGHT on 24 GiB. flux is
+    # compile-only here (no local cache); VRAM UNMEASURED — see report.
+    if train_cfg.quantized_resident == String("fp8_e4m3"):
+        var n_blocks = loader.block_count()
+        var pinned = loader.pin_residents_fp8(FLUX_FP8_RESIDENT_BUDGET_BYTES, ctx)
+        if pinned != n_blocks:
+            raise Error(
+                String("flux fp8-resident: pinned ") + String(pinned) + " of "
+                + String(n_blocks) + " blocks within budget "
+                + String(FLUX_FP8_RESIDENT_BUDGET_BYTES) + " bytes — a block would "
+                + "still per-step disk-stream (MJ-1065). Raise the budget."
+            )
+        print(
+            "[quant] fp8_e4m3-resident base: quantized", pinned, "of", n_blocks,
+            "blocks ONCE (per-row E4M3; dequant per block; NO per-step disk read).",
+        )
+    elif train_cfg.quantized_resident == String("streamed_base_opt_in"):
+        print("[quant] streamed_base_opt_in: per-step bf16 disk stream (A/B arm).")
+    else:
+        raise Error(
+            String("flux: quantized_resident='") + train_cfg.quantized_resident
+            + "' selects the per-step DISK-STREAM base, forbidden by policy "
+            + "MJ-1065. Use \"fp8_e4m3\" (resident base) or "
+            + "\"streamed_base_opt_in\" for the explicit streamed A/B arm."
+        )
 
     # ── 3-axis RoPE tables (positions fixed for 512px; built once) ───────────
     var rope = build_flux1_rope_tables[N_IMG, N_TXT, H, Dh](HT, WT, ctx, STDtype.BF16)

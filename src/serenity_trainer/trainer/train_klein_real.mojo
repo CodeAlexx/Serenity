@@ -289,6 +289,11 @@ comptime SAMPLE_SEED = UInt64(42)
 # bytes — the shift is pointer-alignment GEMM algo selection (same accepted
 # class as the fused-AdamW m/v ties). Anchors re-recorded below.
 comptime RESIDENT_BUDGET_BYTES = 9 * 1024 * 1024 * 1024
+# fp8-resident (MJ-1065, 2026-07-03): the WHOLE klein base (32 blocks, ~17 GiB
+# bf16) quantized to E4M3 + per-row F32 scale is ~8.7 GiB — full residency in
+# LESS VRAM than the old 9 GiB partial bf16 pin, and NO per-step disk stream.
+# Cap sized to hold every block (require pinned==count); 16 GiB leaves headroom.
+comptime KLEIN_FP8_RESIDENT_BUDGET_BYTES = 16 * 1024 * 1024 * 1024
 comptime SCRATCH_FWD_SLAB_BYTES = 512 * 1024 * 1024
 comptime SCRATCH_FWD_SLABS = 2
 comptime SCRATCH_BWD_SLAB_BYTES = 1024 * 1024 * 1024
@@ -1157,8 +1162,12 @@ def main() raises:
     if runtime_profile:
         print("PROG_STAGE step=0 total=", run_steps, " phase=load_step_mod_weights")
     var plan = build_klein_block_plan(cfg.num_double, cfg.num_single)
+    # fp8_e4m3 pins EVERY block device-resident, so the whole-DiT pinned host
+    # block store (~17 GB, never read again) must not be allocated — two
+    # concurrent stores OOM-killed the user session (systemd-oomd 2026-07-04).
     var loader = TurboPlannedLoader.open(
-        cfg.checkpoint, plan^, OffloadConfig.synchronous_single(), ctx
+        cfg.checkpoint, plan^, OffloadConfig.synchronous_single(), ctx,
+        fill_block_store=cfg.quantized_resident != String("fp8_e4m3"),
     )
     if runtime_profile:
         print("PROG_STAGE step=0 total=", run_steps, " phase=open_turbo_loader")
@@ -1172,17 +1181,56 @@ def main() raises:
     var large_inline_sample = (
         runtime_sample_enabled and _klein_inline_sampling_needs_large_grid(sample_cfg)
     )
-    var resident_budget_bytes = (
-        0 if (carrier_active or large_inline_sample) else RESIDENT_BUDGET_BYTES
-    )
-    var pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
-    print(
-        "  resident blocks pinned:", pinned_blocks, "of",
-        cfg.num_double + cfg.num_single,
-        " budget_bytes=", resident_budget_bytes,
-    )
-    if large_inline_sample:
-        print("  large inline sample: block pinning disabled for sampler headroom")
+    # ── Residency policy (MJ-1065, 2026-07-03) ──────────────────────────────────
+    # Base weights MUST be device-resident: per-step disk reads are forbidden.
+    #   "fp8_e4m3"  (default recommendation): quantize the WHOLE base ONCE to E4M3
+    #     + per-row F32 scale (~8.7 GiB), hold resident, dequant per block on await
+    #     — full residency, NO streaming, in LESS VRAM than the old 9 GiB pin.
+    #   "streamed_base_opt_in": the OLD partial bf16 pin + per-step disk stream,
+    #     preserved for anchor re-runs (0.5414x/0.2154x/0.7809x) and A/Bs. fp8 is
+    #     lossy (~0.99 cos) so those bit-anchors need re-baselining under fp8.
+    #   empty/OFF/other: FAIL LOUD (the disk-stream default was the policy violation).
+    var n_blocks = cfg.num_double + cfg.num_single
+    var pinned_blocks = 0
+    if cfg.quantized_resident == String("fp8_e4m3"):
+        pinned_blocks = loader.pin_residents_fp8(
+            KLEIN_FP8_RESIDENT_BUDGET_BYTES, ctx
+        )
+        if pinned_blocks != n_blocks:
+            raise Error(
+                String("klein fp8-resident: pinned ") + String(pinned_blocks)
+                + " of " + String(n_blocks) + " blocks within budget "
+                + String(KLEIN_FP8_RESIDENT_BUDGET_BYTES) + " bytes — a block "
+                + "would still per-step disk-stream (MJ-1065). Raise the budget."
+            )
+        print(
+            "  fp8_e4m3-resident base: quantized", pinned_blocks, "of", n_blocks,
+            "blocks ONCE (per-row E4M3; dequant per block; NO per-step disk read).",
+        )
+        if large_inline_sample or carrier_active:
+            print(
+                "  note: fp8 base pins all blocks (~8.7 GiB) even with",
+                "carrier/large-inline-sample — use streamed_base_opt_in if VRAM-tight.",
+            )
+    elif cfg.quantized_resident == String("streamed_base_opt_in"):
+        var resident_budget_bytes = (
+            0 if (carrier_active or large_inline_sample) else RESIDENT_BUDGET_BYTES
+        )
+        pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
+        print(
+            "  [streamed_base_opt_in] resident blocks pinned:", pinned_blocks,
+            "of", n_blocks, " budget_bytes=", resident_budget_bytes,
+            " (bf16 partial pin + per-step disk stream — anchor/A-B arm).",
+        )
+        if large_inline_sample:
+            print("  large inline sample: block pinning disabled for sampler headroom")
+    else:
+        raise Error(
+            String("klein: quantized_resident='") + cfg.quantized_resident
+            + "' selects the per-step DISK-STREAM base, forbidden by policy "
+            + "MJ-1065. Use \"fp8_e4m3\" (resident base) or "
+            + "\"streamed_base_opt_in\" for the explicit streamed anchor/A-B arm."
+        )
     var use_activation_tape_offload = cfg.activation_offload_enabled()
     if cfg.gradient_checkpointing_offload():
         print(

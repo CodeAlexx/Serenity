@@ -192,6 +192,12 @@ comptime DEFAULT_CONFIG = "/home/alex/mojodiffusion/serenitymojo/configs/qwenima
 comptime DEFAULT_RUN_STEPS = 5
 comptime DEFAULT_CACHE_DIR = "/home/alex/datasets/qwenimage_cache_512"
 comptime LORA_DIR = "/home/alex/mojodiffusion/output/qwenimage_lora"
+# fp8-resident cap (MJ-1065): the 60 double-blocks (~39 GiB bf16, the biggest
+# per-forward disk stream in the fleet) quantized to E4M3 + per-row scale are
+# ~20 GiB — held resident, dequant per block, NO per-step disk stream. 22 GiB
+# cap holds every block (require pinned==count). ~20 GiB resident is TIGHT on
+# 24 GiB with LoRA/optimizer state — the 1-step gate MEASURES the VRAM peak.
+comptime QWEN_FP8_RESIDENT_BUDGET_BYTES = 22 * 1024 * 1024 * 1024
 
 # ── sample-during-training (v1; qwenimage_sample_resident) ────────────────────
 # SAMPLE_STEPS / SAMPLE_CFG : denoise loop length + true-CFG scale (sampler
@@ -799,8 +805,75 @@ def main() raises:
 
     # ── block-swap offload loader ────────────────────────────────────────────
     var plan = build_qwenimage_offload_plan()
-    var loader = TurboPlannedLoader.open(train_cfg.checkpoint, plan^, offload_cfg, ctx)
+    # Both fp8 modes make every block permanently resident (device or host-
+    # pinned-fp8), so the whole-DiT bf16 pinned block store (~39 GiB!, never
+    # read again) must not be allocated. Only the explicit streamed A/B arm
+    # needs it. (Two concurrent 17 GiB stores OOM-killed the session 2026-07-04.)
+    var loader = TurboPlannedLoader.open(
+        train_cfg.checkpoint, plan^, offload_cfg, ctx,
+        fill_block_store=(
+            train_cfg.quantized_resident == String("streamed_base_opt_in")
+        ),
+    )
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
+
+    # ── Residency policy (MJ-1065, 2026-07-03) ──────────────────────────────────
+    # Base weights MUST be device-resident: per-step disk reads are forbidden.
+    # qwenimage streamed ~39 GiB bf16 EVERY forward (the biggest payoff in the
+    # fleet) and its bf16 host-pin store risked failing on the 62 GiB box.
+    #   "fp8_e4m3" (default): quantize the WHOLE block base ONCE from the bf16
+    #     checkpoint to E4M3 + per-row F32 scale (~20 GiB), hold resident, dequant
+    #     per block on await — no streaming. (The standalone qwen fp8 file is
+    #     UNIT-scale with no per-row scales — a different, lossier scheme — so we
+    #     quantize the bf16 checkpoint per-row here, matching krea2/hidream/ideogram.)
+    #   "fp8_e4m3_host" (default): same per-row E4M3 quantize-once, but PINNED IN
+    #     HOST RAM (~20 GiB) and H2D+dequant per await — device-resident fp8 was
+    #     MEASURED to OOM 24 GiB (peak 23.4 GiB, CUDA_ERROR_OUT_OF_MEMORY in the
+    #     first forward, 2026-07-04). Half the per-step PCIe of bf16 streaming.
+    #   "streamed_base_opt_in": the OLD ~39 GiB per-step bf16 disk stream (A/B arm).
+    #   empty/OFF/other: FAIL LOUD (the disk-stream default was the violation).
+    if train_cfg.quantized_resident == String("fp8_e4m3"):
+        var n_blocks = loader.block_count()
+        var pinned = loader.pin_residents_fp8(QWEN_FP8_RESIDENT_BUDGET_BYTES, ctx)
+        if pinned != n_blocks:
+            raise Error(
+                String("qwenimage fp8-resident: pinned ") + String(pinned)
+                + " of " + String(n_blocks) + " blocks within budget "
+                + String(QWEN_FP8_RESIDENT_BUDGET_BYTES) + " bytes — a block would "
+                + "still per-step disk-stream (MJ-1065). Raise the budget or fall "
+                + "back to host-pinned fp8."
+            )
+        print(
+            "[quant] fp8_e4m3-resident base: quantized", pinned, "of", n_blocks,
+            "blocks ONCE (per-row E4M3; dequant per block; NO per-step disk read).",
+        )
+    elif train_cfg.quantized_resident == String("fp8_e4m3_host"):
+        var n_blocks = loader.block_count()
+        var pinned = loader.pin_residents_fp8_host(
+            QWEN_FP8_RESIDENT_BUDGET_BYTES, ctx
+        )
+        if pinned != n_blocks:
+            raise Error(
+                String("qwenimage fp8-host: pinned ") + String(pinned)
+                + " of " + String(n_blocks) + " blocks within budget "
+                + String(QWEN_FP8_RESIDENT_BUDGET_BYTES) + " bytes — a block would "
+                + "still per-step disk-stream (MJ-1065). Raise the budget."
+            )
+        print(
+            "[quant] fp8_e4m3_host base: quantized", pinned, "of", n_blocks,
+            "blocks ONCE into pinned host RAM (H2D+dequant per await;",
+            "half the PCIe of bf16 streaming; NO per-step disk read).",
+        )
+    elif train_cfg.quantized_resident == String("streamed_base_opt_in"):
+        print("[quant] streamed_base_opt_in: ~39 GiB per-step bf16 disk stream (A/B arm).")
+    else:
+        raise Error(
+            String("qwenimage: quantized_resident='") + train_cfg.quantized_resident
+            + "' selects the per-step DISK-STREAM base, forbidden by policy "
+            + "MJ-1065. Use \"fp8_e4m3_host\" (host-pinned fp8, fits 24GB), "
+            + "\"fp8_e4m3\" (device-resident, MEASURED OOM at 512px), or "
+            + "\"streamed_base_opt_in\" for the explicit streamed A/B arm."
+        )
 
     # ── 3-axis RoPE tables (fixed for 512px / 1 frame) ──────────────────────
     var qcfg = QwenImageConfig.qwen_image()
