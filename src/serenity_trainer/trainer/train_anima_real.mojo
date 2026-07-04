@@ -174,20 +174,16 @@ comptime EPS = Float32(1e-06)
 comptime SIGMOID_SCALE = Float32(1.0)  # rs:99
 comptime SEED = UInt64(42)             # rs:71
 comptime DEFAULT_RUN_STEPS = 6         # short smoke (thermal-safe). Pass 0 for config max_steps.
-# The DiT stack is templated on S_IMG (comptime). The cached latent grid can be
-# large (512^2 -> 64x64 latent -> S_IMG=1024); for a thermal/memory-safe smoke on
-# a shared 24GB 3090 we CROP the latent to LATENT_HW x LATENT_HW (top-left),
-# giving S_IMG = (LATENT_HW/2)^2. This is a valid training signal (same flow loss
-# on a sub-window). Raise LATENT_HW (or pass the full grid) for full-resolution
-# runs once the GPU is free.
-comptime LATENT_HW = 16                       # crop latent to 16x16 -> S_IMG=64
+# The DiT stack is templated on S_IMG (comptime). PRODUCTION grid (MJ-1074,
+# 2026-07-04): full 512^2 cache latents = 64x64 -> S_IMG=1024, NO crop. The old
+# 16x16 dev-smoke crop trained a sub-window and rendered 128px previews — if a
+# thermal/memory-safe smoke build is ever needed again, set LATENT_HW=16.
+comptime LATENT_HW = 64                       # full 512p latent grid -> S_IMG=1024
 comptime S_IMG = (LATENT_HW // PS) * (LATENT_HW // PS)
 # Smoke mode: when FIXED_SIGMA_SMOKE, hold sigma + noise CONSTANT across steps so
-# the flow target is identical every step. This isolates the LoRA learning signal
-# (loss MUST fall monotonically as the adapters fit a fixed target) from the
-# per-step timestep variance that dominates a 6-step random-sigma run. The REAL
-# training schedule (random sigmoid sigma per step) runs when this is False.
-comptime FIXED_SIGMA_SMOKE = True
+# the flow target is identical every step (dev gate isolation only). PRODUCTION
+# (MJ-1074): False — the REAL schedule (random sigmoid sigma per step) runs.
+comptime FIXED_SIGMA_SMOKE = False
 comptime FIXED_SIGMA = Float32(0.5)
 
 # ── sample-during-training defaults ───────────────────────────────────────────
