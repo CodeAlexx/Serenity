@@ -1,5 +1,7 @@
 """Serenity trainer UI config model for the native Mojo trainer screen."""
 
+from json.parser import loads
+
 
 comptime UI_SECTION_GENERAL: Int32 = 0
 comptime UI_SECTION_MODEL: Int32 = 1
@@ -1195,7 +1197,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
     re-validates every dim against its comptime contract, so drift fails loud.
     Only the recipe (lr/rank/alpha/steps/save/cache/ckpt) comes from the UI.
     """
-    var t = cfg.backend_target.copy()
+    var t = trainer_ui_json_escape(cfg.backend_target)
     if t == String("klein"):
         # Klein 9B — serenitymojo train_klein_real (config-driven; reads the
         # T1 lever keys via read_model_config since the levers fan-out commit
@@ -1205,7 +1207,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
         # fails loud on any drift. Lever emission mirrors zimage's.
         return (
             String("{\n  \"model_type\": \"klein\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             + String("  \"vae\": \"") + String(SERENITY_KLEIN_VAE) + String("\",\n")
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_KLEIN_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"inner_dim\": 4096,\n  \"in_channels\": 128,\n")
@@ -1214,7 +1216,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + String("  \"num_heads\": 32,\n  \"head_dim\": 128,\n")
             + String("  \"mlp_hidden\": 12288,\n  \"timestep_dim\": 256,\n")
             + String("  \"rope_theta\": 2000,\n")
-            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
             + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
@@ -1230,7 +1232,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
         # positional in the Krea2 trainer.
         return (
             String("{\n  \"model_type\": \"krea2\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             + String("  \"vae\": \"") + String(SERENITY_KREA2_VAE) + String("\",\n")
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_KREA2_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"inner_dim\": 6144,\n  \"in_channels\": 64,\n")
@@ -1239,10 +1241,10 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + String("  \"num_heads\": 48,\n  \"head_dim\": 128,\n")
             + String("  \"mlp_hidden\": 16384,\n  \"timestep_dim\": 256,\n")
             + String("  \"rope_theta\": 1000,\n")
-            + String("  \"quantized_resident\": \"") + cfg.quantized_resident.copy() + String("\",\n")
-            + String("  \"workspace_dir\": \"") + cfg.workspace_dir.copy() + String("\",\n")
-            + String("  \"save_filename_prefix\": \"") + cfg.save_filename_prefix.copy() + String("\",\n")
-            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"quantized_resident\": \"") + trainer_ui_json_escape(cfg.quantized_resident) + String("\",\n")
+            + String("  \"workspace_dir\": \"") + trainer_ui_json_escape(cfg.workspace_dir) + String("\",\n")
+            + String("  \"save_filename_prefix\": \"") + trainer_ui_json_escape(cfg.save_filename_prefix) + String("\",\n")
+            + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
             + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
@@ -1254,7 +1256,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
     if t == String("chroma"):
         return (
             String("{\n  \"model_type\": \"chroma\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             + String("  \"vae\": \"") + String(SERENITY_CHROMA_VAE) + String("\",\n")
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_CHROMA_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"inner_dim\": 3072,\n  \"in_channels\": 64,\n")
@@ -1269,7 +1271,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
     if t == String("ernie"):
         return (
             String("{\n  \"model_type\": \"ernie_image\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             + String("  \"vae\": \"") + String(SERENITY_ERNIE_VAE) + String("\",\n")
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_ERNIE_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"inner_dim\": 4096,\n  \"in_channels\": 128,\n")
@@ -1284,7 +1286,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
     if t == String("anima"):
         return (
             String("{\n  \"model_type\": \"anima\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             + String("  \"vae\": \"") + String(SERENITY_ANIMA_VAE) + String("\",\n")
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_ANIMA_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"inner_dim\": 2048,\n  \"in_channels\": 68,\n")
@@ -1299,7 +1301,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
     if t == String("zimage"):
         return (
             String("{\n  \"model_type\": \"zimage\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_ZIMAGE_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"inner_dim\": 3840,\n  \"in_channels\": 16,\n")
             + String("  \"joint_attention_dim\": 2560,\n  \"out_channels\": 16,\n")
@@ -1314,7 +1316,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             # T1.A loss levers — zimage only this phase (train_zimage_real
             # calls serenitymojo training/levers.mojo levers_loss_grad).
             # Defaults (mse / 1.0 / 1.0 / 0.0) keep the lever OFF.
-            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
             + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
@@ -1331,7 +1333,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
     if t == String("l2p"):
         return (
             String("{\n  \"model_type\": \"l2p\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             # No validation_prompts_file: L2P inline sampling is not wired, so
             # validate_l2p_train_config (train_l2p_real.mojo) fails loud on a
             # non-empty key. Use the standalone sampler for L2P validation.
@@ -1351,7 +1353,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
     if t == String("sdxl"):
         return (
             String("{\n  \"model_type\": \"sdxl\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             + String("  \"vae\": \"") + String(SERENITY_SDXL_VAE) + String("\",\n")
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_SDXL_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"in_channels\": 4,\n  \"out_channels\": 4,\n")
@@ -1378,13 +1380,13 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
         # the trainer is compiled alpha=rank (scale 1.0).
         return (
             String("{\n  \"model_type\": \"hidream_o1\",\n")
-            + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
-            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
+            + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
             + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
             # T2.B quantized-resident base ("OFF" | "fp8_e4m3"; default OFF).
-            + String("  \"quantized_resident\": \"") + cfg.quantized_resident.copy() + String("\",\n")
+            + String("  \"quantized_resident\": \"") + trainer_ui_json_escape(cfg.quantized_resident) + String("\",\n")
             + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
             + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
             + _runner_recipe_json(cfg)
@@ -1404,7 +1406,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             # sampler off. Delivered only when the levers JSON is passed
             # (trainer_ui_ideogram4_levers_set gates argv 11).
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_IDEOGRAM4_SAMPLE_PROMPTS) + String("\",\n")
-            + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
+            + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
             + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
@@ -1447,59 +1449,161 @@ def trainer_ui_ideogram4_levers_path_or_skip(
     return String("-")
 
 
+
+
+def trainer_ui_json_bool(v: Bool) -> String:
+    """JSON booleans are lowercase; Mojo String(Bool) yields Python-style
+    True/False, which made every saved snapshot malformed JSON (found live
+    on disk during the 2026-07-03 UI audit - parse error at the first Bool)."""
+    return String("true") if v else String("false")
+
+
+def trainer_ui_json_escape(value: String) -> String:
+    """Escape a string for a JSON double-quoted literal. Byte-accumulated so
+    multi-byte UTF-8 survives. Fixes the UI-audit 2026-07-03 bug-2 class:
+    user-typed quotes/backslashes in text fields made emitted JSON malformed."""
+    var out = List[UInt8]()
+    var vb = value.as_bytes()
+    for i in range(value.byte_length()):
+        var c = vb[i]
+        if c == 0x22:
+            out.append(0x5C)
+            out.append(0x22)
+        elif c == 0x5C:
+            out.append(0x5C)
+            out.append(0x5C)
+        elif c == 0x0A:
+            out.append(0x5C)
+            out.append(0x6E)
+        elif c == 0x0D:
+            out.append(0x5C)
+            out.append(0x72)
+        elif c == 0x09:
+            out.append(0x5C)
+            out.append(0x74)
+        elif c < 0x20:
+            out.append(0x20)
+        else:
+            out.append(c)
+    try:
+        return String(from_utf8=out)
+    except:
+        return value.copy()
+
+
+def trainer_ui_load_config_snapshot(mut cfg: TrainerUIConfig) -> Bool:
+    """Load CURATED recipe fields from the last session snapshot so user-set
+    values persist - notably max_train_steps, which otherwise resets to the
+    struct default 3000 every launch (user report 2026-07-03). Model-agnostic
+    numbers + run_name ONLY; paths and model selection stay preset-driven.
+    Fail-soft: any parse problem leaves cfg untouched."""
+    try:
+        var f = open(String("target/serenity_trainer_ui_config.json"), "r")
+        var text = f.read()
+        f.close()
+        var obj = loads(text)
+        if obj.contains("max_train_steps"):
+            var v = Float32(obj["max_train_steps"].as_float())
+            if v > 0.0:
+                cfg.max_train_steps = v
+        if obj.contains("learning_rate"):
+            var lr = Float32(obj["learning_rate"].as_float())
+            if lr > 0.0:
+                cfg.learning_rate = lr
+        if obj.contains("lora_rank"):
+            var r = Float32(obj["lora_rank"].as_float())
+            if r >= 1.0:
+                cfg.lora_rank = r
+        if obj.contains("lora_alpha"):
+            var a = Float32(obj["lora_alpha"].as_float())
+            if a > 0.0:
+                cfg.lora_alpha = a
+        if obj.contains("save_every"):
+            var se = Float32(obj["save_every"].as_float())
+            if se >= 0.0:
+                cfg.save_every = se
+        if obj.contains("sample_after"):
+            var sa = Float32(obj["sample_after"].as_float())
+            if sa >= 0.0:
+                cfg.sample_after = sa
+        if obj.contains("sample_steps"):
+            var ss = Float32(obj["sample_steps"].as_float())
+            if ss > 0.0:
+                cfg.sample_steps = ss
+        if obj.contains("sample_cfg"):
+            cfg.sample_cfg = Float32(obj["sample_cfg"].as_float())
+        if obj.contains("seed"):
+            cfg.seed = Float32(obj["seed"].as_float())
+        if obj.contains("epochs"):
+            var ep = Float32(obj["epochs"].as_float())
+            if ep >= 1.0:
+                cfg.epochs = ep
+        if obj.contains("caption_dropout"):
+            var cd = Float32(obj["caption_dropout"].as_float())
+            if cd >= 0.0 and cd <= 1.0:
+                cfg.caption_dropout = cd
+        if obj.contains("run_name") and not obj["run_name"].is_null():
+            var rn = obj["run_name"].as_string()
+            if rn.byte_length() > 0:
+                cfg.run_name = rn.copy()
+        return True
+    except:
+        return False
+
+
 def trainer_ui_config_json_snapshot(cfg: TrainerUIConfig) -> String:
     return (
         String("{\"schema\":\"serenity.trainer_ui.v1\",")
-        + String("\"backend_target\":\"") + cfg.backend_target.copy() + String("\",")
-        + String("\"run_name\":\"") + cfg.run_name.copy() + String("\",")
-        + String("\"training_method\":\"") + cfg.training_method_label() + String("\",")
-        + String("\"model_type\":\"") + cfg.model_type_label() + String("\",")
-        + String("\"architecture\":\"") + cfg.architecture_label() + String("\",")
-        + String("\"base_model_name\":\"") + cfg.base_model_name.copy() + String("\",")
-        + String("\"vae_override\":\"") + cfg.vae_override.copy() + String("\",")
-        + String("\"output_model_destination\":\"") + cfg.output_model_destination.copy() + String("\",")
-        + String("\"output_model_format\":\"") + cfg.output_model_format.copy() + String("\",")
-        + String("\"output_dtype\":\"") + cfg.output_dtype.copy() + String("\",")
-        + String("\"model_arch\":\"") + cfg.model_arch.copy() + String("\",")
-        + String("\"model_quantize\":") + String(cfg.model_quantize) + String(",")
-        + String("\"model_quantize_text_encoder\":") + String(cfg.model_quantize_text_encoder) + String(",")
-        + String("\"model_low_vram\":") + String(cfg.model_low_vram) + String(",")
-        + String("\"model_qtype_text_encoder\":\"") + cfg.model_qtype_text_encoder.copy() + String("\",")
-        + String("\"train_transformer\":") + String(cfg.train_transformer) + String(",")
-        + String("\"train_text_encoder\":") + String(cfg.train_text_encoder) + String(",")
-        + String("\"workspace_dir\":\"") + cfg.workspace_dir.copy() + String("\",")
-        + String("\"cache_dir\":\"") + cfg.cache_dir.copy() + String("\",")
-        + String("\"tensorboard\":") + String(cfg.tensorboard) + String(",")
-        + String("\"validation\":") + String(cfg.validation) + String(",")
-        + String("\"continue_last_backup\":") + String(cfg.continue_last_backup) + String(",")
-        + String("\"prevent_overwrites\":") + String(cfg.prevent_overwrites) + String(",")
-        + String("\"only_cache\":") + String(cfg.only_cache) + String(",")
+        + String("\"backend_target\":\"") + trainer_ui_json_escape(cfg.backend_target) + String("\",")
+        + String("\"run_name\":\"") + trainer_ui_json_escape(cfg.run_name) + String("\",")
+        + String("\"training_method\":\"") + trainer_ui_json_escape(cfg.training_method_label()) + String("\",")
+        + String("\"model_type\":\"") + trainer_ui_json_escape(cfg.model_type_label()) + String("\",")
+        + String("\"architecture\":\"") + trainer_ui_json_escape(cfg.architecture_label()) + String("\",")
+        + String("\"base_model_name\":\"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",")
+        + String("\"vae_override\":\"") + trainer_ui_json_escape(cfg.vae_override) + String("\",")
+        + String("\"output_model_destination\":\"") + trainer_ui_json_escape(cfg.output_model_destination) + String("\",")
+        + String("\"output_model_format\":\"") + trainer_ui_json_escape(cfg.output_model_format) + String("\",")
+        + String("\"output_dtype\":\"") + trainer_ui_json_escape(cfg.output_dtype) + String("\",")
+        + String("\"model_arch\":\"") + trainer_ui_json_escape(cfg.model_arch) + String("\",")
+        + String("\"model_quantize\":") + trainer_ui_json_bool(cfg.model_quantize) + String(",")
+        + String("\"model_quantize_text_encoder\":") + trainer_ui_json_bool(cfg.model_quantize_text_encoder) + String(",")
+        + String("\"model_low_vram\":") + trainer_ui_json_bool(cfg.model_low_vram) + String(",")
+        + String("\"model_qtype_text_encoder\":\"") + trainer_ui_json_escape(cfg.model_qtype_text_encoder) + String("\",")
+        + String("\"train_transformer\":") + trainer_ui_json_bool(cfg.train_transformer) + String(",")
+        + String("\"train_text_encoder\":") + trainer_ui_json_bool(cfg.train_text_encoder) + String(",")
+        + String("\"workspace_dir\":\"") + trainer_ui_json_escape(cfg.workspace_dir) + String("\",")
+        + String("\"cache_dir\":\"") + trainer_ui_json_escape(cfg.cache_dir) + String("\",")
+        + String("\"tensorboard\":") + trainer_ui_json_bool(cfg.tensorboard) + String(",")
+        + String("\"validation\":") + trainer_ui_json_bool(cfg.validation) + String(",")
+        + String("\"continue_last_backup\":") + trainer_ui_json_bool(cfg.continue_last_backup) + String(",")
+        + String("\"prevent_overwrites\":") + trainer_ui_json_bool(cfg.prevent_overwrites) + String(",")
+        + String("\"only_cache\":") + trainer_ui_json_bool(cfg.only_cache) + String(",")
         + String("\"dataloader_threads\":") + String(cfg.dataloader_threads) + String(",")
-        + String("\"train_device\":\"") + cfg.train_device.copy() + String("\",")
-        + String("\"temp_device\":\"") + cfg.temp_device.copy() + String("\",")
-        + String("\"multi_gpu\":") + String(cfg.multi_gpu) + String(",")
-        + String("\"device_indexes\":\"") + cfg.device_indexes.copy() + String("\",")
-        + String("\"dataset_path\":\"") + cfg.dataset_path.copy() + String("\",")
-        + String("\"sample_output_dir\":\"") + cfg.sample_output_dir.copy() + String("\",")
-        + String("\"concept_file_name\":\"") + cfg.concept_file_name.copy() + String("\",")
-        + String("\"aspect_ratio_bucketing\":") + String(cfg.aspect_ratio_bucketing) + String(",")
-        + String("\"latent_caching\":") + String(cfg.latent_caching) + String(",")
-        + String("\"cache_text_embeddings\":") + String(cfg.cache_text_embeddings) + String(",")
-        + String("\"clear_cache_before_training\":") + String(cfg.clear_cache_before_training) + String(",")
-        + String("\"resolution\":\"") + cfg.resolution.copy() + String("\",")
-        + String("\"caption_extension\":\"") + cfg.caption_extension.copy() + String("\",")
+        + String("\"train_device\":\"") + trainer_ui_json_escape(cfg.train_device) + String("\",")
+        + String("\"temp_device\":\"") + trainer_ui_json_escape(cfg.temp_device) + String("\",")
+        + String("\"multi_gpu\":") + trainer_ui_json_bool(cfg.multi_gpu) + String(",")
+        + String("\"device_indexes\":\"") + trainer_ui_json_escape(cfg.device_indexes) + String("\",")
+        + String("\"dataset_path\":\"") + trainer_ui_json_escape(cfg.dataset_path) + String("\",")
+        + String("\"sample_output_dir\":\"") + trainer_ui_json_escape(cfg.sample_output_dir) + String("\",")
+        + String("\"concept_file_name\":\"") + trainer_ui_json_escape(cfg.concept_file_name) + String("\",")
+        + String("\"aspect_ratio_bucketing\":") + trainer_ui_json_bool(cfg.aspect_ratio_bucketing) + String(",")
+        + String("\"latent_caching\":") + trainer_ui_json_bool(cfg.latent_caching) + String(",")
+        + String("\"cache_text_embeddings\":") + trainer_ui_json_bool(cfg.cache_text_embeddings) + String(",")
+        + String("\"clear_cache_before_training\":") + trainer_ui_json_bool(cfg.clear_cache_before_training) + String(",")
+        + String("\"resolution\":\"") + trainer_ui_json_escape(cfg.resolution) + String("\",")
+        + String("\"caption_extension\":\"") + trainer_ui_json_escape(cfg.caption_extension) + String("\",")
         + String("\"caption_dropout\":") + String(cfg.caption_dropout) + String(",")
-        + String("\"captioner_model\":\"") + cfg.captioner_model_label() + String("\",")
-        + String("\"captioner_custom_model_id\":\"") + cfg.captioner_custom_model_id.copy() + String("\",")
-        + String("\"captioner_quant\":\"") + cfg.captioner_quant_label() + String("\",")
-        + String("\"captioner_attention\":\"") + cfg.captioner_attention_label() + String("\",")
-        + String("\"captioner_resolution\":\"") + cfg.captioner_resolution_label() + String("\",")
-        + String("\"captioner_folder_path\":\"") + cfg.captioner_folder_path.copy() + String("\",")
-        + String("\"captioner_prompt\":\"") + cfg.captioner_prompt.copy() + String("\",")
-        + String("\"captioner_skip_existing\":") + String(cfg.captioner_skip_existing) + String(",")
-        + String("\"captioner_summary_mode\":") + String(cfg.captioner_summary_mode) + String(",")
-        + String("\"captioner_one_sentence_mode\":") + String(cfg.captioner_one_sentence_mode) + String(",")
-        + String("\"captioner_retain_preview\":") + String(cfg.captioner_retain_preview) + String(",")
+        + String("\"captioner_model\":\"") + trainer_ui_json_escape(cfg.captioner_model_label()) + String("\",")
+        + String("\"captioner_custom_model_id\":\"") + trainer_ui_json_escape(cfg.captioner_custom_model_id) + String("\",")
+        + String("\"captioner_quant\":\"") + trainer_ui_json_escape(cfg.captioner_quant_label()) + String("\",")
+        + String("\"captioner_attention\":\"") + trainer_ui_json_escape(cfg.captioner_attention_label()) + String("\",")
+        + String("\"captioner_resolution\":\"") + trainer_ui_json_escape(cfg.captioner_resolution_label()) + String("\",")
+        + String("\"captioner_folder_path\":\"") + trainer_ui_json_escape(cfg.captioner_folder_path) + String("\",")
+        + String("\"captioner_prompt\":\"") + trainer_ui_json_escape(cfg.captioner_prompt) + String("\",")
+        + String("\"captioner_skip_existing\":") + trainer_ui_json_bool(cfg.captioner_skip_existing) + String(",")
+        + String("\"captioner_summary_mode\":") + trainer_ui_json_bool(cfg.captioner_summary_mode) + String(",")
+        + String("\"captioner_one_sentence_mode\":") + trainer_ui_json_bool(cfg.captioner_one_sentence_mode) + String(",")
+        + String("\"captioner_retain_preview\":") + trainer_ui_json_bool(cfg.captioner_retain_preview) + String(",")
         + String("\"captioner_max_tokens\":") + String(cfg.captioner_max_tokens) + String(",")
         + String("\"learning_rate\":") + String(cfg.learning_rate) + String(",")
         + String("\"text_encoder_learning_rate\":") + String(cfg.text_encoder_learning_rate) + String(",")
@@ -1511,24 +1615,24 @@ def trainer_ui_config_json_snapshot(cfg: TrainerUIConfig) -> String:
         + String("\"learning_rate_warmup_steps\":") + String(cfg.learning_rate_warmup_steps) + String(",")
         + String("\"learning_rate_min_factor\":") + String(cfg.learning_rate_min_factor) + String(",")
         + String("\"learning_rate_cycles\":") + String(cfg.learning_rate_cycles) + String(",")
-        + String("\"learning_rate_scaler\":\"") + cfg.learning_rate_scaler.copy() + String("\",")
+        + String("\"learning_rate_scaler\":\"") + trainer_ui_json_escape(cfg.learning_rate_scaler) + String("\",")
         + String("\"weight_decay\":") + String(cfg.weight_decay) + String(",")
-        + String("\"optimizer\":\"") + cfg.optimizer_label() + String("\",")
-        + String("\"scheduler\":\"") + cfg.scheduler_label() + String("\",")
-        + String("\"train_dtype\":\"") + cfg.train_dtype.copy() + String("\",")
-        + String("\"fallback_train_dtype\":\"") + cfg.fallback_train_dtype.copy() + String("\",")
-        + String("\"ema\":\"") + cfg.ema_mode.copy() + String("\",")
+        + String("\"optimizer\":\"") + trainer_ui_json_escape(cfg.optimizer_label()) + String("\",")
+        + String("\"scheduler\":\"") + trainer_ui_json_escape(cfg.scheduler_label()) + String("\",")
+        + String("\"train_dtype\":\"") + trainer_ui_json_escape(cfg.train_dtype) + String("\",")
+        + String("\"fallback_train_dtype\":\"") + trainer_ui_json_escape(cfg.fallback_train_dtype) + String("\",")
+        + String("\"ema\":\"") + trainer_ui_json_escape(cfg.ema_mode) + String("\",")
         + String("\"ema_decay\":") + String(cfg.ema_decay) + String(",")
         + String("\"ema_update_step_interval\":") + String(cfg.ema_update_step_interval) + String(",")
-        + String("\"enable_autocast_cache\":") + String(cfg.enable_autocast_cache) + String(",")
-        + String("\"frames\":\"") + cfg.frames.copy() + String("\",")
-        + String("\"force_circular_padding\":") + String(cfg.force_circular_padding) + String(",")
+        + String("\"enable_autocast_cache\":") + trainer_ui_json_bool(cfg.enable_autocast_cache) + String(",")
+        + String("\"frames\":\"") + trainer_ui_json_escape(cfg.frames) + String("\",")
+        + String("\"force_circular_padding\":") + trainer_ui_json_bool(cfg.force_circular_padding) + String(",")
         + String("\"seed\":") + String(cfg.seed) + String(",")
         + String("\"clip_grad_norm\":") + String(cfg.clip_grad_norm) + String(",")
         + String("\"text_encoder_stop_after\":") + String(cfg.text_encoder_stop_after) + String(",")
-        + String("\"text_encoder_sequence_length\":\"") + cfg.text_encoder_sequence_length.copy() + String("\",")
+        + String("\"text_encoder_sequence_length\":\"") + trainer_ui_json_escape(cfg.text_encoder_sequence_length) + String("\",")
         + String("\"transformer_stop_after\":") + String(cfg.transformer_stop_after) + String(",")
-        + String("\"transformer_attention_mask\":") + String(cfg.transformer_attention_mask) + String(",")
+        + String("\"transformer_attention_mask\":") + trainer_ui_json_bool(cfg.transformer_attention_mask) + String(",")
         + String("\"transformer_guidance_scale\":") + String(cfg.transformer_guidance_scale) + String(",")
         + String("\"loss_weight_strength\":") + String(cfg.loss_weight_strength) + String(",")
         + String("\"mse_strength\":") + String(cfg.mse_strength) + String(",")
@@ -1537,58 +1641,58 @@ def trainer_ui_config_json_snapshot(cfg: TrainerUIConfig) -> String:
         + String("\"huber_strength\":") + String(cfg.huber_strength) + String(",")
         + String("\"huber_delta\":") + String(cfg.huber_delta) + String(",")
         + String("\"vb_loss_strength\":") + String(cfg.vb_loss_strength) + String(",")
-        + String("\"loss_weight_fn\":\"") + cfg.loss_weight_fn.copy() + String("\",")
-        + String("\"quantized_resident\":\"") + cfg.quantized_resident.copy() + String("\",")
-        + String("\"loss_scaler\":\"") + cfg.loss_scaler.copy() + String("\",")
+        + String("\"loss_weight_fn\":\"") + trainer_ui_json_escape(cfg.loss_weight_fn) + String("\",")
+        + String("\"quantized_resident\":\"") + trainer_ui_json_escape(cfg.quantized_resident) + String("\",")
+        + String("\"loss_scaler\":\"") + trainer_ui_json_escape(cfg.loss_scaler) + String("\",")
         + String("\"offset_noise_weight\":") + String(cfg.offset_noise_weight) + String(",")
         + String("\"perturbation_noise_weight\":") + String(cfg.perturbation_noise_weight) + String(",")
-        + String("\"timestep_distribution\":\"") + cfg.timestep_distribution.copy() + String("\",")
-        + String("\"timestep_type\":\"") + cfg.timestep_type.copy() + String("\",")
-        + String("\"noise_scheduler\":\"") + cfg.noise_scheduler.copy() + String("\",")
+        + String("\"timestep_distribution\":\"") + trainer_ui_json_escape(cfg.timestep_distribution) + String("\",")
+        + String("\"timestep_type\":\"") + trainer_ui_json_escape(cfg.timestep_type) + String("\",")
+        + String("\"noise_scheduler\":\"") + trainer_ui_json_escape(cfg.noise_scheduler) + String("\",")
         + String("\"min_noising_strength\":") + String(cfg.min_noising_strength) + String(",")
         + String("\"max_noising_strength\":") + String(cfg.max_noising_strength) + String(",")
         + String("\"noising_weight\":") + String(cfg.noising_weight) + String(",")
         + String("\"noising_bias\":") + String(cfg.noising_bias) + String(",")
         + String("\"timestep_shift\":") + String(cfg.timestep_shift) + String(",")
-        + String("\"dynamic_timestep_shifting\":") + String(cfg.dynamic_timestep_shifting) + String(",")
-        + String("\"masked_training\":") + String(cfg.masked_training) + String(",")
+        + String("\"dynamic_timestep_shifting\":") + trainer_ui_json_bool(cfg.dynamic_timestep_shifting) + String(",")
+        + String("\"masked_training\":") + trainer_ui_json_bool(cfg.masked_training) + String(",")
         + String("\"unmasked_probability\":") + String(cfg.unmasked_probability) + String(",")
         + String("\"unmasked_weight\":") + String(cfg.unmasked_weight) + String(",")
-        + String("\"normalize_masked_area_loss\":") + String(cfg.normalize_masked_area_loss) + String(",")
+        + String("\"normalize_masked_area_loss\":") + trainer_ui_json_bool(cfg.normalize_masked_area_loss) + String(",")
         + String("\"masked_prior_preservation_weight\":") + String(cfg.masked_prior_preservation_weight) + String(",")
-        + String("\"custom_conditioning_image\":") + String(cfg.custom_conditioning_image) + String(",")
-        + String("\"layer_filter_preset\":\"") + cfg.layer_filter_preset.copy() + String("\",")
-        + String("\"layer_filter\":\"") + cfg.layer_filter.copy() + String("\",")
-        + String("\"layer_filter_regex\":") + String(cfg.layer_filter_regex) + String(",")
-        + String("\"peft_type\":\"") + cfg.peft_type.copy() + String("\",")
+        + String("\"custom_conditioning_image\":") + trainer_ui_json_bool(cfg.custom_conditioning_image) + String(",")
+        + String("\"layer_filter_preset\":\"") + trainer_ui_json_escape(cfg.layer_filter_preset) + String("\",")
+        + String("\"layer_filter\":\"") + trainer_ui_json_escape(cfg.layer_filter) + String("\",")
+        + String("\"layer_filter_regex\":") + trainer_ui_json_bool(cfg.layer_filter_regex) + String(",")
+        + String("\"peft_type\":\"") + trainer_ui_json_escape(cfg.peft_type) + String("\",")
         + String("\"network_algorithm\":\"") + trainer_ui_network_algorithm(cfg) + String("\",")
-        + String("\"lora_model_name\":\"") + cfg.lora_model_name.copy() + String("\",")
+        + String("\"lora_model_name\":\"") + trainer_ui_json_escape(cfg.lora_model_name) + String("\",")
         + String("\"lora_rank\":") + String(cfg.lora_rank) + String(",")
         + String("\"lora_alpha\":") + String(cfg.lora_alpha) + String(",")
         + String("\"lora_dropout\":") + String(cfg.lora_dropout) + String(",")
-        + String("\"lora_weight_dtype\":\"") + cfg.lora_weight_dtype.copy() + String("\",")
+        + String("\"lora_weight_dtype\":\"") + trainer_ui_json_escape(cfg.lora_weight_dtype) + String("\",")
         + String("\"oft_block_size\":") + String(cfg.oft_block_size) + String(",")
-        + String("\"oft_coft\":") + String(cfg.oft_coft) + String(",")
+        + String("\"oft_coft\":") + trainer_ui_json_bool(cfg.oft_coft) + String(",")
         + String("\"sample_after\":") + String(cfg.sample_after) + String(",")
         + String("\"sample_skip_first\":") + String(cfg.sample_skip_first) + String(",")
         + String("\"sample_cfg\":") + String(cfg.sample_cfg) + String(",")
         + String("\"sample_steps\":") + String(cfg.sample_steps) + String(",")
-        + String("\"sample_sampler\":\"") + cfg.sample_sampler.copy() + String("\",")
-        + String("\"sampler_preset\":\"") + cfg.sampler_preset.copy() + String("\",")
-        + String("\"samples_to_tensorboard\":") + String(cfg.samples_to_tensorboard) + String(",")
-        + String("\"non_ema_sampling\":") + String(cfg.non_ema_sampling) + String(",")
+        + String("\"sample_sampler\":\"") + trainer_ui_json_escape(cfg.sample_sampler) + String("\",")
+        + String("\"sampler_preset\":\"") + trainer_ui_json_escape(cfg.sampler_preset) + String("\",")
+        + String("\"samples_to_tensorboard\":") + trainer_ui_json_bool(cfg.samples_to_tensorboard) + String(",")
+        + String("\"non_ema_sampling\":") + trainer_ui_json_bool(cfg.non_ema_sampling) + String(",")
         + String("\"backup_after\":") + String(cfg.backup_after) + String(",")
-        + String("\"rolling_backup\":") + String(cfg.rolling_backup) + String(",")
+        + String("\"rolling_backup\":") + trainer_ui_json_bool(cfg.rolling_backup) + String(",")
         + String("\"rolling_backup_count\":") + String(cfg.rolling_backup_count) + String(",")
-        + String("\"backup_before_save\":") + String(cfg.backup_before_save) + String(",")
+        + String("\"backup_before_save\":") + trainer_ui_json_bool(cfg.backup_before_save) + String(",")
         + String("\"save_every\":") + String(cfg.save_every) + String(",")
         + String("\"save_skip_first\":") + String(cfg.save_skip_first) + String(",")
         + String("\"save_max_keep\":") + String(cfg.save_max_keep) + String(",")
-        + String("\"save_filename_prefix\":\"") + cfg.save_filename_prefix.copy() + String("\",")
-        + String("\"cloud_type\":\"") + cfg.cloud_type_label() + String("\",")
-        + String("\"cloud_host\":\"") + cfg.cloud_host.copy() + String("\",")
-        + String("\"cloud_port\":\"") + cfg.cloud_port.copy() + String("\",")
-        + String("\"cloud_user\":\"") + cfg.cloud_user.copy() + String("\",")
-        + String("\"cloud_workspace_dir\":\"") + cfg.cloud_workspace_dir.copy() + String("\",")
-        + String("\"cloud_delete_workspace\":") + String(cfg.cloud_delete_workspace) + String("}")
+        + String("\"save_filename_prefix\":\"") + trainer_ui_json_escape(cfg.save_filename_prefix) + String("\",")
+        + String("\"cloud_type\":\"") + trainer_ui_json_escape(cfg.cloud_type_label()) + String("\",")
+        + String("\"cloud_host\":\"") + trainer_ui_json_escape(cfg.cloud_host) + String("\",")
+        + String("\"cloud_port\":\"") + trainer_ui_json_escape(cfg.cloud_port) + String("\",")
+        + String("\"cloud_user\":\"") + trainer_ui_json_escape(cfg.cloud_user) + String("\",")
+        + String("\"cloud_workspace_dir\":\"") + trainer_ui_json_escape(cfg.cloud_workspace_dir) + String("\",")
+        + String("\"cloud_delete_workspace\":") + trainer_ui_json_bool(cfg.cloud_delete_workspace) + String("}")
     )

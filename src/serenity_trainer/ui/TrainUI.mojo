@@ -46,6 +46,7 @@ from serenity_trainer.ui.TopBar import render_top_bar
 from serenity_trainer.ui.TrainingTab import render_training_tab
 from serenity_trainer.ui.TrainerConfigModel import (
     TrainerUIConfig,
+    trainer_ui_load_config_snapshot,
     UI_SECTION_BACKUP,
     UI_SECTION_CAPTIONER,
     UI_SECTION_CLOUD,
@@ -101,6 +102,10 @@ struct TrainUIAppState(Movable):
     def __init__(out self):
         self.ctx = Context()
         self.cfg = TrainerUIConfig()
+        # Persist user-set recipe values across sessions (max_train_steps etc.
+        # otherwise reset to struct defaults every launch - the "3000 steps
+        # hardcoded" report, 2026-07-03). Fail-soft when no snapshot exists.
+        _ = trainer_ui_load_config_snapshot(self.cfg)
         self.runtime = TrainerUIRuntime()
         self.font_id = 0
         self.win_w = INIT_W

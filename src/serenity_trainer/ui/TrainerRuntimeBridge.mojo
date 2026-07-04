@@ -13,6 +13,7 @@ from serenity_trainer.ui.TrainerConfigModel import (
     trainer_ui_ideogram4_levers_path_or_skip,
     trainer_ui_ideogram4_levers_set,
     trainer_ui_ignored_lever_summary,
+    trainer_ui_json_escape,
     trainer_ui_runner_train_config_json,
     trainer_ui_total_steps,
     trainer_ui_validate,
@@ -135,11 +136,11 @@ def _append_command_event(mut rt: TrainerUIRuntime, action: String, config_path:
         var f = open(rt.command_file_path.copy(), "a")
         f.write(
             String("{\"schema\":\"serenity.trainer_command.v1\",")
-            + String("\"action\":\"") + action.copy() + String("\",")
+            + String("\"action\":\"") + trainer_ui_json_escape(action) + String("\",")
             + String("\"run_id\":") + String(rt.run_id) + String(",")
-            + String("\"backend\":\"") + rt.backend_target.copy() + String("\",")
-            + String("\"progress_file\":\"") + rt.progress_file_path.copy() + String("\",")
-            + String("\"config_file\":\"") + config_path.copy() + String("\"}")
+            + String("\"backend\":\"") + trainer_ui_json_escape(rt.backend_target) + String("\",")
+            + String("\"progress_file\":\"") + trainer_ui_json_escape(rt.progress_file_path) + String("\",")
+            + String("\"config_file\":\"") + trainer_ui_json_escape(config_path) + String("\"}")
         )
         f.write("\n")
         f.close()
@@ -163,9 +164,27 @@ def _sys_system(command: String) -> Int:
 
 
 def _shell_quote(value: String) -> String:
-    # Paths in this app are local absolute paths. Single quotes keep spaces safe;
-    # apostrophes are not expected in Serenity model/workspace paths.
-    return String("'") + value.copy() + String("'")
+    # POSIX single-quote: safe for every byte except the single quote itself,
+    # which is closed-escaped-reopened ('\''). Byte-accumulated so multi-byte
+    # UTF-8 in paths survives intact. The old version documented the apostrophe
+    # hole instead of handling it (UI audit 2026-07-03, bug 2 class).
+    var out = List[UInt8]()
+    out.append(0x27)  # opening '
+    var vb = value.as_bytes()
+    for i in range(value.byte_length()):
+        if vb[i] == 0x27:  # ' -> '\''
+            out.append(0x27)
+            out.append(0x5C)
+            out.append(0x27)
+            out.append(0x27)
+        else:
+            out.append(vb[i])
+    out.append(0x27)  # closing '
+    try:
+        return String(from_utf8=out)
+    except:
+        # unreachable for valid input strings; fall back to the raw wrap
+        return String("'") + value.copy() + String("'")
 
 
 def _ideogram4_transformer_path(cfg: TrainerUIConfig) -> String:
@@ -484,7 +503,11 @@ def _stop_live_runner(target: String) -> Bool:
         + String("if [ -n \"$term\" ] && kill -TERM \"$term\" 2>/dev/null; then ok=0; fi; ")
         # Fallback (wrapper already gone / legacy launch): TERM the runner.
         + String("if [ -n \"$pid\" ] && kill -TERM \"$pid\" 2>/dev/null; then ok=0; fi; ")
-        + String("rm -f ") + pid_q + String(" ") + term_q + String("; ")
+        # Remove the pidfiles only when a kill actually landed. Unconditional
+        # removal blinded the ownership guard while the process could still be
+        # alive (UI audit 2026-07-03, bug 5); stale files on the failure path
+        # are handled by the recycled-pid cmdline check + pre-launch rm.
+        + String("if [ $ok -eq 0 ]; then rm -f ") + pid_q + String(" ") + term_q + String("; fi; ")
         + String("exit $ok")
     )
     return rc == 0
@@ -615,9 +638,16 @@ def _update_eta_like_serenity(mut rt: TrainerUIRuntime):
     if rt.live.total_steps <= 0 or rt.live.total_epochs <= 0:
         rt.live.eta_secs = 0
         return
-    var steps_done = rt.live.epoch * rt.live.total_steps + rt.live.step
+    # Epochs are 1-based in trainer output ("epoch 1/1"); clamp 0-based staging
+    # lines up to 1 so the basis matches the global_step math below (the old
+    # 0-based formula showed ETA 0 for the ENTIRE last epoch of a 1-based
+    # trainer — UI audit 2026-07-03, bug 3).
+    var epoch_1b = rt.live.epoch
+    if epoch_1b < 1:
+        epoch_1b = 1
+    var steps_done = (epoch_1b - 1) * rt.live.total_steps + rt.live.step
     var remaining_steps = (
-        (rt.live.total_epochs - rt.live.epoch - 1) * rt.live.total_steps
+        (rt.live.total_epochs - epoch_1b) * rt.live.total_steps
         + (rt.live.total_steps - rt.live.step)
     )
     if steps_done <= 0:
@@ -1042,29 +1072,51 @@ def trainer_ui_apply_progress_line(mut rt: TrainerUIRuntime, line: String) -> Bo
       grad_norm 0.1527 | 2.1s/step | elapsed 0:55:37 | ETA 0:13:20
     """
     try:
+        # Parse EVERYTHING into locals first; commit only after the full line
+        # validates. The old code wrote rt.live.step before the rest parsed, so
+        # inline-SAMPLER lines ("[krea2-sample-inline] step 5 / 30 ...") that
+        # fail later left a stale step behind and made the progress rail jump
+        # to the sampler's counter during every cadence render (UI audit
+        # 2026-07-03, bug 1).
         var step_pos = _find_token(line.copy(), String("step "))
         if step_pos < 0:
             return False
         var step_start = step_pos + 5
         var step_slash = _find_char(line.copy(), String("/"), step_start)
         var step_end = _token_end(line.copy(), step_slash + 1)
-        rt.live.step = _read_int_between(line.copy(), step_start, step_slash)
-        rt.live.total_steps = _read_int_between(line.copy(), step_slash + 1, step_end)
+        var new_step = _read_int_between(line.copy(), step_start, step_slash)
+        var new_total_steps = _read_int_between(line.copy(), step_slash + 1, step_end)
 
+        var new_epoch = rt.live.epoch
+        var new_total_epochs = rt.live.total_epochs
         var epoch_pos = _find_token(line.copy(), String("epoch "), step_end)
         if epoch_pos >= 0:
             var epoch_start = epoch_pos + 6
             var epoch_slash = _find_char(line.copy(), String("/"), epoch_start)
             var epoch_end = _token_end(line.copy(), epoch_slash + 1)
-            rt.live.epoch = _read_int_between(line.copy(), epoch_start, epoch_slash)
-            rt.live.total_epochs = _read_int_between(line.copy(), epoch_slash + 1, epoch_end)
+            new_epoch = _read_int_between(line.copy(), epoch_start, epoch_slash)
+            new_total_epochs = _read_int_between(line.copy(), epoch_slash + 1, epoch_end)
 
-        rt.live.loss = _read_after_token_float(line.copy(), String("loss "))
-        if rt.live.smooth_loss <= 0.0:
-            rt.live.smooth_loss = rt.live.loss
-        else:
-            rt.live.smooth_loss = rt.live.smooth_loss * 0.99 + rt.live.loss * 0.01
-        rt.live.grad_norm = _read_after_token_float(line.copy(), String("grad_norm "))
+        var new_loss = _read_after_token_float(line.copy(), String("loss "))
+        var new_grad = _read_after_token_float(line.copy(), String("grad_norm "))
+
+        # Line fully validated - commit.
+        rt.live.step = new_step
+        rt.live.total_steps = new_total_steps
+        rt.live.epoch = new_epoch
+        rt.live.total_epochs = new_total_epochs
+        rt.live.loss = new_loss
+        rt.live.grad_norm = new_grad
+        # Prefer the trainer's own smooth_loss when the line carries one
+        # (ideogram4 does); the UI-side EMA is only a fallback for trainers
+        # that print raw loss only (UI audit 2026-07-03, bug 4).
+        try:
+            rt.live.smooth_loss = _read_after_token_float(line.copy(), String("smooth_loss "))
+        except:
+            if rt.live.smooth_loss <= 0.0:
+                rt.live.smooth_loss = rt.live.loss
+            else:
+                rt.live.smooth_loss = rt.live.smooth_loss * 0.99 + rt.live.loss * 0.01
 
         var speed_marker = _find_token(line.copy(), String("s/step"))
         if speed_marker >= 0:
