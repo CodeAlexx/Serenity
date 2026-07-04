@@ -845,6 +845,49 @@ def ideogram4_lora_train_compute_resident[
         return grads^
 
 
+# LyCORIS/carrier variant: forces the HAND-CHAIN stack backward regardless of
+# IDEOGRAM4_V2_GRAPH_PATH. The v2 graph node (ops_record.record_ideogram4_block)
+# records a SINGLE per-block rank (loras[0].rank) and applies it to all 6 slots —
+# fine for the plain LoRA set (uniform rank) but WRONG for the LyCORIS carrier
+# set, whose slots carry DIFFERENT ranks (active r_eff vs inactive rank-1). The
+# hand-chain backward reads ad.rank per slot (block.mojo _lora_linear_bwd), so it
+# is the correct path for a mixed-rank carrier set. Forward is the same plain
+# per-slot forward the graph path also uses.
+def ideogram4_lora_train_compute_resident_handchain[
+    NT: Int, GH: Int, GW: Int
+](
+    rw: Ideogram4Weights,
+    noisy_latents: Tensor,
+    clean: Tensor,
+    noise: Tensor,
+    t_flow: Float32,
+    llm_features: Tensor,
+    loras: Ideogram4LoraSet,
+    lcfg: LeversConfig,
+    mut loss_out: Float32,
+    ctx: DeviceContext,
+    text_len: Int = NT,
+) raises -> Ideogram4StackLoraGrads:
+    comptime NIMG = GH * GW
+    comptime SEQ = NT + NIMG
+    comptime N = IDEOGRAM4_PACKED_CHANNELS * NIMG
+
+    var fwd = ideogram4_lora_train_forward_resident[NT, GH, GW](
+        rw, noisy_latents, t_flow, llm_features, loras, ctx, text_len
+    )
+    var target = ideogram4_flow_target(noise, clean, ctx)
+    var ld = _i4_flow_loss_and_dvel(fwd.velocity, target, t_flow, N, lcfg, ctx)
+    loss_out = ld.loss
+    var d_h = ideogram4_lora_final_backward[NT, GH, GW](
+        ld.d_velocity, fwd.h, fwd.fscale, fwd.flw, ctx
+    )
+    var grads = ideogram4_stack_lora_backward_resident[
+        SEQ, IDEOGRAM4_HIDDEN, IDEOGRAM4_NUM_HEADS, IDEOGRAM4_HEAD_DIM,
+        IDEOGRAM4_INTERMEDIATE_SIZE, IDEOGRAM4_ADALN_DIM,
+    ](d_h, fwd.adaln_input, fwd.cosf, fwd.sinf, rw, loras, fwd.stack_fwd^, ctx)
+    return grads^
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # FULL TRAINING STEP.
 #   forward → velocity ; target = noise - clean ; loss = mean((velocity-target)^2)

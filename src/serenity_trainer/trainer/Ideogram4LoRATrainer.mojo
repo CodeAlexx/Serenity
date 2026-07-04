@@ -30,6 +30,31 @@ from serenitymojo.training.lora_ema import (
     ema_path_for_lora,
 )
 from serenitymojo.training.train_config import TrainConfig as LeversConfig
+from serenitymojo.training.train_config import (
+    TRAIN_ADAPTER_ALGO_LOKR, TRAIN_ADAPTER_ALGO_LOHA,
+)
+from serenitymojo.training.adapter_algo_policy import (
+    require_lora_or_locon_linear, adapter_algo_name,
+)
+from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
+from serenitymojo.models.ideogram4.config import (
+    IDEOGRAM4_ADALN_DIM, IDEOGRAM4_HIDDEN, IDEOGRAM4_INTERMEDIATE_SIZE,
+    IDEOGRAM4_NUM_LAYERS,
+)
+from serenitymojo.models.ideogram4.ideogram4_lokr_stack import (
+    Ideogram4LoKrSet, empty_ideogram4_lokr_set, build_ideogram4_lokr_set,
+    ideogram4_lokr_carrier_total_bytes, ideogram4_lokr_carrier_device_set,
+    ideogram4_lokr_chain_from_device, ideogram4_lokr_grad_norm,
+    ideogram4_lokr_clip_grads, ideogram4_lokr_adamw_step,
+    ideogram4_lokr_zero_leg_l1, save_ideogram4_lokr,
+)
+from serenitymojo.models.ideogram4.ideogram4_loha_stack import (
+    Ideogram4LoHaSet, empty_ideogram4_loha_set, build_ideogram4_loha_set,
+    ideogram4_loha_carrier_total_bytes, ideogram4_loha_carrier_device_set,
+    ideogram4_loha_chain_from_device, ideogram4_loha_grad_norm,
+    ideogram4_loha_clip_grads, ideogram4_loha_adamw_step,
+    ideogram4_loha_zero_leg_l1, save_ideogram4_loha,
+)
 from serenitymojo.training.schedule import sample_timestep_logit_normal_scaled
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.ops.tensor_algebra import zeros_device
@@ -53,6 +78,7 @@ from serenity_trainer.trainer.Ideogram4LoRATrainStep import (
     Ideogram4LoRATrainResult,
     ideogram4_lora_train_step_resident,
     ideogram4_lora_train_compute_resident,
+    ideogram4_lora_train_compute_resident_handchain,
 )
 from serenity_trainer.trainer.Ideogram4StackTrain import (
     IDEOGRAM4_TELEMETRY_EVERY_STEPS,
@@ -222,6 +248,19 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
     var drop_p = run_cfg.caption_dropout_prob
     if drop_p <= Float32(0.0):
         drop_p = lcfg.caption_dropout_prob
+
+    # ── LyCORIS carrier dispatch (adapter_algo comes from the levers config JSON:
+    # network_algorithm/algo/adapter_algo -> lcfg.adapter_algo, parsed by
+    # serenitymojo read_model_config). LOKR/LOHA take the additive (a,b)-carrier
+    # path; DORA/OFT/BOFT/FULL fail loud HERE (before the resident transformer
+    # load) via adapter_algo_policy.require_lora_or_locon_linear. LORA/LOCON fall
+    # through to the plain device-LoRA loop below. ──────────────────────────────
+    if (
+        lcfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+        or lcfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOHA
+    ):
+        return _train_ideogram4_lycoris_from_cache[NT, GH, GW](cfg, run_cfg, lcfg, ctx)
+    require_lora_or_locon_linear(lcfg, String("Ideogram4"))
 
     makedirs(run_cfg.output_dir, exist_ok=True)
     var final_lora_path = _final_lora_path(run_cfg.output_dir)
@@ -528,6 +567,224 @@ def train_ideogram4_lora_from_cache[NT: Int, GH: Int, GW: Int](
         1,
         progress.copy(),
     )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LyCORIS (LoKr / LoHa) carrier training driver. ADDITIVE (a,b)-carrier families:
+# each step synthesizes per-slot (a,b) matrices from the family masters into a
+# DEVICE Ideogram4LoraSet, runs the EXISTING resident forward/backward
+# (ideogram4_lora_train_compute_resident), pulls the device (a,b)-grads to host,
+# chain-rules them to the master factors, and takes a HOST AdamW step on the
+# masters (lokr_adamw/loha_adamw — the ideogram4 fused device AdamW drives only
+# plain LoRA a/b tensors, not carrier masters, so the carrier path uses the same
+# host optimizer arm zimage's carrier uses). Re-synthesized next step.
+#
+# Fail-loud (klein train_klein_real.mojo:1202-1318 posture) on combos this wave
+# does not wire: grad-accum>1, EMA, levers optimizers, resume, inline sampling,
+# masked training, init_lokr_norm (needs a base SafeTensors handle the resident
+# fp8 trunk doesn't expose here).
+def _train_ideogram4_lycoris_from_cache[NT: Int, GH: Int, GW: Int](
+    cfg: TrainConfig,
+    run_cfg: Ideogram4LoRATrainRunConfig,
+    lcfg: LeversConfig,
+    ctx: DeviceContext,
+) raises -> Ideogram4LoRATrainSummary:
+    var is_lokr = lcfg.adapter_algo == TRAIN_ADAPTER_ALGO_LOKR
+    var algo_name = adapter_algo_name(lcfg.adapter_algo)
+    var tag = String("[Ideogram4-") + algo_name + String("]")
+
+    if run_cfg.steps < 1:
+        raise Error(tag + " steps must be >= 1")
+    if cfg.gradient_accumulation_steps > 1:
+        raise Error(tag + " gradient accumulation is not wired for the carrier path")
+    if lcfg.ema_enabled:
+        raise Error(tag + " EMA shadows are not wired for the carrier path")
+    if levers_optimizer_active(lcfg):
+        raise Error(tag + " levers optimizers are not wired for the carrier path")
+    if run_cfg.resume_lora_path.byte_length() > 0 or run_cfg.resume_state_dir.byte_length() > 0:
+        raise Error(tag + " resume is not wired for the carrier path")
+    if run_cfg.sample_every_steps > 0:
+        raise Error(tag + " inline sampling is not wired for the carrier path")
+    if lcfg.masked_training:
+        raise Error(tag + " masked training is not wired for this trainer")
+
+    var H = IDEOGRAM4_HIDDEN
+    var F = IDEOGRAM4_INTERMEDIATE_SIZE
+    var A = IDEOGRAM4_ADALN_DIM
+    var NL = IDEOGRAM4_NUM_LAYERS
+    var targets = 1 if lcfg.lokr_targets == 1 else 2
+    var rank = cfg.lora_rank
+    var alpha = cfg.lora_alpha
+
+    makedirs(run_cfg.output_dir, exist_ok=True)
+    var final_lora_path = _final_lycoris_path(run_cfg.output_dir)
+
+    var cache = Ideogram4TrainCache.open(run_cfg.cache_path)
+
+    # ── build masters + device-byte preflight (fail loud over the shared budget) ─
+    var lokr_masters = empty_ideogram4_lokr_set()
+    var loha_masters = empty_ideogram4_loha_set()
+    var carrier_bytes = 0
+    if is_lokr:
+        lokr_masters = build_ideogram4_lokr_set(
+            NL, H, F, A, rank, alpha, lcfg.lokr_factor,
+            lcfg.lokr_decompose_both, lcfg.lokr_full_matrix, targets, run_cfg.lora_seed,
+        )
+        if lcfg.init_lokr_norm > 0.0:
+            raise Error(
+                tag + " init_lokr_norm perturbed init needs a base SafeTensors"
+                + " handle; not wired for the resident fp8 trunk"
+            )
+        carrier_bytes = ideogram4_lokr_carrier_total_bytes(lokr_masters, H, F, A)
+    else:
+        loha_masters = build_ideogram4_loha_set(NL, H, F, A, rank, alpha, targets, run_cfg.lora_seed)
+        carrier_bytes = ideogram4_loha_carrier_total_bytes(loha_masters, H, F, A)
+
+    print(
+        tag, " model IDEOGRAM_4 | targets ", targets, " | rank ", rank,
+        " | carrier_device_bytes ", carrier_bytes,
+        " | budget ", LOKR_CARRIER_MAX_DEVICE_BYTES,
+    )
+    if carrier_bytes > LOKR_CARRIER_MAX_DEVICE_BYTES:
+        raise Error(
+            tag + " carrier set needs " + String(carrier_bytes)
+            + " device bytes (> budget " + String(LOKR_CARRIER_MAX_DEVICE_BYTES)
+            + "); use a smaller lokr_factor or targets=attn"
+        )
+
+    # ── one resident fp8 transformer weight set (same as the plain LoRA path) ────
+    var weights = Ideogram4Weights.load(
+        ShardedSafeTensors.open(run_cfg.transformer_path), ctx
+    )
+
+    var drop_p = run_cfg.caption_dropout_prob
+    if drop_p <= Float32(0.0):
+        drop_p = lcfg.caption_dropout_prob
+
+    var progress = TrainProgress()
+    var last_loss = Float32(0.0)
+    var last_master_norm = Float64(0.0)
+    var train_start = perf_counter()
+    var smooth_loss = Float32(0.0)
+    var smooth_inited = False
+
+    for local_step in range(run_cfg.steps):
+        var sample_index = progress.global_step % cache.len()
+        var seed = run_cfg.noise_seed + UInt64(local_step)
+        var t_step = sample_timestep_logit_normal_scaled(
+            run_cfg.noise_seed * UInt64(7919) + UInt64(local_step), Float32(1.0)
+        )
+        var sample = cache.sample[NT, GH, GW](sample_index, t_step, seed, ctx)
+
+        var llm_in = sample.llm_features.copy()
+        var text_len_in = sample.text_len
+        if caption_dropout_pick(UInt64(local_step), run_cfg.noise_seed, drop_p):
+            llm_in = ArcPointer[Tensor](cache.uncond[NT](ctx))
+            text_len_in = cache.uncond_text_len[NT](ctx)
+
+        var step_loss = Float32(0.0)
+        var k = local_step + 1
+        var master_norm = Float64(0.0)
+        var zero_leg = Float64(0.0)
+
+        if is_lokr:
+            var device = ideogram4_lokr_carrier_device_set(lokr_masters, H, F, A, ctx)
+            var grads = ideogram4_lora_train_compute_resident_handchain[NT, GH, GW](
+                weights, sample.noisy[], sample.clean[], sample.noise[],
+                sample.t_flow, llm_in[], device, lcfg, step_loss, ctx, text_len_in,
+            )
+            var mg = ideogram4_lokr_chain_from_device(lokr_masters, grads, ctx)
+            master_norm = ideogram4_lokr_grad_norm(mg)
+            if cfg.clip_grad_norm > Float32(0.0) and master_norm > Float64(cfg.clip_grad_norm):
+                var cs = Float32(Float64(cfg.clip_grad_norm) / (master_norm + Float64(1.0e-6)))
+                ideogram4_lokr_clip_grads(mg, cs)
+            ideogram4_lokr_adamw_step(
+                lokr_masters, mg, k, cfg.learning_rate,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            zero_leg = ideogram4_lokr_zero_leg_l1(lokr_masters)
+            _ = device^
+        else:
+            var device = ideogram4_loha_carrier_device_set(loha_masters, H, F, A, ctx)
+            var grads = ideogram4_lora_train_compute_resident_handchain[NT, GH, GW](
+                weights, sample.noisy[], sample.clean[], sample.noise[],
+                sample.t_flow, llm_in[], device, lcfg, step_loss, ctx, text_len_in,
+            )
+            var mg = ideogram4_loha_chain_from_device(loha_masters, grads, ctx)
+            master_norm = ideogram4_loha_grad_norm(mg)
+            if cfg.clip_grad_norm > Float32(0.0) and master_norm > Float64(cfg.clip_grad_norm):
+                var cs = Float32(Float64(cfg.clip_grad_norm) / (master_norm + Float64(1.0e-6)))
+                ideogram4_loha_clip_grads(mg, cs)
+            ideogram4_loha_adamw_step(
+                loha_masters, mg, k, cfg.learning_rate,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            zero_leg = ideogram4_loha_zero_leg_l1(loha_masters)
+            _ = device^
+
+        last_loss = step_loss
+        last_master_norm = master_norm
+        progress.next_step(cfg.batch_size)
+        if not smooth_inited:
+            smooth_loss = step_loss
+            smooth_inited = True
+        else:
+            smooth_loss = smooth_loss * Float32(0.99) + step_loss * Float32(0.01)
+
+        print(
+            tag, " step ", k, "/", run_cfg.steps, " | loss ", step_loss,
+            " | master_grad_norm ", Float32(master_norm),
+            " | zero_leg_l1 ", zero_leg,
+        )
+
+        if run_cfg.progress_file_path.byte_length() > 0:
+            var elapsed = perf_counter() - train_start
+            var speed = elapsed / Float64(local_step + 1)
+            _append_ideogram4_live_progress(
+                run_cfg.progress_file_path, progress, run_cfg.steps, cfg,
+                last_loss, smooth_loss, Float32(master_norm),
+                Float32(speed), elapsed,
+            )
+
+        if run_cfg.save_every_steps > 0 and k % run_cfg.save_every_steps == 0:
+            var step_path = _step_lycoris_path(run_cfg.output_dir, k)
+            _ = _save_ideogram4_lycoris(lokr_masters, loha_masters, is_lokr, step_path, ctx)
+
+    var train_elapsed = perf_counter() - train_start
+    var seconds_per_step = train_elapsed / Float64(run_cfg.steps)
+    var n_written = _save_ideogram4_lycoris(lokr_masters, loha_masters, is_lokr, final_lora_path, ctx)
+    print(tag, " saved ", n_written, " adapters -> ", final_lora_path)
+
+    return Ideogram4LoRATrainSummary(
+        run_cfg.steps,
+        cache.len(),
+        run_cfg.steps,
+        last_loss,
+        Float32(last_master_norm),
+        train_elapsed,
+        seconds_per_step,
+        final_lora_path,
+        String(""),
+        1,
+        progress.copy(),
+    )
+
+
+def _final_lycoris_path(output_dir: String) -> String:
+    return output_dir + String("/lycoris_last.safetensors")
+
+
+def _step_lycoris_path(output_dir: String, step: Int) -> String:
+    return output_dir + String("/lycoris_step_") + String(step) + String(".safetensors")
+
+
+def _save_ideogram4_lycoris(
+    lokr: Ideogram4LoKrSet, loha: Ideogram4LoHaSet, is_lokr: Bool,
+    path: String, ctx: DeviceContext,
+) raises -> Int:
+    if is_lokr:
+        return save_ideogram4_lokr(lokr, path, ctx)
+    return save_ideogram4_loha(loha, path, ctx)
 
 
 def save_ideogram4_lora_train_state(

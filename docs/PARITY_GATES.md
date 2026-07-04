@@ -113,3 +113,18 @@ range for an untrained base on a new style.
   grad_norm 0.0000 — the counterexample this gate sequence exists to
   catch). Live gate green: loss 0.6-1.2 class decreasing, 204 LoRA-B
   nonzero.
+
+## 2026-07-03 — LyCORIS carrier orchestration smokes (real slot geometry)
+
+| gate | model | geometry | verdict |
+|---|---|---|---|
+| smoke/sdxl_flat_lycoris_orchestration_smoke | sdxl | 700 carriers (11 ST x 10 slots x depth) | PASS 2026-07-03 |
+| smoke/hidream_flat_lycoris_orchestration_smoke | hidream | 257 (36x7 block + 5 head) | PASS 2026-07-03 |
+| smoke/chroma_flux_lycoris_orchestration_smoke | chroma | 418 (19x2x6 dbl + 38x5 sgl) | PASS 2026-07-03 |
+| smoke/l2p_zimage_lycoris_orchestration_smoke | l2p | 238 built / 210 active (main-only mask) | PASS 2026-07-03 |
+
+Each gates: slot count+dims vs the model's rule, LoKr/LoHa r_eff, zero-leg init==0,
+post-AdamW-step movement, save+reopen. ideogram4 twin lives in mojodiffusion
+(models/ideogram4/parity/ideogram4_lycoris_orchestration_smoke.mojo) + 1-step REAL
+gates on the eri2 cache PASS x2 (see LYCORIS_CARRIER_DISPATCH_2026-06-27.md 07-03
+section; MJ-1062/1063).
