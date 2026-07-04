@@ -77,6 +77,7 @@ from serenitymojo.models.anima.lora_block import ANIMA_SLOTS
 from serenitymojo.models.anima.anima_stack_lora import (
     AnimaLoraSet, AnimaLoraGrads, build_anima_lora_set,
     anima_stack_lora_forward_streamed, anima_stack_lora_backward_streamed,
+    anima_stack_lora_forward_streamed_b2, anima_stack_lora_backward_streamed_b2,
     anima_lora_adamw_step, save_anima_lora, save_anima_lora_state,
 )
 from serenitymojo.models.anima.anima_lycoris_stack import (
@@ -776,6 +777,17 @@ def main() raises:
 
     var cfg = read_model_config(cfg_path)
     validate_anima_train_config(cfg)
+    # ── TRUE batch-2 (row-stacked) gate: batch_size==2 runs two samples as one
+    #    B=2 forward/backward (models/anima/anima_stack_lora anima_*_streamed_b2).
+    #    batch_size==1 keeps the byte-identical b1 path. >2 unsupported. ──
+    if cfg.batch_size < 1:
+        raise Error("train_anima_real: batch_size must be >= 1, got " + String(cfg.batch_size))
+    if cfg.batch_size > 2:
+        raise Error(
+            "train_anima_real: batch_size > 2 is not supported (TRUE batch-2 only); got "
+            + String(cfg.batch_size)
+        )
+    var use_b2 = cfg.batch_size == 2
     var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
     var offload_policy = anima_offload_policy_from_train_config(cfg)
@@ -876,6 +888,34 @@ def main() raises:
                     var dst = ((b * Hd + h) * Wd + w) * Cd + c
                     lat_bthwc[dst] = lat_full[src]
 
+    # ── TRUE batch-2 partner latent (cache_files[1]; self-dup file[0] if only one) ─
+    #    Row-stacked as sample 1 in the b2 step body. Same crop as sample 0.
+    var lat_bthwc1 = List[Float32]()
+    if use_b2:
+        var partner_idx = 1 if len(cache_files) >= 2 else 0
+        var partner_dup = len(cache_files) < 2
+        var cache_path1 = cache_dir + String("/") + cache_files[partner_idx]
+        print("[b2] partner cache:", cache_path1, " (self-dup=", partner_dup, ")")
+        var cache1 = SafeTensors.open(cache_path1)
+        var lat_info1 = cache1.tensor_info("latent")
+        var lat_sh1 = lat_info1.shape.copy()
+        if len(lat_sh1) != 4 or lat_sh1[1] != C or lat_sh1[2] < LATENT_HW or lat_sh1[3] < LATENT_HW:
+            raise Error("[b2] partner latent shape incompatible with sample 0")
+        var full_H1 = lat_sh1[2]
+        var full_W1 = lat_sh1[3]
+        var latent_cache1 = _cache_tensor(cache1, "latent", ctx)
+        var lat_full1 = _host_f32_for_step_math(latent_cache1, ctx)
+        lat_bthwc1.reserve(B * Hd * Wd * Cd)
+        for _ in range(B * Hd * Wd * Cd):
+            lat_bthwc1.append(Float32(0.0))
+        for b in range(B):
+            for h in range(Hd):
+                for w in range(Wd):
+                    for c in range(Cd):
+                        var src1 = ((b * Cd + c) * full_H1 + h) * full_W1 + w
+                        var dst1 = ((b * Hd + h) * Wd + w) * Cd + c
+                        lat_bthwc1[dst1] = lat_full1[src1]
+
     # frozen LLM-adapter context [B,256,1024] (captured sidecar context_cond).
     print("context:", CONTEXT_PATH)
     var ctx_st = SafeTensors.open(CONTEXT_PATH)
@@ -886,6 +926,16 @@ def main() raises:
         raise Error("context numel " + String(ctx_n) + " != B*S_TXT*JOINT="
                     + String(B * S_TXT * JOINT))
     print("context [B,", S_TXT, JOINT, "] loaded (frozen cross-attn input)")
+
+    # ── TRUE batch-2 context: both samples share the fixed CONTEXT_PATH context
+    #    (the trainer has one frozen sidecar), row-stacked → [2*S_TXT*JOINT]. ──
+    var context_b2 = List[Float32]()
+    if use_b2:
+        context_b2.reserve(2 * S_TXT * JOINT)
+        for i in range(len(context)):
+            context_b2.append(context[i])
+        for i in range(len(context)):
+            context_b2.append(context[i])
 
     # uncond context for sampling CFG: zeroed [B*S_TXT*JOINT] (empty-prompt cond,
     # matching anima_sample_cli's zero-context fallback). Built once; only consumed
@@ -907,6 +957,11 @@ def main() raises:
     var dora_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_DORA
     var oft_active = cfg.adapter_algo == TRAIN_ADAPTER_ALGO_OFT
     var carrier_active = lokr_active or loha_active or dora_active or oft_active
+    if use_b2 and carrier_active:
+        raise Error(
+            "train_anima_real: batch_size=2 (TRUE batch-2) is not wired for the"
+            " LyCORIS (LoKr/LoHa/DoRA/OFT) carrier arms — use adapter_algo=lora/locon"
+        )
     var lokr_masters = empty_anima_lokr_set()
     var loha_masters = empty_anima_loha_set()
     var dora_masters = empty_anima_dora_set()
@@ -1022,6 +1077,11 @@ def main() raises:
             "train_anima_real: grad_accum_steps>1 is not wired for the LyCORIS"
             " (LoKr/LoHa/DoRA/OFT) carrier arms — use adapter_algo=lora/locon"
         )
+    if use_b2 and use_grad_accum:
+        raise Error(
+            "train_anima_real: batch_size=2 (TRUE batch-2) with grad_accum_steps>1"
+            " is not wired — use one or the other (batch_size=1 for accumulation)"
+        )
     var acc_da = List[List[Float32]]()
     var acc_db = List[List[Float32]]()
     var micro_in_window = 0
@@ -1030,102 +1090,181 @@ def main() raises:
 
     for step in range(run_steps):
         var step_t0 = perf_counter_ns()
-        # ── timestep sampling (sigmoid -> shift -> clamp), rs:328-834 ──
-        # In FIXED_SIGMA_SMOKE we hold sigma + the noise draw constant so the
-        # target is identical every step (loss-decrease isolation, see header).
-        var sigma = FIXED_SIGMA
-        comptime if not FIXED_SIGMA_SMOKE:
-            var sigma_seed = SEED * UInt64(7919) + UInt64(step) * UInt64(2654435761)
-            var sigma0 = sample_timestep_sigmoid(sigma_seed, SIGMOID_SCALE, Float32(0.0))
-            sigma = _apply_shift(sigma0, cfg.timestep_shift)
-            sigma = _clamp(sigma, Float32(1.0e-5), Float32(1.0) - Float32(1.0e-5))
+        # ── per-step forward/loss/backward → (loss, grads). b1 default; when
+        #    batch_size==2 the b2 row-stacked path runs (guarded so batch_size==1
+        #    is byte-identical to the pre-b2 trainer). ──
+        var loss = Float32(0.0)
+        var grads: AnimaLoraGrads
+        if use_b2:
+            # ── TRUE batch-2: two samples row-stacked along the batch dim, run as
+            #    one B=2 forward/backward. Sample 1 offsets the sigma+noise seeds by
+            #    +1 (its own draw); the joint 2N-mean loss makes the b2 grad == the
+            #    mean of the two b1 per-sample grads (grad-accum=2 semantics). ──
+            var sigma0 = FIXED_SIGMA
+            var sigma1 = FIXED_SIGMA
+            comptime if not FIXED_SIGMA_SMOKE:
+                var sseed0 = SEED * UInt64(7919) + UInt64(step) * UInt64(2654435761)
+                sigma0 = _clamp(_apply_shift(sample_timestep_sigmoid(sseed0, SIGMOID_SCALE, Float32(0.0)), cfg.timestep_shift), Float32(1.0e-5), Float32(1.0) - Float32(1.0e-5))
+                var sseed1 = sseed0 + UInt64(1)
+                sigma1 = _clamp(_apply_shift(sample_timestep_sigmoid(sseed1, SIGMOID_SCALE, Float32(0.0)), cfg.timestep_shift), Float32(1.0e-5), Float32(1.0) - Float32(1.0e-5))
+            var nseed0 = SEED * UInt64(104729)
+            comptime if not FIXED_SIGMA_SMOKE:
+                nseed0 += UInt64(step)
+            var nseed1 = nseed0 + UInt64(1)
+            var noise0 = _host_noise(n_lat, nseed0)
+            var noise1 = _host_noise(n_lat, nseed1)
+            var noisy0 = List[Float32](); var target0 = List[Float32]()
+            var noisy1 = List[Float32](); var target1 = List[Float32]()
+            noisy0.reserve(n_lat); target0.reserve(n_lat)
+            noisy1.reserve(n_lat); target1.reserve(n_lat)
+            for i in range(n_lat):
+                noisy0.append(sigma0 * noise0[i] + (Float32(1.0) - sigma0) * lat_bthwc[i])
+                target0.append(noise0[i] - lat_bthwc[i])
+                noisy1.append(sigma1 * noise1[i] + (Float32(1.0) - sigma1) * lat_bthwc1[i])
+                target1.append(noise1[i] - lat_bthwc1[i])
+            # per-sample patchify (Bd=1) then row-stack along the batch dim.
+            var patches0 = _patchify_in(noisy0, 1, 1, Hd, Wd, Cd)
+            var patches1 = _patchify_in(noisy1, 1, 1, Hd, Wd, Cd)
+            var tgt0_p = _patchify_out(target0, 1, 1, Hd, Wd, Cd)
+            var tgt1_p = _patchify_out(target1, 1, 1, Hd, Wd, Cd)
+            var patches_b2 = patches0.copy()
+            for i in range(len(patches1)):
+                patches_b2.append(patches1[i])
+            var target_patches_b2 = tgt0_p.copy()
+            for i in range(len(tgt1_p)):
+                target_patches_b2.append(tgt1_p[i])
+            # per-sample timestep conditioning, row-stacked → [2,2048]/[2,6144].
+            var temb0 = _prepare_timestep(sigma0, base, ctx)
+            var temb1 = _prepare_timestep(sigma1, base, ctx)
+            var t_cond_b2 = temb0.t_cond.copy()
+            for i in range(len(temb1.t_cond)):
+                t_cond_b2.append(temb1.t_cond[i])
+            var base_adaln_b2 = temb0.base_adaln.copy()
+            for i in range(len(temb1.base_adaln)):
+                base_adaln_b2.append(temb1.base_adaln[i])
+            # forward (B=2). ropes.cos/sin are the SINGLE-sample table; the b2 stack
+            # doubles them internally (both samples share the same image grid).
+            var fwd = anima_stack_lora_forward_streamed_b2[H, Dh, S_IMG, S_TXT](
+                patches_b2.copy(), t_cond_b2.copy(), base_adaln_b2.copy(), context_b2.copy(),
+                base, st, lora, ropes.cos, ropes.sin,
+                2, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
+            )
+            # JOINT 2N-mean MSE: d_out = 2/(2N)*(pred-target); loss = sse/(2N).
+            var npred_b2 = len(fwd.out)
+            var sse = Float32(0.0)
+            var d_out_b2 = List[Float32]()
+            d_out_b2.reserve(npred_b2)
+            var inv_n2 = Float32(2.0) / Float32(npred_b2)
+            for i in range(npred_b2):
+                var diff = fwd.out[i] - target_patches_b2[i]
+                sse += diff * diff
+                d_out_b2.append(inv_n2 * diff)
+            loss = sse / Float32(npred_b2)
+            if step == 0:
+                first_loss = loss
+            last_loss = loss
+            grads = anima_stack_lora_backward_streamed_b2[H, Dh, S_IMG, S_TXT](
+                d_out_b2, patches_b2.copy(), t_cond_b2.copy(), base_adaln_b2.copy(), context_b2.copy(),
+                base, st, lora, ropes.cos, ropes.sin, fwd,
+                2, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
+            )
+        else:
+            # ── timestep sampling (sigmoid -> shift -> clamp), rs:328-834 ──
+            # In FIXED_SIGMA_SMOKE we hold sigma + the noise draw constant so the
+            # target is identical every step (loss-decrease isolation, see header).
+            var sigma = FIXED_SIGMA
+            comptime if not FIXED_SIGMA_SMOKE:
+                var sigma_seed = SEED * UInt64(7919) + UInt64(step) * UInt64(2654435761)
+                var sigma0 = sample_timestep_sigmoid(sigma_seed, SIGMOID_SCALE, Float32(0.0))
+                sigma = _apply_shift(sigma0, cfg.timestep_shift)
+                sigma = _clamp(sigma, Float32(1.0e-5), Float32(1.0) - Float32(1.0e-5))
 
-        # ── flow-matching noise + target at LATENT level (rs:859-863) ──
-        #   noisy  = sigma*noise + (1-sigma)*latent
-        #   target = noise - latent
-        var noise_seed = SEED * UInt64(104729)
-        comptime if not FIXED_SIGMA_SMOKE:
-            noise_seed += UInt64(step)
-        var noise = _host_noise(n_lat, noise_seed)
-        var noisy = List[Float32]()
-        var target = List[Float32]()
-        noisy.reserve(n_lat)
-        target.reserve(n_lat)
-        for i in range(n_lat):
-            noisy.append(sigma * noise[i] + (Float32(1.0) - sigma) * lat_bthwc[i])
-            target.append(noise[i] - lat_bthwc[i])
+            # ── flow-matching noise + target at LATENT level (rs:859-863) ──
+            #   noisy  = sigma*noise + (1-sigma)*latent
+            #   target = noise - latent
+            var noise_seed = SEED * UInt64(104729)
+            comptime if not FIXED_SIGMA_SMOKE:
+                noise_seed += UInt64(step)
+            var noise = _host_noise(n_lat, noise_seed)
+            var noisy = List[Float32]()
+            var target = List[Float32]()
+            noisy.reserve(n_lat)
+            target.reserve(n_lat)
+            for i in range(n_lat):
+                noisy.append(sigma * noise[i] + (Float32(1.0) - sigma) * lat_bthwc[i])
+                target.append(noise[i] - lat_bthwc[i])
 
-        # ── patchify: noisy -> input patches [B*N,68]; target -> output [B*N,64] ──
-        var patches = _patchify_in(noisy, B, 1, Hd, Wd, Cd)
-        var target_patches = _patchify_out(target, B, 1, Hd, Wd, Cd)
+            # ── patchify: noisy -> input patches [B*N,68]; target -> output [B*N,64] ──
+            var patches = _patchify_in(noisy, B, 1, Hd, Wd, Cd)
+            var target_patches = _patchify_out(target, B, 1, Hd, Wd, Cd)
 
-        # ── t_embedder: sigma -> (t_cond RAW, base_adaln) ──
-        var temb = _prepare_timestep(sigma, base, ctx)
+            # ── t_embedder: sigma -> (t_cond RAW, base_adaln) ──
+            var temb = _prepare_timestep(sigma, base, ctx)
 
-        # ── forward (streamed 28-block) ──
-        var fwd = anima_stack_lora_forward_streamed[H, Dh, S_IMG, S_TXT](
-            patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
-            base, st, lora, ropes.cos, ropes.sin,
-            B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
-        )
+            # ── forward (streamed 28-block) ──
+            var fwd = anima_stack_lora_forward_streamed[H, Dh, S_IMG, S_TXT](
+                patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
+                base, st, lora, ropes.cos, ropes.sin,
+                B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
+            )
 
-        # ── MSE loss + d_out (dMSE/dpred = 2/N*(pred-target)) ──
-        # fwd.out is [B*N, 64] host; read it by reference (fwd is consumed by
-        # the backward call below, so we don't bind/copy it out here).
-        var npred = len(fwd.out)
-        var sse = Float32(0.0)
-        var d_out = List[Float32]()
-        d_out.reserve(npred)
-        var inv_n = Float32(2.0) / Float32(npred)
-        for i in range(npred):
-            var diff = fwd.out[i] - target_patches[i]
-            sse += diff * diff
-            d_out.append(inv_n * diff)
-        var loss = sse / Float32(npred)
-        # Capture loss BEFORE the accumulation block: on a mid-window micro-step
-        # the block `continue`s past the rest of the loop, so first_loss/last_loss
-        # must be recorded here (every micro-step) or first_loss stays 0.0 when
-        # step 0 is a non-boundary micro-step (accum_steps>1).
-        if step == 0:
-            first_loss = loss
-        last_loss = loss
+            # ── MSE loss + d_out (dMSE/dpred = 2/N*(pred-target)) ──
+            # fwd.out is [B*N, 64] host; read it by reference (fwd is consumed by
+            # the backward call below, so we don't bind/copy it out here).
+            var npred = len(fwd.out)
+            var sse = Float32(0.0)
+            var d_out = List[Float32]()
+            d_out.reserve(npred)
+            var inv_n = Float32(2.0) / Float32(npred)
+            for i in range(npred):
+                var diff = fwd.out[i] - target_patches[i]
+                sse += diff * diff
+                d_out.append(inv_n * diff)
+            loss = sse / Float32(npred)
+            # Capture loss BEFORE the accumulation block: on a mid-window micro-step
+            # the block `continue`s past the rest of the loop, so first_loss/last_loss
+            # must be recorded here (every micro-step) or first_loss stays 0.0 when
+            # step 0 is a non-boundary micro-step (accum_steps>1).
+            if step == 0:
+                first_loss = loss
+            last_loss = loss
 
-        # ── backward (streamed) ──
-        var grads = anima_stack_lora_backward_streamed[H, Dh, S_IMG, S_TXT](
-            d_out, patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
-            base, st, lora, ropes.cos, ropes.sin, fwd,
-            B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
-        )
+            # ── backward (streamed) ──
+            grads = anima_stack_lora_backward_streamed[H, Dh, S_IMG, S_TXT](
+                d_out, patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
+                base, st, lora, ropes.cos, ropes.sin, fwd,
+                B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
+            )
 
-        # ── gradient accumulation (plain-LoRA host arm; default-off N==1) ──────
-        # SUM this micro-step's LoRA grad groups into the window buffers; on a
-        # non-boundary micro-step print progress and skip clip+AdamW+save. On the
-        # boundary MEAN (÷window) into `grads` and fall through to the UNCHANGED
-        # clip+AdamW path below. N==1 => every step is a boundary (byte-identical).
-        if use_grad_accum:
-            if micro_in_window == 0:
-                acc_da = zeros_like_group(grads.d_a)
-                acc_db = zeros_like_group(grads.d_b)
-            accumulate_grad_group(acc_da, grads.d_a)
-            accumulate_grad_group(acc_db, grads.d_b)
-            micro_in_window += 1
-            var is_boundary = micro_in_window >= accum_steps or step == run_steps - 1
-            if not is_boundary:
-                var mid_now = perf_counter_ns()
-                print_trainer_progress(
-                    String("Anima-lora"), step + 1, run_steps, 1,
-                    loss, 0.0,
-                    Float64(mid_now - step_t0) / 1.0e9, 0.0,
-                    Float64(mid_now - t0) / 1.0e9,
-                )
-                continue
-            var inv_micro = Float32(1.0) / Float32(micro_in_window)
-            scale_grad_group(acc_da, inv_micro)
-            scale_grad_group(acc_db, inv_micro)
-            for i in range(len(grads.d_a)):
-                grads.d_a[i] = acc_da[i].copy()
-                grads.d_b[i] = acc_db[i].copy()
-            micro_in_window = 0
+            # ── gradient accumulation (plain-LoRA host arm; default-off N==1) ──────
+            # SUM this micro-step's LoRA grad groups into the window buffers; on a
+            # non-boundary micro-step print progress and skip clip+AdamW+save. On the
+            # boundary MEAN (÷window) into `grads` and fall through to the UNCHANGED
+            # clip+AdamW path below. N==1 => every step is a boundary (byte-identical).
+            if use_grad_accum:
+                if micro_in_window == 0:
+                    acc_da = zeros_like_group(grads.d_a)
+                    acc_db = zeros_like_group(grads.d_b)
+                accumulate_grad_group(acc_da, grads.d_a)
+                accumulate_grad_group(acc_db, grads.d_b)
+                micro_in_window += 1
+                var is_boundary = micro_in_window >= accum_steps or step == run_steps - 1
+                if not is_boundary:
+                    var mid_now = perf_counter_ns()
+                    print_trainer_progress(
+                        String("Anima-lora"), step + 1, run_steps, 1,
+                        loss, 0.0,
+                        Float64(mid_now - step_t0) / 1.0e9, 0.0,
+                        Float64(mid_now - t0) / 1.0e9,
+                    )
+                    continue
+                var inv_micro = Float32(1.0) / Float32(micro_in_window)
+                scale_grad_group(acc_da, inv_micro)
+                scale_grad_group(acc_db, inv_micro)
+                for i in range(len(grads.d_a)):
+                    grads.d_a[i] = acc_da[i].copy()
+                    grads.d_b[i] = acc_db[i].copy()
+                micro_in_window = 0
 
         # ── global-norm clip (1.0) then AdamW over all adapters ──
         var gn_before = _global_norm(grads)
