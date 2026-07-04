@@ -61,12 +61,15 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_forward_device_inputs_resident_moddev_rope,
     klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch,
     klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch,
+    klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_b2,
     klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape,
+    KleinStackForwardB2,
     klein_stack_lora_backward, klein_stack_lora_backward_resident,
     klein_stack_lora_backward_resident_moddev,
     klein_stack_lora_backward_resident_moddev_rope,
     klein_stack_lora_backward_resident_moddev_rope_scratch,
     klein_stack_lora_backward_offload_turbo_moddev_rope_scratch,
+    klein_stack_lora_backward_offload_turbo_moddev_rope_scratch_b2,
     klein_stack_lora_backward_graph,
     klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch,
     klein_stack_direct_dora_forward_offload_turbo_moddev_rope_scratch,
@@ -493,6 +496,58 @@ struct KleinLossGrad(Movable):
     def __init__(out self, loss: Float32, var d_loss: List[Float32]):
         self.loss = loss
         self.d_loss = d_loss^
+
+
+# ── batch-2 per-sample noise/target prep (true batching, rung 2) ─────────────
+# One batch-2 half: independent sigma draw + flow-match noise/target from a
+# per-sample seed pair, mirroring the single-sample block (sigma selector +
+# bias + host noise + modifiers + flow_match). Keeps the two halves' timesteps
+# and noise independent, exactly like two single-sample steps.
+struct _KleinB2Noise(Movable):
+    var x_t: TArc
+    var target: List[Float32]
+    var sigma: Float32
+
+    def __init__(out self, var x_t: TArc, var target: List[Float32], sigma: Float32):
+        self.x_t = x_t^
+        self.target = target^
+        self.sigma = sigma
+
+
+def _klein_b2_prep(
+    cfg: TrainConfig, sigma_seed: UInt64, noise_seed: UInt64,
+    latent_tokens_t: TArc, n_img: Int, ctx: DeviceContext,
+) raises -> _KleinB2Noise:
+    var sigma: Float32
+    if cfg.timestep_distribution == TSD_UNIFORM:
+        sigma = sample_timestep_uniform(sigma_seed)
+    elif cfg.timestep_distribution == TSD_SIGMOID:
+        sigma = sample_timestep_sigmoid(
+            sigma_seed, cfg.timestep_noising_weight, cfg.timestep_noising_bias
+        )
+    else:
+        sigma = sample_timestep_logit_normal(sigma_seed, cfg.timestep_shift)
+    sigma = apply_bias(
+        sigma, Float32(1.0), cfg.timestep_bias_strategy,
+        cfg.timestep_bias_multiplier,
+        cfg.timestep_bias_range_min, cfg.timestep_bias_range_max,
+    )
+    var n_img_vals = n_img * cfg.in_channels
+    var noise = _host_noise(n_img_vals, noise_seed)
+    _ = apply_noise_modifiers_host(
+        noise, n_img, cfg.in_channels,
+        cfg.offset_noise_weight, cfg.offset_noise_prob,
+        cfg.input_perturbation,
+        cfg.multires_iterations, cfg.multires_discount,
+        noise_seed,
+    )
+    var noise_t = Tensor.from_host(
+        noise^, [n_img, cfg.in_channels], latent_tokens_t[].dtype(), ctx
+    )
+    var fm = flow_match_noise_target(latent_tokens_t[], sigma, noise_t, ctx)
+    var x_t_dev = TArc(fm.x_t.clone(ctx))
+    var target = _host_f32_for_step_math(fm.target, ctx)
+    return _KleinB2Noise(x_t_dev^, target^, sigma)
 
 
 def _klein_loss_grad(
@@ -1239,6 +1294,45 @@ def main() raises:
             " layer_offload_fraction=", Float32(cfg.layer_offload_fraction),
         )
 
+    # ── TRUE batch-2 scope fences (fleet true-batching rung 2) ────────────────
+    # batch_size==1 (or unset) leaves every path byte-identical. batch_size==2
+    # runs the interleaved per-sample scratch drivers on the PLAIN-LoRA path
+    # only: carrier (LoKr/LoHa), direct (DoRA/OFT), and the CPU activation-tape
+    # offload path are not wired for two samples this wave — fail loud rather
+    # than silently train one. The KLEIN_V2_GRAPH capture arm is batch-1-only by
+    # design, so batch_size==2 routes to the uncaptured hand-chain scratch
+    # backward (klein_stack_lora_backward_offload_turbo_moddev_rope_scratch_b2),
+    # exactly how the carrier path already falls back off the graph arm.
+    if cfg.batch_size < 1:
+        raise Error("Klein trainer: batch_size must be >= 1")
+    if cfg.batch_size > 2:
+        raise Error(
+            String("Klein trainer: batch_size=") + String(cfg.batch_size)
+            + String(" not supported — this wave wires TRUE batch-2 only (set 1 or 2)")
+        )
+    if cfg.batch_size == 2:
+        if carrier_active:
+            raise Error(
+                "Klein batch_size=2: not wired for the LoKr/LoHa carrier path"
+                " (adapter_algo 2/4); use batch_size=1"
+            )
+        if direct_active:
+            raise Error(
+                "Klein batch_size=2: not wired for the DoRA/OFT direct path"
+                " (adapter_algo 5/6); use batch_size=1"
+            )
+        if use_activation_tape_offload:
+            raise Error(
+                "Klein batch_size=2: not wired for the CPU activation-tape offload"
+                " path; disable activation_offload or use batch_size=1"
+            )
+        if cfg.grad_accum_steps > 1:
+            raise Error(
+                "Klein batch_size=2: combined with grad_accum_steps>1 is not wired"
+                " this wave; set one of them to 1"
+            )
+        print("  TRUE batch-2: interleaved per-sample scratch drivers (uncaptured hand-chain)")
+
     # ── adapter algo selector (Wave 2B item 2j; default 0 = plain LoRA) ───────
     # adapter_algo==1 selects LyCORIS Full (full-shape weight delta). The Full
     # PRIMITIVE + .diff.weight save convention ship in training/full_adapter.mojo
@@ -1984,7 +2078,92 @@ def main() raises:
                 perf_min_free = _klein_update_min_free(ctx, perf_min_free)
                 continue
 
-        if use_activation_tape_offload:
+        if cfg.batch_size == 2:
+            # ── TRUE batch-2 step (fleet rung 2). Trivial round-robin pairing
+            # ((2k-2, 2k-1) mod N; odd tail self-dups). Every cache sample shares
+            # the 512px bucket, so a pair always matches by construction. Both
+            # samples run through ONE forward/backward: each block streamed once
+            # and applied per sample (own modvecs), the shared LoRA grads summed
+            # = the batch gradient. The single-sample setup above (cache_slot,
+            # sigma, mods) is recomputed here for the pair; base.final_* mutation
+            # above is irrelevant (b2 passes per-sample final adaLN explicitly).
+            var n_comp = len(compatible)
+            var slot0 = (2 * (k - 1)) % n_comp
+            var slot1 = (2 * (k - 1) + 1) % n_comp
+            if n_comp < 2:
+                slot1 = slot0
+            var lat0: TArc; var txt0: TArc
+            var lat1: TArc; var txt1: TArc
+            if preload_cache_tensors:
+                lat0 = cached_img_tokens[slot0].copy(); txt0 = cached_txt_tokens[slot0].copy()
+                lat1 = cached_img_tokens[slot1].copy(); txt1 = cached_txt_tokens[slot1].copy()
+            else:
+                var cs0 = cache.load(compatible[slot0], ctx)
+                lat0 = TArc(_latent_to_img_tokens_device(cs0.latent, cfg.in_channels, ctx))
+                txt0 = TArc(reshape(cs0.text_embedding, preload_txt_sh.copy(), ctx))
+                var cs1 = cache.load(compatible[slot1], ctx)
+                lat1 = TArc(_latent_to_img_tokens_device(cs1.latent, cfg.in_channels, ctx))
+                txt1 = TArc(reshape(cs1.text_embedding, preload_txt_sh.copy(), ctx))
+            # per-sample caption dropout (default-off; same Bernoulli source).
+            if cfg.caption_dropout_prob > Float32(0.0):
+                if not uncond_txt:
+                    raise Error("caption_dropout enabled but uncond text tensor was not initialized")
+                if caption_dropout_pick(UInt64(2 * k), SEED_BASE, cfg.caption_dropout_prob):
+                    txt0 = uncond_txt.value().copy()
+                if caption_dropout_pick(UInt64(2 * k + 1), SEED_BASE, cfg.caption_dropout_prob):
+                    txt1 = uncond_txt.value().copy()
+            # per-sample sigma/noise/flow-match target (independent seed pairs).
+            var prep0 = _klein_b2_prep(
+                cfg, SEED_BASE + UInt64(2 * k),
+                SEED_BASE * UInt64(7919) + UInt64(2 * k), lat0, N_IMG, ctx,
+            )
+            var prep1 = _klein_b2_prep(
+                cfg, SEED_BASE + UInt64(2 * k + 1),
+                SEED_BASE * UInt64(7919) + UInt64(2 * k + 1), lat1, N_IMG, ctx,
+            )
+            # per-sample modulation (img/txt/single + final adaLN scale/shift).
+            var mods0 = build_klein_step_mods_device_cached(
+                mod_weights, prep0.sigma, cfg.timestep_dim, cfg.d_model, ctx
+            )
+            var mods1 = build_klein_step_mods_device_cached(
+                mod_weights, prep1.sigma, cfg.timestep_dim, cfg.d_model, ctx
+            )
+            var fwd_b2 = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_b2[H, Dh, N_IMG, N_TXT, S](
+                prep0.x_t, txt0, prep1.x_t, txt1, base, loader, lora_dev,
+                mods0[0].copy(), mods0[1].copy(), mods0[2].copy(),
+                mods1[0].copy(), mods1[1].copy(), mods1[2].copy(),
+                mods0[3].copy(), mods0[4].copy(), mods1[3].copy(), mods1[4].copy(),
+                cos_dev[], sin_dev[],
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch_fwd,
+            )
+            var t_fwd1_b2 = perf_counter_ns()
+            perf_forward_seconds += Float64(t_fwd1_b2 - t_fwd0) / 1.0e9
+            # joint 2N-mean loss = mean of the two single-sample losses; each
+            # sample's output grad is HALF the single-sample d_loss so summing
+            # the two backward halves yields the batch-MEAN gradient.
+            var lg0 = _klein_loss_grad(fwd_b2.s0.out, prep0.target, prep0.sigma, cfg)
+            var lg1 = _klein_loss_grad(fwd_b2.s1.out, prep1.target, prep1.sigma, cfg)
+            loss = (lg0.loss + lg1.loss) * Float32(0.5)
+            var d0 = List[Float32]()
+            for i in range(len(lg0.d_loss)):
+                d0.append(lg0.d_loss[i] * Float32(0.5))
+            var d1 = List[Float32]()
+            for i in range(len(lg1.d_loss)):
+                d1.append(lg1.d_loss[i] * Float32(0.5))
+            if runtime_profile:
+                print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss, " b2=1")
+            t_bwd0 = perf_counter_ns()
+            perf_loss_seconds += Float64(t_bwd0 - t_fwd1_b2) / 1.0e9
+            g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch_b2[H, Dh, N_IMG, N_TXT, S](
+                d0, d1, base, loader, lora_dev,
+                mods0[0].copy(), mods0[1].copy(), mods0[2].copy(),
+                mods1[0].copy(), mods1[1].copy(), mods1[2].copy(),
+                mods0[4].copy(), mods1[4].copy(), cos_dev[], sin_dev[], fwd_b2,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                cfg.out_channels, cfg.eps, ctx, scratch_bwd,
+            )
+        elif use_activation_tape_offload:
             var fwd_tape = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape[H, Dh, N_IMG, N_TXT, S](
                 x_t_dev, txt_tokens_t, base,
                 loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
