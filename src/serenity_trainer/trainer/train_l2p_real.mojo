@@ -66,12 +66,17 @@ from serenitymojo.ops.cast import cast_tensor
 from serenitymojo.models.zimage.weights import ZImageBlockWeights
 from serenitymojo.models.zimage.block import ZImageModVecs
 from serenitymojo.models.zimage.zimage_stack import ZImageStackForward
-from serenitymojo.models.zimage.lora_block import ZIMAGE_SLOTS
+from serenitymojo.models.zimage.lora_block import (
+    ZIMAGE_SLOTS, ZImageModVecsDevice, zimage_modvecs_pack2_to_device,
+)
 from serenitymojo.models.zimage.zimage_stack_lora import (
     ZImageLoraSet, ZImageLoraGrads, build_zimage_lora_set,
     zimage_lora_set_to_device,
+    ZImageStackForwardB2,
     zimage_stack_lora_forward_main_device,
     zimage_stack_lora_backward_main_device_nofinal,
+    zimage_stack_lora_forward_main_device_b2_masked,
+    zimage_stack_lora_backward_main_device_b2_masked_nofinal,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
     save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
     ZIMAGE_DIRECT_24_GIB,
@@ -784,6 +789,309 @@ def _train_one_step_l2p(
     return L2PStepResult(loss, Float32(gn_before), Float32(secs), b_absum, grads.nonfinite_lora_grads)
 
 
+# ── per-sample conditioning helper (mirrors the b1 step's cap_seq build) ──────
+def _l2p_cap_seq_padded(
+    aux: L2PRealAux, s_cap_feats: Tensor, valid_cap: Int, ctx: DeviceContext
+) raises -> List[Float32]:
+    """cap_feats [1,seq,2560] F32 -> [CAP_LEN, D] host, valid rows embedded,
+    pad rows [valid_cap, CAP_LEN) filled with cap_pad_token. Identical to the
+    b1 step (train_l2p_real:472-484)."""
+    var cap_feats = cast_tensor(s_cap_feats, STDtype.F32, ctx)   # [1,seq,2560]
+    var cap_full = cap_feats.to_host(ctx)
+    var cap_vals = List[Float32]()
+    for r in range(CAP_LEN):
+        var src_r = r if r < valid_cap else valid_cap - 1
+        for c in range(CAP_DIM):
+            cap_vals.append(cap_full[src_r * CAP_DIM + c])
+    var cap2 = Tensor.from_host(cap_vals^, [CAP_LEN, CAP_DIM], STDtype.F32, ctx)
+    var cap_seq = build_l2p_cap_seq(aux, cap2, EPS, ctx)
+    var cap_pad_h = aux.cap_pad_token[].to_host(ctx)
+    for r in range(valid_cap, CAP_LEN):
+        for c in range(D):
+            cap_seq[r * D + c] = cap_pad_h[c]
+    return cap_seq^
+
+
+# ── TRUE batch-2 (row-stacked) L2P step ──────────────────────────────────────
+# Reuses the PROVEN zimage b2 MASKED stack (two samples stacked along rows,
+# [2S, D]; per-sample tail masking via cap_attn_len/main_attn_len). The DiT's
+# last main-block hidden IS the feature map (identity final layer, out0/out1
+# DISCARDED); the FROZEN local_decoder is batch-1 so it runs TWICE (once per
+# sample, each with its own noisy pixels). JOINT 2N-mean loss with per-sample
+# d_velocity scaled by 0.5 (inv_n_b2 = 1/npix = 0.5 * b1's 2/npix) so the b2
+# gradient == the MEAN of the two per-sample b1 grads = the grad-accum=2 oracle.
+# Binding acceptance (MJ-1073): loss parity + forward velocity, NOT grad
+# cosine-vs-b1 at depth (bf16 GEMM M-shape is shape-deterministic).
+def _train_one_step_l2p_b2(
+    k: Int,
+    run_steps: Int,
+    slot0: Int,
+    slot1: Int,
+    seed0: UInt64,
+    seed1: UInt64,
+    cache: L2PCache,
+    aux: L2PRealAux,
+    dec: L2PDecoderF32,
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    mut lora: ZImageLoraSet,
+    step_lr: Float32,
+    max_grad_norm: Float32,
+    beta1: Float32,
+    beta2: Float32,
+    optimizer_eps: Float32,
+    weight_decay: Float32,
+    train_start_ns: UInt,
+    ctx: DeviceContext,
+) raises -> L2PStepResult:
+    var t0 = perf_counter_ns()
+
+    # ── load the two cached samples ───────────────────────────────────────────
+    var sa = cache.load(slot0, ctx)
+    var sb = cache.load(slot1, ctx)
+    var psh0 = sa.pixel.shape()
+    var psh1 = sb.pixel.shape()
+    if (
+        len(psh0) != 3 or psh0[0] != PIX_C or psh0[1] != PIX_H or psh0[2] != PIX_W
+        or len(psh1) != 3 or psh1[0] != PIX_C or psh1[1] != PIX_H or psh1[2] != PIX_W
+    ):
+        raise Error("train_l2p_real b2: pixel shape mismatch — expected [3,512,512]")
+    var csh0 = sa.cap_feats.shape()
+    var csh1 = sb.cap_feats.shape()
+    if (
+        len(csh0) != 3 or csh0[0] != 1 or csh0[2] != CAP_DIM
+        or len(csh1) != 3 or csh1[0] != 1 or csh1[2] != CAP_DIM
+    ):
+        raise Error("train_l2p_real b2: cap_feats shape mismatch — expected [1,seq,2560]")
+    var valid_cap0 = csh0[1]
+    var valid_cap1 = csh1[1]
+    if valid_cap0 <= 0 or valid_cap0 > CAP_LEN or valid_cap1 <= 0 or valid_cap1 > CAP_LEN:
+        raise Error("train_l2p_real b2: caption length out of range")
+
+    # ── per-sample attention lengths (round valid caption up to a 32-multiple,
+    #    cap at CAP_LEN); the masked stack masks each sample's OWN pad tail ─────
+    var cap_attn_len0 = ((valid_cap0 + 31) // 32) * 32
+    var cap_attn_len1 = ((valid_cap1 + 31) // 32) * 32
+    if cap_attn_len0 > CAP_LEN:
+        cap_attn_len0 = CAP_LEN
+    if cap_attn_len1 > CAP_LEN:
+        cap_attn_len1 = CAP_LEN
+    var main_attn_len0 = N_IMG + cap_attn_len0
+    var main_attn_len1 = N_IMG + cap_attn_len1
+
+    var pix_h0 = cast_tensor(sa.pixel, STDtype.F32, ctx).to_host(ctx)
+    var pix_h1 = cast_tensor(sb.pixel, STDtype.F32, ctx).to_host(ctx)
+
+    # ── per-sample timestep (own step_seed) ───────────────────────────────────
+    var t_int0 = _uniform_t_int(SEED_BASE + seed0, NUM_TRAIN_TIMESTEPS)
+    var t_int1 = _uniform_t_int(SEED_BASE + seed1, NUM_TRAIN_TIMESTEPS)
+    var sigma0 = Float32(t_int0) / Float32(NUM_TRAIN_TIMESTEPS)
+    var sigma1 = Float32(t_int1) / Float32(NUM_TRAIN_TIMESTEPS)
+    var t_value0 = Float32(1.0) - sigma0
+    var t_value1 = Float32(1.0) - sigma1
+
+    # ── per-sample pixel noise + noisy pixels (rectified flow) ────────────────
+    var npix = PIX_C * PIX_H * PIX_W
+    var noise_pix0 = _host_noise_l2p(npix, SEED_BASE * UInt64(7919) + seed0)
+    var noise_pix1 = _host_noise_l2p(npix, SEED_BASE * UInt64(7919) + seed1)
+    var noisy0_h = List[Float32]()
+    var noisy1_h = List[Float32]()
+    for i in range(npix):
+        noisy0_h.append(pix_h0[i] * (Float32(1.0) - sigma0) + noise_pix0[i] * sigma0)
+        noisy1_h.append(pix_h1[i] * (Float32(1.0) - sigma1) + noise_pix1[i] * sigma1)
+    var noisy_pixel_t0 = Tensor.from_host(noisy0_h^, [1, PIX_C, PIX_H, PIX_W], STDtype.F32, ctx)
+    var noisy_pixel_t1 = Tensor.from_host(noisy1_h^, [1, PIX_C, PIX_H, PIX_W], STDtype.F32, ctx)
+
+    # ── per-sample adaln + modvecs; main modvecs packed into [2,D] device ─────
+    var adaln0 = build_l2p_adaln(aux, t_value0, T_SCALE, ctx)
+    var adaln1 = build_l2p_adaln(aux, t_value1, T_SCALE, ctx)
+    var nr_mod0 = List[ZImageModVecs]()
+    var nr_mod1 = List[ZImageModVecs]()
+    for i in range(NUM_NR):
+        nr_mod0.append(build_l2p_block_modvecs(aux.nr_mod_w[i][], aux.nr_mod_b[i][], adaln0, D, ctx))
+        nr_mod1.append(build_l2p_block_modvecs(aux.nr_mod_w[i][], aux.nr_mod_b[i][], adaln1, D, ctx))
+    var main_mod_b2 = List[ZImageModVecsDevice]()
+    for i in range(MAIN_DEPTH):
+        var m0 = build_l2p_block_modvecs(aux.main_mod_w[i][], aux.main_mod_b[i][], adaln0, D, ctx)
+        var m1 = build_l2p_block_modvecs(aux.main_mod_w[i][], aux.main_mod_b[i][], adaln1, D, ctx)
+        main_mod_b2.append(zimage_modvecs_pack2_to_device(m0, m1, D, ctx))
+
+    # ── per-sample x_seq (patchify) + cap_seq (padded) ────────────────────────
+    var x_t0 = build_l2p_x_seq(aux, noisy_pixel_t0, PIX_H, PIX_W, ctx)
+    var x_t1 = build_l2p_x_seq(aux, noisy_pixel_t1, PIX_H, PIX_W, ctx)
+    var cap_seq0 = _l2p_cap_seq_padded(aux, sa.cap_feats, valid_cap0, ctx)
+    var cap_seq1 = _l2p_cap_seq_padded(aux, sb.cap_feats, valid_cap1, ctx)
+
+    # ── rope: x table shared (both samples 512²); cap per sample; uni2 = rope
+    #    over the CONCATENATED per-sample position lists [x|cap0|x|cap1] ────────
+    var pos0 = build_l2p_positions(N_IMG, HT, WT, CAP_LEN, valid_cap0)
+    var pos1 = build_l2p_positions(N_IMG, HT, WT, CAP_LEN, valid_cap1)
+    var x_pos = pos0[0].copy()
+    var cap_pos0 = pos0[1].copy()
+    var cap_pos1 = pos1[1].copy()
+    var uni2_pos = List[List[Int]]()
+    for i in range(len(x_pos)):
+        uni2_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos0)):
+        uni2_pos.append(cap_pos0[i].copy())
+    for i in range(len(x_pos)):
+        uni2_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos1)):
+        uni2_pos.append(cap_pos1[i].copy())
+    var xr = build_l2p_rope(x_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var x_cos = xr[0].copy(); var x_sin = xr[1].copy()
+    var cr0 = build_l2p_rope(cap_pos0, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cap_cos0 = cr0[0].copy(); var cap_sin0 = cr0[1].copy()
+    var cr1 = build_l2p_rope(cap_pos1, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cap_cos1 = cr1[0].copy(); var cap_sin1 = cr1[1].copy()
+    var ur2 = build_l2p_rope(uni2_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var uni_cos2 = ur2[0].copy(); var uni_sin2 = ur2[1].copy()
+
+    var t_prep = perf_counter_ns()
+
+    # ── identity final layer (f_scale2=zeros[2D]; out0/out1 discarded) ────────
+    var f_scale2_zeros = List[Float32]()
+    for _ in range(2 * D):
+        f_scale2_zeros.append(Float32(0.0))
+    var ident_host = List[Float32]()
+    for _ in range(D * D):
+        ident_host.append(Float32(0.0))
+    for d in range(D):
+        ident_host[d * D + d] = Float32(1.0)
+    var ident_w = Tensor.from_host(ident_host^, [D, D], STDtype.F32, ctx)
+    var zero_b_host = List[Float32]()
+    for _ in range(D):
+        zero_b_host.append(Float32(0.0))
+    var zero_b = Tensor.from_host(zero_b_host^, [D], STDtype.F32, ctx)
+
+    var lora_dev = zimage_lora_set_to_device(lora, ctx)
+    var t_lora = perf_counter_ns()
+
+    # ── masked B=2 DiT forward (last-block hidden = feature map) ──────────────
+    var fwd = zimage_stack_lora_forward_main_device_b2_masked[H, Dh, N_IMG, N_TXT, S](
+        x_t0.copy(), cap_seq0.copy(), x_t1.copy(), cap_seq1.copy(),
+        cap_attn_len0, cap_attn_len1, main_attn_len0, main_attn_len1,
+        nr_blocks, nr_mod0, nr_mod1, cr_blocks, main_blocks, main_mod_b2, lora_dev,
+        f_scale2_zeros.copy(), ident_w, zero_b,
+        x_cos[], x_sin[], cap_cos0[], cap_sin0[], cap_cos1[], cap_sin1[],
+        uni_cos2[], uni_sin2[],
+        D, F, D, EPS, FINAL_EPS, ctx,
+    )
+    var t_fwd = perf_counter_ns()
+
+    # ── split x_final [2S,D] -> per-sample [S,D] -> feature maps ──────────────
+    var xf = fwd.x_final[].to_host(ctx)     # [2S, D]
+    var xf0 = List[Float32]()
+    for i in range(S * D):
+        xf0.append(xf[i])
+    var xf1 = List[Float32]()
+    var base1 = S * D
+    for i in range(S * D):
+        xf1.append(xf[base1 + i])
+    var feat0 = _tokens_to_feat_nchw(xf0, ctx)
+    var feat1 = _tokens_to_feat_nchw(xf1, ctx)
+
+    # ── FROZEN local_decoder forward, ONCE PER SAMPLE (decoder is batch-1) ────
+    var dec_fwd0 = l2p_decoder_forward[PIX_H, PIX_W, HT, WT](
+        dec, noisy_pixel_t0, feat0, ctx
+    )
+    var dec_fwd1 = l2p_decoder_forward[PIX_H, PIX_W, HT, WT](
+        dec, noisy_pixel_t1, feat1, ctx
+    )
+    var pred_h0 = dec_fwd0.pred_nchw.to_host(ctx)
+    var pred_h1 = dec_fwd1.pred_nchw.to_host(ctx)
+    var t_dec = perf_counter_ns()
+
+    # ── JOINT 2N-mean loss (pred = -decoder_out; target = noise - pixel) ──────
+    # inv_n_b2 = 2/(2*npix) = 1/npix = 0.5 * b1's (2/npix) => b2 grad == mean of
+    # the two per-sample b1 grads; loss_b2 = mean(MSE0, MSE1).
+    var inv_n_b2 = Float32(2.0) / Float32(2 * npix)
+    var d_pred0_h = List[Float32]()
+    var d_pred1_h = List[Float32]()
+    for _ in range(npix):
+        d_pred0_h.append(Float32(0.0))
+        d_pred1_h.append(Float32(0.0))
+    var sse0 = 0.0
+    var sse1 = 0.0
+    for i in range(npix):
+        var pred = -pred_h0[i]
+        var target = noise_pix0[i] - pix_h0[i]
+        var diff = pred - target
+        sse0 += Float64(diff) * Float64(diff)
+        d_pred0_h[i] = -inv_n_b2 * diff
+    for i in range(npix):
+        var pred = -pred_h1[i]
+        var target = noise_pix1[i] - pix_h1[i]
+        var diff = pred - target
+        sse1 += Float64(diff) * Float64(diff)
+        d_pred1_h[i] = -inv_n_b2 * diff
+    var mse0 = Float32(sse0 / Float64(npix))
+    var mse1 = Float32(sse1 / Float64(npix))
+    var loss = Float32((sse0 + sse1) / Float64(2 * npix))
+    var d_pred_t0 = Tensor.from_host(d_pred0_h^, [1, PIX_C, PIX_H, PIX_W], STDtype.F32, ctx)
+    var d_pred_t1 = Tensor.from_host(d_pred1_h^, [1, PIX_C, PIX_H, PIX_W], STDtype.F32, ctx)
+    var t_loss = perf_counter_ns()
+
+    # ── FROZEN local_decoder backward, once per sample -> d_feat -> d_x rows ──
+    var d_feat0 = l2p_decoder_backward[PIX_H, PIX_W, HT, WT](
+        dec, dec_fwd0.acts, d_pred_t0, ctx
+    )
+    var d_feat1 = l2p_decoder_backward[PIX_H, PIX_W, HT, WT](
+        dec, dec_fwd1.acts, d_pred_t1, ctx
+    )
+    var d_x0 = _feat_nchw_to_tokens(d_feat0, ctx)   # [S,D] (image rows filled)
+    var d_x1 = _feat_nchw_to_tokens(d_feat1, ctx)   # [S,D]
+    var d_x_full_2s = d_x0.copy()
+    for i in range(len(d_x1)):
+        d_x_full_2s.append(d_x1[i])                 # [2S, D]
+    var t_dbwd = perf_counter_ns()
+
+    # ── masked B=2 DiT backward (NO final layer) -> LoRA grads (mean of B1) ───
+    var grads = zimage_stack_lora_backward_main_device_b2_masked_nofinal[
+        H, Dh, N_IMG, N_TXT, S
+    ](
+        d_x_full_2s, main_attn_len0, main_attn_len1,
+        main_blocks, main_mod_b2, lora_dev,
+        uni_cos2[], uni_sin2[], fwd,
+        D, F, EPS, ctx,
+    )
+    var t_bwd = perf_counter_ns()
+
+    # ── clip + optimize (main adapters only; one optimizer step per b2 step) ──
+    var gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
+    zimage_lora_adamw_step_main_only(
+        lora, grads, k, step_lr, ctx, beta1, beta2, optimizer_eps, weight_decay,
+    )
+    var t_opt = perf_counter_ns()
+
+    var t1 = perf_counter_ns()
+    var secs = Float64(t1 - t0) / 1.0e9
+    var b_absum = Float32(0.0)
+    for i in range(TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL):
+        b_absum += _absum_l2p(lora.ad[i].b)
+
+    print_trainer_progress(
+        String("L2P-b2-lora"), k, run_steps, 2,
+        loss, Float64(gn_before), secs, 0.0,
+        Float64(t1 - train_start_ns) / 1.0e9,
+    )
+    # split-hypothesis check: per-sample MSE (each ~ its own b1 loss); joint = mean.
+    print("[L2P-b2] per-sample MSE s0=", mse0, " s1=", mse1, " joint(mean)=", loss)
+    if grads.nonfinite_lora_grads != 0:
+        print("[L2P-b2] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
+    print("[TIMING-b2 step=", k,
+          "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
+          " lora=", Float32(Float64(t_lora - t_prep) / 1.0e9),
+          " fwd=", Float32(Float64(t_fwd - t_lora) / 1.0e9),
+          " dec=", Float32(Float64(t_dec - t_fwd) / 1.0e9),
+          " loss=", Float32(Float64(t_loss - t_dec) / 1.0e9),
+          " dbwd=", Float32(Float64(t_dbwd - t_loss) / 1.0e9),
+          " bwd=", Float32(Float64(t_bwd - t_dbwd) / 1.0e9),
+          " opt=", Float32(Float64(t_opt - t_bwd) / 1.0e9))
+    return L2PStepResult(loss, Float32(gn_before), Float32(secs), b_absum, grads.nonfinite_lora_grads)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 def main() raises:
     var ctx = DeviceContext()
@@ -1019,6 +1327,32 @@ def main() raises:
             "train_l2p_real: grad_accum_steps>1 is not wired for the LoKr/LoHa/"
             "DoRA/OFT arms — use adapter_algo=lora/locon"
         )
+
+    # ── TRUE batch-2 (row-stacked masked stack): batch_size==2 fans two samples
+    # per optimizer step. L2P is fixed 512² (N_IMG=1024 % 32 == 0) so NO latent
+    # bucketing is needed — the ONLY per-sample variation is caption length, so
+    # the masked b2 stack (per-sample tail mask) is required. Only the plain-LoRA
+    # arm is wired; every other algo and grad-accum>1 fail loud. batch_size==1 is
+    # byte-identical to before (the b1 branch below is untouched). ──────────────
+    var use_b2 = train_cfg.batch_size == 2
+    if train_cfg.batch_size > 2:
+        raise Error(
+            "train_l2p_real: batch_size>2 is not wired — use batch_size=1 (b1) or"
+            " batch_size=2 (row-stacked true batch-2)"
+        )
+    if use_b2 and (lokr_active or loha_active or dora_active or oft_active):
+        raise Error(
+            "train_l2p_real: batch_size=2 is not wired for the LoKr/LoHa/DoRA/OFT"
+            " arms — use adapter_algo=lora/locon"
+        )
+    if use_b2 and accum_steps > 1:
+        raise Error(
+            "train_l2p_real: batch_size=2 + grad_accum_steps>1 is not wired — use"
+            " one or the other"
+        )
+    if use_b2:
+        print("  TRUE batch-2: row-stacked masked stack, 2 samples/optimizer step")
+
     var acc_a = List[List[Float32]]()
     var acc_b = List[List[Float32]]()
     var micro_in_window = 0
@@ -1026,18 +1360,35 @@ def main() raises:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
     for k in range(start_step + 1, run_steps + 1):
-        var slot = (k - 1) % cache.count()
-        var step_seed = UInt64(k)
-        var r = _train_one_step_l2p(
-            k, run_steps, slot, step_seed, cache, aux, dec,
-            nr_blocks, cr_blocks, main_blocks, lora,
-            lokr_active, loha_active, dora_active, oft_active,
-            lokr_masters, loha_masters, direct_dora, direct_oft,
-            direct_targets,
-            step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
-            accum_steps, acc_a, acc_b, micro_in_window,
-            train_start, ctx,
-        )
+        var r: L2PStepResult
+        if use_b2:
+            # round-robin pair; odd tail self-dups via %n (l2p is fixed 512², no
+            # bucketing). Each sample its OWN step seed (2k / 2k+1), mirroring the
+            # zimage b2 per-sample seed derivation.
+            var n = cache.count()
+            var slot0 = (2 * (k - 1)) % n
+            var slot1 = (2 * (k - 1) + 1) % n
+            var seed0 = UInt64(2 * k)
+            var seed1 = UInt64(2 * k + 1)
+            r = _train_one_step_l2p_b2(
+                k, run_steps, slot0, slot1, seed0, seed1, cache, aux, dec,
+                nr_blocks, cr_blocks, main_blocks, lora,
+                step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
+                train_start, ctx,
+            )
+        else:
+            var slot = (k - 1) % cache.count()
+            var step_seed = UInt64(k)
+            r = _train_one_step_l2p(
+                k, run_steps, slot, step_seed, cache, aux, dec,
+                nr_blocks, cr_blocks, main_blocks, lora,
+                lokr_active, loha_active, dora_active, oft_active,
+                lokr_masters, loha_masters, direct_dora, direct_oft,
+                direct_targets,
+                step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
+                accum_steps, acc_a, acc_b, micro_in_window,
+                train_start, ctx,
+            )
         if k == start_step + 1:
             first_loss = r.loss
         last_loss = r.loss
