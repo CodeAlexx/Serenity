@@ -72,6 +72,9 @@ from serenitymojo.models.ernie.ernie_stack_lora import (
     ErnieLoraSet, ErnieLoraGrads, build_ernie_lora_set,
     ernie_lora_set_to_device,
     ernie_stack_lora_forward_resident_device, ernie_stack_lora_backward_resident_device,
+    ErnieStackForwardB2,
+    ernie_stack_lora_forward_resident_device_b2,
+    ernie_stack_lora_backward_resident_device_b2,
     ernie_stack_direct_dora_forward_resident_device,
     ernie_stack_direct_dora_backward_resident_device,
     ernie_stack_direct_oft_forward_resident_device,
@@ -342,6 +345,24 @@ def _mse_loss_grad(pred: List[Float32], target: List[Float32]) raises -> _LossGr
         sse += Float64(diff) * Float64(diff)
         d_out.append(diff * inv_n)
     return _LossGrad(Float32(sse / Float64(len(pred))), d_out^)
+
+
+# 0.5-scaled MSE for the TRUE batch-2 joint 2N-mean loss (mirrors krea2
+# _mse_half_loss). Each per-sample loss/grad is halved; loss_b2 = half0 + half1 =
+# mean(loss0, loss1) and the 0.5 grad scale turns the batch backward's SUM over the
+# two row halves into the MEAN = the grad-accum=2 oracle. loss/d_out ×2 recover the
+# comparable B=1 values.
+def _mse_half_loss_grad(pred: List[Float32], target: List[Float32]) raises -> _LossGrad:
+    if len(pred) != len(target):
+        raise Error("_mse_half_loss_grad: pred/target length mismatch")
+    var sse = Float64(0.0)
+    var d_out = List[Float32]()
+    var inv_n = Float32(1.0) / Float32(len(pred))   # = 0.5 * (2/N)
+    for i in range(len(pred)):
+        var diff = pred[i] - target[i]
+        sse += Float64(diff) * Float64(diff)
+        d_out.append(diff * inv_n)
+    return _LossGrad(Float32(0.5) * Float32(sse / Float64(len(pred))), d_out^)
 
 
 # ── deterministic gaussian noise (Box-Muller on a PCG stream), F32 ────────────
@@ -886,6 +907,32 @@ def main() raises:
     if use_grad_accum and (direct_active or carrier_active):
         raise Error("ERNIE: grad_accum_steps>1 not wired for LyCORIS (lokr/loha/dora/oft) this wave")
 
+    # ── TRUE batch-2 (row-stacked; default-off when batch_size==1) ────────────
+    # batch_size==2 processes two samples per optimizer step through the b2
+    # resident-device stack (joint 2N-mean loss → batch gradient), fed to the SAME
+    # host-list plain-LoRA fused-AdamW arm. Wired ONLY for the standard plain-LoRA
+    # loop this wave; the LyCORIS (lokr/loha/dora/oft) arms and grad accumulation
+    # are NOT b2-wired (fail loud, same fence style as grad-accum). batch_size==1
+    # stays byte-identical (the whole b2 branch is guarded behind use_b2).
+    var use_b2 = train_cfg.batch_size == 2
+    if train_cfg.batch_size > 2:
+        raise Error(
+            String("ERNIE: batch_size=") + String(train_cfg.batch_size)
+            + " unsupported — only 1 or 2 (TRUE batch-2 is the first vertical)"
+        )
+    if use_b2:
+        if direct_active or carrier_active:
+            raise Error(
+                "ERNIE: batch_size=2 is not wired for the LyCORIS (lokr/loha/dora/oft)"
+                " arms — use network_algorithm=lora on the host plain-LoRA path"
+            )
+        if use_grad_accum:
+            raise Error(
+                "ERNIE: batch_size=2 + grad_accum_steps>1 not wired together this"
+                " wave — batch_size=2 IS a 2-sample batch; set grad_accum_steps=1"
+            )
+        print("  TRUE batch-2: two samples row-stacked per optimizer step")
+
     var direct_targets = ERNIE_LYCORIS_TGT_ATTN if train_cfg.lokr_targets == ERNIE_LYCORIS_TGT_ATTN else 2
     var lokr_masters = empty_ernie_lokr_set()
     var loha_masters = empty_ernie_loha_set()
@@ -1017,7 +1064,12 @@ def main() raises:
 
     for step in range(run_steps):
         var step_t0 = perf_counter()
-        var cache_idx = step % len(cache_files)
+        # TRUE batch-2: each optimizer step consumes a NON-OVERLAPPING pair
+        # (order[2k], order[2k+1]); odd tail wraps via %len = self-dup. b1:
+        # pair_lead == step (byte-identical sample/sigma/noise stream to the pre-b2
+        # loop). See krea2 train_krea2.mojo:3765.
+        var pair_lead = (2 * step) if use_b2 else step
+        var cache_idx = pair_lead % len(cache_files)
         var cs = SafeTensors.open(cache_files[cache_idx])
 
         var latent_cache = _read_cache_tensor(cs, String("latent"), ctx)
@@ -1059,7 +1111,7 @@ def main() raises:
         rng_state = sigma_draw[1]
         var sigma = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
         var n_lat = N_IMG * IN_CH
-        var noise = _host_noise(n_lat, SEED ^ (UInt64(step) + 1))
+        var noise = _host_noise(n_lat, SEED ^ (UInt64(pair_lead) + 1))
         # noisy = noise*sigma + latent*(1-sigma)  (image-token space; same packing)
         var target = List[Float32]()
         for i in range(n_lat):
@@ -1152,20 +1204,89 @@ def main() raises:
             # dev_p as the live weight buffer, zimage ZIMAGE_V2_ENGINE
             # pattern), not a simple move.
             var lora_dev = ernie_lora_set_to_device(lora, STDtype.BF16, ctx)
-            var fwd = ernie_stack_lora_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
-                noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
-                f_scale.copy(), f_shift.copy(), rope[0], rope[1],
-                D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
-                real_len,
-            )
-            var lg = _mse_loss_grad(fwd.out, target)
-            loss = lg.loss
-            var grads = ernie_stack_lora_backward_resident_device[H, Dh, N_IMG, N_TXT, S](
-                lg.d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
-                f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd,
-                D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
-                real_len,
-            )
+            var grads: ErnieLoraGrads
+            if use_b2:
+                # ── TRUE batch-2: fetch the pair partner order[2k+1] (own cache,
+                # sigma, noise, rope, AdaLN source) and row-stack both samples ──
+                var idx1 = (pair_lead + 1) % len(cache_files)
+                var cs1 = SafeTensors.open(cache_files[idx1])
+                var latent1 = _read_cache_tensor(cs1, String("latent"), ctx).to_host_bf16(ctx)
+                var text_cache1 = _read_cache_tensor(cs1, String("text_embedding"), ctx)
+                var text1 = text_cache1.to_host_bf16(ctx)
+                var tdims1 = _cache_dims(cs1, String("text_embedding"))
+                var t_cache1 = tdims1[1]
+                var img_tokens1 = _latent_to_img_tokens(latent1)
+                var txt_tokens1 = _text_to_txt_tokens(text1, t_cache1)
+
+                var real_len1 = N_TXT
+                if _cache_has(cs1, String("text_real_len")):
+                    var rl_t1 = _read_cache_tensor(cs1, String("text_real_len"), ctx)
+                    var rl_h1 = rl_t1.to_host(ctx)
+                    real_len1 = Int(rl_h1[0])
+                if real_len1 < 1:
+                    real_len1 = 1
+                if real_len1 > N_TXT:
+                    real_len1 = N_TXT
+
+                var rope1 = build_ernie_rope_tables[N_IMG, N_TXT, H, Dh](
+                    IMG_H, IMG_W, real_len1, ctx, STDtype.F32
+                )
+
+                var sigma_draw1 = _sample_sigma_idx(rng_state)
+                var sigma_idx1 = sigma_draw1[0]
+                rng_state = sigma_draw1[1]
+                var sigma1 = Float32(sigma_idx1 + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+                var noise1 = _host_noise(n_lat, SEED ^ (UInt64(pair_lead + 1) + 1))
+                var target1 = List[Float32]()
+                for i in range(n_lat):
+                    target1.append(noise1[i] - img_tokens1[i])
+                var noisy_tokens1 = List[Float32]()
+                for i in range(n_lat):
+                    noisy_tokens1.append(noise1[i] * sigma1 + img_tokens1[i] * (Float32(1.0) - sigma1))
+
+                var src1 = _shared_adaln_source(base, sigma_idx1, ctx)
+                var mv1 = src1[0].copy()
+                var f_scale1 = src1[1].copy()
+                var f_shift1 = src1[2].copy()
+
+                var fwd_b2 = ernie_stack_lora_forward_resident_device_b2[H, Dh, N_IMG, N_TXT, S](
+                    noisy_tokens.copy(), txt_tokens.copy(),
+                    noisy_tokens1.copy(), txt_tokens1.copy(),
+                    base, blocks, lora_dev, mv, mv1,
+                    f_scale.copy(), f_shift.copy(), f_scale1.copy(), f_shift1.copy(),
+                    rope[0], rope[1], rope1[0], rope1[1],
+                    D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                    real_len, real_len1,
+                )
+                # joint 2N-mean MSE: each per-sample loss/grad halved → summed.
+                var lg0 = _mse_half_loss_grad(fwd_b2.out0, target)
+                var lg1 = _mse_half_loss_grad(fwd_b2.out1, target1)
+                loss = lg0.loss + lg1.loss
+                grads = ernie_stack_lora_backward_resident_device_b2[H, Dh, N_IMG, N_TXT, S](
+                    lg0.d_out, lg1.d_out,
+                    noisy_tokens.copy(), txt_tokens.copy(),
+                    noisy_tokens1.copy(), txt_tokens1.copy(),
+                    base, blocks, lora_dev, mv, mv1,
+                    f_scale.copy(), f_shift.copy(), f_scale1.copy(), f_shift1.copy(),
+                    rope[0], rope[1], rope1[0], rope1[1], fwd_b2,
+                    D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                    real_len, real_len1,
+                )
+            else:
+                var fwd = ernie_stack_lora_forward_resident_device[H, Dh, N_IMG, N_TXT, S](
+                    noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
+                    f_scale.copy(), f_shift.copy(), rope[0], rope[1],
+                    D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                    real_len,
+                )
+                var lg = _mse_loss_grad(fwd.out, target)
+                loss = lg.loss
+                grads = ernie_stack_lora_backward_resident_device[H, Dh, N_IMG, N_TXT, S](
+                    lg.d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
+                    f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd,
+                    D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
+                    real_len,
+                )
 
             # ── gradient accumulation (item 2h; default-off when N==1) ────────
             # SUM this micro-step's grads into the window; on the boundary MEAN
