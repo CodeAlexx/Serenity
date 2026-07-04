@@ -357,6 +357,13 @@ def validate_hidream_adapter_config(cfg: TrainConfig) raises:
             + adapter_algo_name(cfg.adapter_algo)
             + String(" is not wired; supported here: lora, locon, loha, lokr, dora, oft")
         )
+    # Inline sampling is not wired for HiDream O1: fail loud rather than
+    # silently ignore a sample-prompt config the launcher believed was honored.
+    if cfg.validation_prompts_file != String(""):
+        raise Error(
+            "inline sampling not wired for hidream_o1; remove"
+            " validation_prompts_file or use the standalone sampler"
+        )
 
 
 def _hidream_block_in_dims() raises -> List[Int]:

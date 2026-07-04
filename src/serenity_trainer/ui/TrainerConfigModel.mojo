@@ -15,16 +15,16 @@ comptime UI_SECTION_LOGS: Int32 = 10
 comptime UI_SECTION_CAPTIONER: Int32 = 11
 comptime SERENITY_TRAINER_OUTPUT_DIR = "/home/alex/mojodiffusion/output"
 comptime SERENITY_BOXJANA_DATASET_DIR = "/home/alex/1/datasets/boxjana"
-comptime SERENITY_BOXJANA_KLEIN_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/alina_klein9b"  # was boxjana single-file (MISSING, 06-11 audit); alina = the engine-verified cache
+comptime SERENITY_BOXJANA_KLEIN_CACHE = "/home/alex/flame-diffusion-archive/klein-trainer/cache/eri2_klein9b_512"  # verified 75-sample klein9b 512 cache (2026-07-03 recon); was alina_klein9b (06-11 audit)
 comptime SERENITY_KLEIN9B_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/flux-2-klein-base-9b.safetensors"
 # Klein 9B config-driven runner (serenitymojo train_klein_real.mojo): the VAE
 # and PRECACHED sample-prompt config mirror serenitymojo/configs/klein9b.json
 # (the trainer's own default config; validate_klein_train_config re-asserts
 # every arch dim at startup).
 comptime SERENITY_KLEIN_VAE = "/home/alex/.serenity/models/vaes/flux2-vae.safetensors"
-comptime SERENITY_KLEIN_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/klein9b_alina_samples.json"
+comptime SERENITY_KLEIN_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/klein_samples.json"
 comptime SERENITY_IDEOGRAM4_BASE = "/home/alex/.serenity/models/ideogram-4-fp8"
-comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/trainings/ideogram4_giger_cache/cache.safetensors"
+comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/serenity-trainer/output/eri2_ideogram4_cache.safetensors"  # verified 3.2GB cache (2026-07-03 recon); was ideogram4_giger_cache
 # Krea-2 Raw — trainer lives in mojodiffusion because it is the shared
 # model/runtime vertical; Serenity launches it as a live trainer binary.
 comptime SERENITY_KREA2_CHECKPOINT = "/home/alex/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494/raw.safetensors"
@@ -38,7 +38,7 @@ comptime SERENITY_KREA2_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/
 # path is a stage-A dir (images.safetensors + caption.<i>.txt from
 # scripts/ideogram4_stage_images.py); giger stage = the campaign-verified one.
 comptime SERENITY_HIDREAM_CHECKPOINT = "/home/alex/HiDream-O1-Image-Dev-weights"
-comptime SERENITY_HIDREAM_STAGE = "/home/alex/trainings/ideogram4_giger_stage"
+comptime SERENITY_HIDREAM_STAGE = "/home/alex/serenity-trainer/output/eri2_ideogram4_staged"  # verified 115-sample exact stage-A format (2026-07-03 recon); was ideogram4_giger_stage
 
 # Campaign-verified trainable verticals (serenitymojo train_<m>_real.mojo runners).
 # Checkpoints / caches mirror /home/alex/mojodiffusion/serenitymojo/configs/<m>.json
@@ -60,15 +60,18 @@ comptime SERENITY_ZIMAGE_CHECKPOINT = "/home/alex/.serenity/models/zimage_base/t
 # (cap 224/256). The EriDiffusion 64x64/seq-512 caches raise "unsupported
 # Z-Image production bucket" (measured 2026-06-09); this is the trainer's own
 # prepare-output location — fails loud ("does not exist") until prepared.
-comptime SERENITY_ZIMAGE_CACHE = "/home/alex/mojodiffusion/output/alina_zimage_cache"
+comptime SERENITY_ZIMAGE_CACHE = "/home/alex/mojodiffusion/output/alina_zimage_cache"  # MISSING - needs restaged dataset (576x448/704x384 buckets); source AlinaAignatova lost (2026-07-03 recon)
 comptime SERENITY_L2P_CHECKPOINT = "/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors"
 # No prepared L2P pixel cache exists yet (2026-06-09); trainer preflight fails
 # loud until one is built at this path.
 comptime SERENITY_L2P_CACHE = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/boxjana_l2p_512"  # was alina_l2p_cache (MISSING, 06-11 audit)
 comptime SERENITY_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/sample_prompts.example.json"
-comptime SERENITY_ZIMAGE_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/zimage_alina_samples.json"
-comptime SERENITY_ANIMA_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/anima_alina_samples.json"
-comptime SERENITY_ERNIE_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/ernie_image_samples.json"
+comptime SERENITY_ZIMAGE_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/zimage_samples.json"
+comptime SERENITY_ANIMA_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/anima_samples.json"
+comptime SERENITY_ERNIE_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/ernie_samples.json"
+comptime SERENITY_CHROMA_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/chroma_samples.json"
+comptime SERENITY_SDXL_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/sdxl_samples.json"
+comptime SERENITY_IDEOGRAM4_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/ideogram4_samples.json"
 
 
 struct TrainerUIConcept(Copyable, Movable):
@@ -1253,7 +1256,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             String("{\n  \"model_type\": \"chroma\",\n")
             + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
             + String("  \"vae\": \"") + String(SERENITY_CHROMA_VAE) + String("\",\n")
-            + String("  \"validation_prompts_file\": \"") + String(SERENITY_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_CHROMA_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"inner_dim\": 3072,\n  \"in_channels\": 64,\n")
             + String("  \"joint_attention_dim\": 4096,\n  \"out_channels\": 64,\n")
             + String("  \"num_double\": 19,\n  \"num_single\": 38,\n")
@@ -1329,7 +1332,9 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
         return (
             String("{\n  \"model_type\": \"l2p\",\n")
             + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
-            + String("  \"validation_prompts_file\": \"") + String(SERENITY_ZIMAGE_SAMPLE_PROMPTS) + String("\",\n")
+            # No validation_prompts_file: L2P inline sampling is not wired, so
+            # validate_l2p_train_config (train_l2p_real.mojo) fails loud on a
+            # non-empty key. Use the standalone sampler for L2P validation.
             + String("  \"inner_dim\": 3840,\n  \"in_channels\": 3,\n")
             + String("  \"joint_attention_dim\": 2560,\n  \"out_channels\": 3,\n")
             + String("  \"num_double\": 0,\n  \"num_single\": 30,\n")
@@ -1348,7 +1353,7 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             String("{\n  \"model_type\": \"sdxl\",\n")
             + String("  \"checkpoint\": \"") + cfg.base_model_name.copy() + String("\",\n")
             + String("  \"vae\": \"") + String(SERENITY_SDXL_VAE) + String("\",\n")
-            + String("  \"validation_prompts_file\": \"") + String(SERENITY_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_SDXL_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"in_channels\": 4,\n  \"out_channels\": 4,\n")
             + String("  \"model_channels\": 320,\n  \"channel_mult\": [1, 2, 4],\n")
             + String("  \"num_res_blocks\": 2,\n  \"context_dim\": 2048,\n")
@@ -1393,6 +1398,12 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
         # optimizer*/caption_dropout_prob).
         return (
             String("{\n  \"model_type\": \"ideogram4\",\n")
+            # Standard sample-prompt source: consumed by Ideogram4LiveTrainer as
+            # the argv-17 fallback when the inline sampler is enabled (it reads
+            # run_cfg.levers.validation_prompts_file). Timing-inert with the
+            # sampler off. Delivered only when the levers JSON is passed
+            # (trainer_ui_ideogram4_levers_set gates argv 11).
+            + String("  \"validation_prompts_file\": \"") + String(SERENITY_IDEOGRAM4_SAMPLE_PROMPTS) + String("\",\n")
             + String("  \"loss_fn\": \"") + cfg.loss_fn.copy() + String("\",\n")
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")

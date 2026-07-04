@@ -71,6 +71,7 @@ from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 
 from serenitymojo.models.flux.weights import load_flux_stack_base
+from serenitymojo.models.flux.flux_stack import FluxStackBase
 from serenitymojo.models.flux.flux_stack_lora import (
     FluxLoraSet, FluxLoraGradSet, FluxStackLoraSet, build_flux_lora_set,
     build_flux_stack_lora_set, empty_flux_stack_lora_set, total_stack_adapters,
@@ -118,6 +119,9 @@ from serenitymojo.training.sample_prompt_config import (
     validate_step_sample_cadence, should_sample_completed_step,
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+    caps_sampling_active, assert_enabled_sample_prompts,
+    warn_legacy_cached_caption_sampling,
 )
 from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED,
@@ -510,6 +514,142 @@ def _pack_latents(lat: List[Float32]) -> List[Float32]:
     return out^
 
 
+# ── per-prompt validation caps (serenity.sample_prompts.v1) ──────────────────
+# FLUX conditioning is TWO tensors: T5 txt_tokens [N_TXT,TXT_CH] and CLIP
+# clip_pool [VEC_DIM]. A single cap_cache .bin cannot hold both, so caps_pos
+# points at a CACHE-ENTRY-SHAPED safetensors carrying the SAME keys the train
+# loop reads (t5_embed, clip_pool), and this helper REUSES the loop's exact
+# pad/truncate so each sample is the real prompt (NOT the step's cached caption).
+# FLUX.1-dev is guidance-DISTILLED (single forward, no CFG uncond) so there is no
+# caps_neg; prompt.cfg maps to the distillation `guidance` scalar.
+struct _FluxCaps(Movable):
+    var txt: List[Float32]
+    var pool: List[Float32]
+
+    def __init__(out self, var txt: List[Float32], var pool: List[Float32]):
+        self.txt = txt^
+        self.pool = pool^
+
+
+def _flux_check_caps_shape(path: String, label: String) raises:
+    if path == String(""):
+        raise Error(String("Flux sample prompt ") + label + String(": empty caps path"))
+    var st = SafeTensors.open(path)
+    var t5_info = st.tensor_info(String("t5_embed"))
+    if len(t5_info.shape) < 2 or Int(t5_info.shape[len(t5_info.shape) - 1]) != TXT_CH:
+        raise Error(
+            String("Flux caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors keys 't5_embed' [1,LT,")
+            + String(TXT_CH) + String("] (LT<=") + String(N_TXT)
+            + String(", zero-padded to ") + String(N_TXT) + String(") + 'clip_pool' [")
+            + String(VEC_DIM) + String("]; got t5_embed last-dim ")
+            + String(Int(t5_info.shape[len(t5_info.shape) - 1]))
+        )
+    var clip_info = st.tensor_info(String("clip_pool"))
+    var clip_numel = 1
+    for i in range(len(clip_info.shape)):
+        clip_numel *= Int(clip_info.shape[i])
+    if clip_numel != VEC_DIM:
+        raise Error(
+            String("Flux caps for prompt '") + label + String("' at ") + path
+            + String(": expected key 'clip_pool' numel ") + String(VEC_DIM)
+            + String("; got ") + String(clip_numel)
+        )
+
+
+def _flux_caps_from_file(path: String, label: String, ctx: DeviceContext) raises -> _FluxCaps:
+    if path == String(""):
+        raise Error(String("Flux sample prompt ") + label + String(": empty caps path"))
+    var st = SafeTensors.open(path)
+    var t5_info = st.tensor_info(String("t5_embed"))
+    if len(t5_info.shape) < 2 or Int(t5_info.shape[len(t5_info.shape) - 1]) != TXT_CH:
+        raise Error(
+            String("Flux caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors keys 't5_embed' [1,LT,")
+            + String(TXT_CH) + String("] (LT<=") + String(N_TXT)
+            + String(", zero-padded to ") + String(N_TXT) + String(") + 'clip_pool' [")
+            + String(VEC_DIM) + String("]; got t5_embed last-dim ")
+            + String(Int(t5_info.shape[len(t5_info.shape) - 1]))
+        )
+    var clip_pool_cache = _cache_tensor(st, String("clip_pool"), ctx)
+    var clip_pool = _host_f32_for_step_math(clip_pool_cache, ctx)
+    if len(clip_pool) != VEC_DIM:
+        raise Error(String("Flux sample prompt ") + label + String(": caps clip_pool length ") + String(len(clip_pool)) + String(" != ") + String(VEC_DIM))
+    var t5_seq = Int(t5_info.shape[len(t5_info.shape) - 2])
+    var t5_cache = _cache_tensor(st, String("t5_embed"), ctx)
+    var t5_flat = _host_f32_for_step_math(t5_cache, ctx)
+    var txt = List[Float32]()
+    for r in range(N_TXT):
+        if r < t5_seq:
+            for c in range(TXT_CH):
+                txt.append(t5_flat[r * TXT_CH + c])
+        else:
+            for _ in range(TXT_CH):
+                txt.append(Float32(0.0))
+    return _FluxCaps(txt^, clip_pool^)
+
+
+def _flux_sample_prompt_config_for_sampler(sample_file: String) raises -> SamplePromptConfig:
+    if sample_file == String(""):
+        raise Error("Flux trainer caps sampling requires validation_prompts_file")
+    var cfg = read_sample_prompt_config(sample_file)
+    assert_enabled_sample_prompts(cfg, String("Flux"))
+    return cfg^
+
+
+def _flux_preflight_sample_caps(sample_cfg: SamplePromptConfig) raises:
+    var checked = 0
+    for i in range(len(sample_cfg.prompts)):
+        var p = sample_cfg.prompts[i].copy()
+        if not p.enabled:
+            continue
+        if p.frames != 1:
+            raise Error(String("Flux sample prompt ") + p.label + String(": only single-frame image samples supported"))
+        if p.width != LAT_W * 8 or p.height != LAT_H * 8:
+            raise Error(
+                String("Flux sample prompt ") + p.label + String(": requests ")
+                + String(p.width) + String("x") + String(p.height)
+                + String(" but this binary samples ") + String(LAT_W * 8)
+                + String("x") + String(LAT_H * 8)
+            )
+        _flux_check_caps_shape(p.caps_pos, p.label)
+        checked += 1
+    if checked == 0:
+        raise Error("Flux trainer requires at least one enabled validation prompt when caps sampling is enabled")
+
+
+def _flux_run_sample_caps(
+    base: FluxStackBase,
+    mut loader: TurboPlannedLoader,
+    lora: FluxLoraSet,
+    txt_tokens: List[Float32],
+    clip_pool: List[Float32],
+    cos: List[Float32],
+    sin: List[Float32],
+    samples_dir: String,
+    step: Int,
+    prompt: SamplePrompt,
+    seed: UInt64,
+    ctx: DeviceContext,
+) raises:
+    var sample_packed = flux_sample_offload[
+        H, Dh, N_IMG, N_TXT, S, IN_CH, OUT_CH
+    ](
+        base, loader, lora,
+        txt_tokens.copy(), clip_pool.copy(), cos.copy(), sin.copy(),
+        prompt.cfg, prompt.steps, seed,
+        D, FMLP, TXT_CH, T_DIM, VEC_DIM, EPS, ctx,
+    )
+    var sample_png = (
+        samples_dir + String("/step_") + String(step)
+        + String("_") + prompt.label + String(".png")
+    )
+    flux_decode_packed_to_png[
+        N_IMG, HT, WT, LAT_H, LAT_W, LAT_C
+    ](sample_packed, String(VAE_PATH), sample_png, ctx)
+    print("[Flux-lora] caps sample step=", step, " prompt=", prompt.label, " -> ", sample_png)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -548,8 +688,22 @@ def main() raises:
     # conditioning (txt_tokens + clip_pool) the current step already loaded — see
     # flux_sample_resident.mojo header (v1 conditioning).
     var samples_dir = String(LORA_DIR) + String("/samples")
+    # STANDARD sample-prompts contract: caps sampling is ACTIVE when the config
+    # names a validation_prompts_file; load+preflight per-prompt caps (fail loud
+    # before the run). Otherwise the seam uses the legacy cached-caption render
+    # with a LOUD warning.
+    var caps_sample_file = sample_cadence.sample_definition_file_name
+    var caps_active = caps_sampling_active(caps_sample_file)
+    var sample_cfg = SamplePromptConfig()
     if sample_enabled:
         makedirs(samples_dir, exist_ok=True)
+        if caps_active:
+            sample_cfg = _flux_sample_prompt_config_for_sampler(caps_sample_file)
+            _flux_preflight_sample_caps(sample_cfg)
+            print("[cadence] sample-during-training WIRED (caps) -> ", samples_dir,
+                  " prompts=", len(sample_cfg.prompts), " file=", caps_sample_file)
+        else:
+            print("[cadence] sample-during-training WIRED (legacy cached-caption) -> ", samples_dir)
     var output_lora_path = flux_output_lora_path_from_train_config(train_cfg, run_steps)
     _mkdir_parent(output_lora_path)
 
@@ -1060,23 +1214,40 @@ def main() raises:
             print(
                 "[cadence] sample due at completed_step=", k,
                 " sample_file=", sample_cadence.sample_definition_file_name,
-                " — denoising", SAMPLE_STEPS, "steps (re-streams blocks)",
+                " — denoising (re-streams blocks)",
             )
-            var sample_packed = flux_sample_offload[
-                H, Dh, N_IMG, N_TXT, S, IN_CH, OUT_CH
-            ](
-                base, loader, lora,
-                txt_tokens.copy(), clip_pool.copy(), cos.copy(), sin.copy(),
-                GUIDANCE, SAMPLE_STEPS, SAMPLE_SEED + UInt64(k),
-                D, FMLP, TXT_CH, T_DIM, VEC_DIM, EPS, ctx,
-            )
-            var sample_png = (
-                samples_dir + String("/step_") + String(k) + String(".png")
-            )
-            flux_decode_packed_to_png[
-                N_IMG, HT, WT, LAT_H, LAT_W, LAT_C
-            ](sample_packed, String(VAE_PATH), sample_png, ctx)
-            print("[Flux-lora] sample step=", k, " -> ", sample_png)
+            if caps_active:
+                # Prompt-faithful: one render per ENABLED prompt, conditioned on
+                # THAT prompt's caps (T5 txt + CLIP pool) not the cached caption.
+                for pi in range(len(sample_cfg.prompts)):
+                    var prompt = sample_cfg.prompts[pi].copy()
+                    if not prompt.enabled:
+                        continue
+                    var caps = _flux_caps_from_file(prompt.caps_pos, prompt.label, ctx)
+                    _flux_run_sample_caps(
+                        base, loader, lora, caps.txt, caps.pool,
+                        cos.copy(), sin.copy(), samples_dir, k, prompt,
+                        prompt.seed + UInt64(pi), ctx,
+                    )
+            else:
+                # Legacy: reuse THIS step's cached caption embeds (txt_tokens +
+                # clip_pool) — NOT a prompt-faithful validation.
+                warn_legacy_cached_caption_sampling(String("Flux"))
+                var sample_packed = flux_sample_offload[
+                    H, Dh, N_IMG, N_TXT, S, IN_CH, OUT_CH
+                ](
+                    base, loader, lora,
+                    txt_tokens.copy(), clip_pool.copy(), cos.copy(), sin.copy(),
+                    GUIDANCE, SAMPLE_STEPS, SAMPLE_SEED + UInt64(k),
+                    D, FMLP, TXT_CH, T_DIM, VEC_DIM, EPS, ctx,
+                )
+                var sample_png = (
+                    samples_dir + String("/step_") + String(k) + String(".png")
+                )
+                flux_decode_packed_to_png[
+                    N_IMG, HT, WT, LAT_H, LAT_W, LAT_C
+                ](sample_packed, String(VAE_PATH), sample_png, ctx)
+                print("[Flux-lora] sample step=", k, " -> ", sample_png)
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)

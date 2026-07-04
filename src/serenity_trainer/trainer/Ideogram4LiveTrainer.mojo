@@ -39,6 +39,7 @@ from std.os import makedirs
 from std.sys import argv
 
 from serenitymojo.io.train_config_reader import read_model_config
+from serenitymojo.training.sample_prompt_config import read_sample_prompt_config
 
 from serenity_trainer.trainer.Ideogram4LoRATrainer import (
     Ideogram4LoRATrainRunConfig,
@@ -261,8 +262,49 @@ def main() raises:
         run_cfg.sample_seed = sample_seed
     if sample_resolution > 0:
         run_cfg.sample_resolution = sample_resolution
+    # Read the levers config FIRST (argv 11) so its standard
+    # validation_prompts_file key (io/train_config_reader.mojo:793) is available
+    # as a sample-prompt source below.
+    if levers_config_path.byte_length() > 0:
+        # Lever keys (loss_fn / min_snr_gamma_flow / ema_* / optimizer* /
+        # caption_dropout_prob fallback) come from the JSON; the shared recipe
+        # scalars stay argv-owned (the trainer syncs them from `cfg` above).
+        run_cfg.levers = read_model_config(levers_config_path)
+        print(
+            "[Ideogram4-lora] levers config ", levers_config_path,
+            " | loss_fn ", run_cfg.levers.loss_fn,
+            " | min_snr_gamma_flow ", run_cfg.levers.min_snr_gamma_flow,
+            " | optimizer ", run_cfg.levers.optimizer,
+            " | ema_enabled ", run_cfg.levers.ema_enabled,
+            " | caption_dropout_prob ", run_cfg.levers.caption_dropout_prob,
+        )
+
+    # Sample-prompt source. argv 17 (sample_prompt_json) is the explicit
+    # override; when it is absent the levers config's standard
+    # validation_prompts_file supplies the inline sampler prompts. ideogram4 is
+    # AI-toolkit-oracle, so this only ADDS the standard file source — no argv or
+    # key is renamed. The file is consulted only when the inline sampler is
+    # enabled (argv 12 > 0); with sampling off the key is timing-inert and
+    # silently ignored (it configures the sampler, not a mistraining risk).
     if sample_prompt_json.byte_length() > 0:
         run_cfg.sample_prompts.append(sample_prompt_json.copy())
+    elif (
+        run_cfg.sample_every_steps > 0
+        and run_cfg.levers.validation_prompts_file.byte_length() > 0
+    ):
+        var spc = read_sample_prompt_config(run_cfg.levers.validation_prompts_file)
+        for pi in range(len(spc.prompts)):
+            var p = spc.prompts[pi].copy()
+            if p.enabled:
+                run_cfg.sample_prompts.append(p.prompt.copy())
+        print(
+            "[Ideogram4-lora] inline sampler prompts from levers"
+            " validation_prompts_file ",
+            run_cfg.levers.validation_prompts_file,
+            " | count ",
+            len(run_cfg.sample_prompts),
+        )
+
     if run_cfg.resume_lora_path.byte_length() > 0:
         print("[Ideogram4-lora] resume LoRA ", run_cfg.resume_lora_path)
     if run_cfg.sample_every_steps > 0:
@@ -279,19 +321,6 @@ def main() raises:
             run_cfg.sample_resolution,
             " | prompt_json_count ",
             len(run_cfg.sample_prompts),
-        )
-    if levers_config_path.byte_length() > 0:
-        # Lever keys (loss_fn / min_snr_gamma_flow / ema_* / optimizer* /
-        # caption_dropout_prob fallback) come from the JSON; the shared recipe
-        # scalars stay argv-owned (the trainer syncs them from `cfg` above).
-        run_cfg.levers = read_model_config(levers_config_path)
-        print(
-            "[Ideogram4-lora] levers config ", levers_config_path,
-            " | loss_fn ", run_cfg.levers.loss_fn,
-            " | min_snr_gamma_flow ", run_cfg.levers.min_snr_gamma_flow,
-            " | optimizer ", run_cfg.levers.optimizer,
-            " | ema_enabled ", run_cfg.levers.ema_enabled,
-            " | caption_dropout_prob ", run_cfg.levers.caption_dropout_prob,
         )
 
     var ctx = DeviceContext()

@@ -169,6 +169,7 @@ from serenitymojo.training.sample_prompt_config import (
     validate_step_sample_cadence, should_sample_completed_step,
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+    caps_sampling_active, warn_legacy_cached_caption_sampling,
 )
 from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_ONLY,
@@ -3831,6 +3832,20 @@ def main() raises:
             print(
                 "[cadence] Z-Image sampler is split-process; run request after trainer memory is released",
             )
+            # STANDARD sample-prompts contract for Z-Image: the prompt-faithful
+            # validation is the split-process sample_request queued above (it
+            # carries validation_prompts_file to the standalone generator, which
+            # encodes the REAL prompts with its own Qwen3 encoder). The in-process
+            # render below is ALWAYS a cached-caption preview (cache slot 0), so
+            # warn LOUDLY that it is not a prompt-faithful validation (MJ-1045).
+            if caps_sampling_active(sample_cadence.sample_definition_file_name):
+                print(
+                    "[Z-Image] prompt-faithful validation -> queued split-process sample_request",
+                    " (validation_prompts_file=", sample_cadence.sample_definition_file_name,
+                    "); the in-process render below is a cached-caption PREVIEW only",
+                )
+            else:
+                warn_legacy_cached_caption_sampling(String("Z-Image"))
             # ── TRUE in-process sample render DURING training ──
             # Renders a PNG inline from the live LoRA + frozen base (NO second
             # model load), reusing the cached eri sample's REAL `vrtlEri2, ...`

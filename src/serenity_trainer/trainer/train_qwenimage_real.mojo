@@ -140,6 +140,9 @@ from serenitymojo.training.sample_prompt_config import (
     validate_step_sample_cadence, should_sample_completed_step,
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+    caps_sampling_active, assert_enabled_sample_prompts,
+    warn_legacy_cached_caption_sampling,
 )
 from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_ONLY,
@@ -561,6 +564,126 @@ def _qwen_run_sample(
     print("[QwenImage-lora] sample step=", step, " -> ", out_path)
 
 
+# ── per-prompt validation caps (serenity.sample_prompts.v1) ──────────────────
+# caps_pos/caps_neg point at a CACHE-ENTRY-SHAPED safetensors carrying the
+# "text_embedding" key (same key + layout the train loop reads from its cache).
+# Reuses the loop's cache->cond pad/truncate to [N_TXT, TXT_CH] so the sample
+# conditioning is the real prompt (NOT the step's cached caption; MJ-1045 trap).
+def _qwen_txt_cond_from_caps(path: String, label: String, ctx: DeviceContext) raises -> List[Float32]:
+    if path == String(""):
+        raise Error(String("QwenImage sample prompt ") + label + String(": empty caps path"))
+    var st = SafeTensors.open(path)
+    var info = st.tensor_info(String("text_embedding"))
+    if len(info.shape) < 2 or Int(info.shape[len(info.shape) - 1]) != Int(TXT_CH):
+        raise Error(
+            String("QwenImage caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors key 'text_embedding' shape [1,LT,")
+            + String(Int(TXT_CH)) + String("] (LT<=512, truncated/zero-padded to ")
+            + String(Int(N_TXT)) + String("); got last-dim ")
+            + String(Int(info.shape[len(info.shape) - 1]))
+        )
+    var txt_cache = _load_cache_preserving_dtype(st, String("text_embedding"), ctx)
+    var txt_flat = txt_cache.to_host_bf16(ctx)
+    var txt_seq = len(txt_flat) // Int(TXT_CH)
+    var txt = List[Float32]()
+    for r in range(Int(N_TXT)):
+        if r < txt_seq:
+            for c in range(Int(TXT_CH)):
+                txt.append(txt_flat[r * Int(TXT_CH) + c].cast[DType.float32]())
+        else:
+            for _ in range(Int(TXT_CH)):
+                txt.append(Float32(0.0))
+    return txt^
+
+
+def _qwen_check_caps_shape(path: String, label: String) raises:
+    if path == String(""):
+        raise Error(String("QwenImage sample prompt ") + label + String(": empty caps path"))
+    var st = SafeTensors.open(path)
+    var info = st.tensor_info(String("text_embedding"))
+    if len(info.shape) < 2 or Int(info.shape[len(info.shape) - 1]) != Int(TXT_CH):
+        raise Error(
+            String("QwenImage caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors key 'text_embedding' shape [1,LT,")
+            + String(Int(TXT_CH)) + String("] (LT<=512, truncated/zero-padded to ")
+            + String(Int(N_TXT)) + String("); got last-dim ")
+            + String(Int(info.shape[len(info.shape) - 1]))
+        )
+
+
+def _qwen_sample_prompt_config_for_sampler(sample_file: String) raises -> SamplePromptConfig:
+    if sample_file == String(""):
+        raise Error("QwenImage trainer caps sampling requires validation_prompts_file")
+    var cfg = read_sample_prompt_config(sample_file)
+    assert_enabled_sample_prompts(cfg, String("QwenImage"))
+    return cfg^
+
+
+def _qwen_preflight_sample_caps(sample_cfg: SamplePromptConfig) raises:
+    var checked = 0
+    for i in range(len(sample_cfg.prompts)):
+        var p = sample_cfg.prompts[i].copy()
+        if not p.enabled:
+            continue
+        if p.frames != 1:
+            raise Error(String("QwenImage sample prompt ") + p.label + String(": only single-frame image samples supported"))
+        if p.width != Int(ROPE_W) * Int(SAMPLE_PATCH) * 8 or p.height != Int(ROPE_H) * Int(SAMPLE_PATCH) * 8:
+            raise Error(
+                String("QwenImage sample prompt ") + p.label + String(": requests ")
+                + String(p.width) + String("x") + String(p.height)
+                + String(" but this binary samples ") + String(Int(ROPE_W) * Int(SAMPLE_PATCH) * 8)
+                + String("x") + String(Int(ROPE_H) * Int(SAMPLE_PATCH) * 8)
+            )
+        _qwen_check_caps_shape(p.caps_pos, p.label)
+        if p.cfg != Float32(1.0) and p.caps_neg != String(""):
+            _qwen_check_caps_shape(p.caps_neg, p.label)
+        checked += 1
+    if checked == 0:
+        raise Error("QwenImage trainer requires at least one enabled validation prompt when caps sampling is enabled")
+
+
+def _qwen_run_sample_caps(
+    base: QwenOffloadBase,
+    mut loader: TurboPlannedLoader,
+    lora: QwenLoraSet,
+    cond_txt: List[Float32],
+    uncond_txt: List[Float32],     # empty => zeroed CFG-empty cond
+    cos_h: List[Float32],
+    sin_h: List[Float32],
+    norm_out_w: List[BFloat16], norm_out_b: List[BFloat16],
+    vae_dir: String,
+    samples_dir: String,
+    step: Int,
+    prompt: SamplePrompt,
+    seed: UInt64,
+    ctx: DeviceContext,
+) raises:
+    var uncond = uncond_txt.copy()
+    if len(uncond) == 0:
+        for _ in range(Int(N_TXT) * Int(TXT_CH)):
+            uncond.append(Float32(0.0))
+    var init_noise = _host_noise(Int(N_IMG) * Int(IN_CH), seed)
+    var latent = qwenimage_sample_resident[H, Dh, N_IMG, N_TXT, S](
+        base, loader, lora,
+        cond_txt.copy(), uncond^, init_noise^,
+        cos_h.copy(), sin_h.copy(),
+        norm_out_w, norm_out_b,
+        prompt.steps, prompt.cfg,
+        Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), Int(TIMESTEP_DIM),
+        EPS, ctx,
+    )
+    var out_path = (
+        samples_dir + String("/step_") + String(step)
+        + String("_") + prompt.label + String(".png")
+    )
+    qwenimage_decode_packed_to_png[
+        N_IMG, ROPE_H, ROPE_W, SAMPLE_LAT_C, SAMPLE_PATCH, IN_CH
+    ](
+        latent, vae_dir, out_path, ctx,
+    )
+    print("[QwenImage-lora] caps sample step=", step, " prompt=", prompt.label, " -> ", out_path)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -852,8 +975,21 @@ def main() raises:
         sample_vae_dir = train_cfg.vae.copy()
     var samples_dir = String(LORA_DIR) + String("/samples")
     makedirs(samples_dir, exist_ok=True)
-    print("[cadence] sample-during-training WIRED -> ", samples_dir,
-          " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG, " vae=", sample_vae_dir, ")")
+    # STANDARD sample-prompts contract: caps sampling is ACTIVE when the config
+    # names a validation_prompts_file; load+preflight the per-prompt caps (fail
+    # loud before the run). Otherwise the seam uses the legacy cached-caption
+    # render with a LOUD warning.
+    var caps_sample_file = sample_cadence.sample_definition_file_name
+    var caps_active = caps_sampling_active(caps_sample_file)
+    var sample_cfg = SamplePromptConfig()
+    if caps_active:
+        sample_cfg = _qwen_sample_prompt_config_for_sampler(caps_sample_file)
+        _qwen_preflight_sample_caps(sample_cfg)
+        print("[cadence] sample-during-training WIRED (caps) -> ", samples_dir,
+              " prompts=", len(sample_cfg.prompts), " file=", caps_sample_file, " vae=", sample_vae_dir)
+    else:
+        print("[cadence] sample-during-training WIRED (legacy cached-caption) -> ", samples_dir,
+              " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG, " vae=", sample_vae_dir, ")")
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
@@ -1160,11 +1296,27 @@ def main() raises:
                 " sample_file=", sample_cadence.sample_definition_file_name,
             )
             # Sample from the CURRENT frozen base + streamed blocks + LIVE LoRA.
-            # v1 conditioning: this step's cached caption embeds (txt_tokens) as
-            # COND, zeros as UNCOND (see qwenimage_sample_resident.mojo header).
-            # Skip if there is no real cache — synthetic txt_tokens are all-zeros and
-            # would render a degenerate sample.
-            if have_cache and len(files) > 0:
+            if caps_active:
+                # Prompt-faithful: one render per ENABLED prompt, conditioned on
+                # THAT prompt's caps (not the step's cached caption).
+                for pi in range(len(sample_cfg.prompts)):
+                    var prompt = sample_cfg.prompts[pi].copy()
+                    if not prompt.enabled:
+                        continue
+                    var cond = _qwen_txt_cond_from_caps(prompt.caps_pos, prompt.label, ctx)
+                    var uncond = List[Float32]()
+                    if prompt.cfg != Float32(1.0) and prompt.caps_neg != String(""):
+                        uncond = _qwen_txt_cond_from_caps(prompt.caps_neg, prompt.label, ctx)
+                    _qwen_run_sample_caps(
+                        base, loader, lora, cond^, uncond^,
+                        cos_h.copy(), sin_h.copy(), norm_out_w, norm_out_b,
+                        sample_vae_dir, samples_dir, k, prompt,
+                        prompt.seed + UInt64(pi), ctx,
+                    )
+            elif have_cache and len(files) > 0:
+                # Legacy: reuse this step's cached caption embeds (txt_tokens) as
+                # COND, zeros as UNCOND — NOT a prompt-faithful validation.
+                warn_legacy_cached_caption_sampling(String("QwenImage"))
                 _qwen_run_sample(
                     base, loader, lora, txt_tokens.copy(),
                     cos_h.copy(), sin_h.copy(),
@@ -1173,7 +1325,7 @@ def main() raises:
                 )
             else:
                 print("[QwenImage-lora] sample skipped step=", k,
-                      " (no cache; synthetic zero conditioning)")
+                      " (no validation_prompts_file and no cache; synthetic zero conditioning)")
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)

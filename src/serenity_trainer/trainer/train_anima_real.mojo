@@ -126,6 +126,9 @@ from serenitymojo.training.sample_prompt_config import (
     validate_step_sample_cadence, should_sample_completed_step,
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+    caps_sampling_active, assert_enabled_sample_prompts,
+    warn_legacy_cached_caption_sampling,
 )
 from serenitymojo.training.anima_sample_streamed import (
     anima_sample_streamed, anima_decode_latent_to_png,
@@ -658,6 +661,103 @@ def _clip(mut grads: AnimaLoraGrads, max_norm: Float32):
             grads.d_b[i][j] = grads.d_b[i][j] * s
 
 
+# ── per-prompt validation caps (serenity.sample_prompts.v1) ──────────────────
+# caps_pos/caps_neg point at a safetensors carrying the "context_cond" key (the
+# Anima LLM-adapter cross-attn context, same key the trainer reads from its
+# CONTEXT_PATH sidecar). `_anima_context_from_caps` reuses the loop's context
+# build with pad/truncate to [B, S_TXT, JOINT] so each sample is conditioned on
+# the real prompt, NOT the single fixed CONTEXT_PATH (MJ-1045 trap).
+def _anima_context_from_caps(path: String, label: String, ctx: DeviceContext) raises -> List[Float32]:
+    if path == String(""):
+        raise Error(String("Anima sample prompt ") + label + String(": empty caps path"))
+    var st = SafeTensors.open(path)
+    var info = st.tensor_info(String("context_cond"))
+    if len(info.shape) < 2 or Int(info.shape[len(info.shape) - 1]) != JOINT:
+        raise Error(
+            String("Anima caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors key 'context_cond' shape [1,LT,")
+            + String(JOINT) + String("] (LT<=512, truncated/zero-padded to ")
+            + String(S_TXT) + String(" tokens); got last-dim ")
+            + String(Int(info.shape[len(info.shape) - 1]))
+        )
+    var src = _cache_tensor(st, String("context_cond"), ctx)
+    var src_flat = _host_f32_for_step_math(src, ctx)
+    var src_tokens = len(src_flat) // JOINT
+    var out = List[Float32]()
+    out.reserve(B * S_TXT * JOINT)
+    for r in range(S_TXT):
+        if r < src_tokens:
+            for c in range(JOINT):
+                out.append(src_flat[r * JOINT + c])
+        else:
+            for _ in range(JOINT):
+                out.append(Float32(0.0))
+    return out^
+
+
+def _anima_check_caps_shape(path: String, label: String) raises:
+    if path == String(""):
+        raise Error(String("Anima sample prompt ") + label + String(": empty caps path"))
+    var st = SafeTensors.open(path)
+    var info = st.tensor_info(String("context_cond"))
+    if len(info.shape) < 2 or Int(info.shape[len(info.shape) - 1]) != JOINT:
+        raise Error(
+            String("Anima caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors key 'context_cond' shape [1,LT,")
+            + String(JOINT) + String("] (LT<=512, truncated/zero-padded to ")
+            + String(S_TXT) + String(" tokens); got last-dim ")
+            + String(Int(info.shape[len(info.shape) - 1]))
+        )
+
+
+def _anima_sample_prompt_config_for_sampler(sample_file: String) raises -> SamplePromptConfig:
+    if sample_file == String(""):
+        raise Error("Anima trainer caps sampling requires validation_prompts_file")
+    var cfg = read_sample_prompt_config(sample_file)
+    assert_enabled_sample_prompts(cfg, String("Anima"))
+    return cfg^
+
+
+def _anima_preflight_sample_caps(sample_cfg: SamplePromptConfig) raises:
+    var checked = 0
+    for i in range(len(sample_cfg.prompts)):
+        var p = sample_cfg.prompts[i].copy()
+        if not p.enabled:
+            continue
+        if p.frames != 1:
+            raise Error(String("Anima sample prompt ") + p.label + String(": only single-frame image samples supported"))
+        _anima_check_caps_shape(p.caps_pos, p.label)
+        if p.cfg != Float32(1.0) and p.caps_neg != String(""):
+            _anima_check_caps_shape(p.caps_neg, p.label)
+        checked += 1
+    if checked == 0:
+        raise Error("Anima trainer requires at least one enabled validation prompt when caps sampling is enabled")
+
+
+def _anima_run_sample_caps(
+    base: AnimaStackBase, st: SafeTensors, lora: AnimaLoraSet,
+    cos: Tensor, sin: Tensor,
+    context_cond: List[Float32], context_uncond: List[Float32],  # uncond empty => zeros
+    samples_dir: String, step: Int, prompt: SamplePrompt, seed: UInt64, ctx: DeviceContext,
+) raises:
+    var uncond = context_uncond.copy()
+    if len(uncond) == 0:
+        uncond.reserve(B * S_TXT * JOINT)
+        for _ in range(B * S_TXT * JOINT):
+            uncond.append(Float32(0.0))
+    var latent = anima_sample_streamed[H, Dh, S_IMG, S_TXT, LATENT_HW](
+        base, st, lora, cos, sin,
+        context_cond.copy(), uncond^,
+        prompt.steps, prompt.cfg, seed, ctx,
+    )
+    var out_png = (
+        samples_dir + String("/step_") + String(step)
+        + String("_") + prompt.label + String(".png")
+    )
+    anima_decode_latent_to_png[LATENT_HW](latent, out_png, ctx)
+    print("[cadence] caps sample written:", out_png, " prompt=", prompt.label)
+
+
 def main() raises:
     var args = argv()
     var cfg_path = String(ANIMA_CONFIG)
@@ -708,11 +808,24 @@ def main() raises:
     # output/anima_lora_smoke.safetensors -> output/samples/). Sample PNGs land at
     # <samples_dir>/step_<N>.png on each cadence fire.
     var samples_dir = _samples_dir_for_lora(lora_out)
+    # STANDARD sample-prompts contract: caps sampling is ACTIVE when the config
+    # names a validation_prompts_file; load+preflight the per-prompt caps (fail
+    # loud before the run). Otherwise the seam uses the legacy fixed-context
+    # render with a LOUD warning.
+    var caps_sample_file = sample_cadence.sample_definition_file_name
+    var caps_active = caps_sampling_active(caps_sample_file)
+    var sample_cfg = SamplePromptConfig()
     if sample_enabled:
         var next_sample = next_sample_completed_step(sample_cadence, 0, cfg.max_steps)
         makedirs(samples_dir, exist_ok=True)
-        print("[cadence] Anima sampling-in-training ENABLED -> ", samples_dir,
-              "; next configured sample step=", next_sample)
+        if caps_active:
+            sample_cfg = _anima_sample_prompt_config_for_sampler(caps_sample_file)
+            _anima_preflight_sample_caps(sample_cfg)
+            print("[cadence] Anima sampling-in-training ENABLED (caps) -> ", samples_dir,
+                  " prompts=", len(sample_cfg.prompts), " file=", caps_sample_file, "; next=", next_sample)
+        else:
+            print("[cadence] Anima sampling-in-training ENABLED (legacy fixed-context) -> ", samples_dir,
+                  "; next configured sample step=", next_sample)
 
     # ── open the real DiT checkpoint (streamed per-block) ──
     print("checkpoint:", cfg.checkpoint)
@@ -1082,16 +1195,36 @@ def main() raises:
                 " sample_file=", sample_cadence.sample_definition_file_name,
             )
             var sample_t0 = perf_counter_ns()
-            var sample_seed = SEED * UInt64(1099087573) + UInt64(completed_step)
-            var sample_latent = anima_sample_streamed[H, Dh, S_IMG, S_TXT, LATENT_HW](
-                base, st, lora, ropes.cos, ropes.sin,
-                context.copy(), context_uncond.copy(),
-                ANIMA_NUM_STEPS, ANIMA_CFG_SCALE, sample_seed, ctx,
-            )
-            var sample_png = samples_dir + String("/step_") + String(completed_step) + String(".png")
-            anima_decode_latent_to_png[LATENT_HW](sample_latent, sample_png, ctx)
+            if caps_active:
+                # Prompt-faithful: one render per ENABLED prompt, conditioned on
+                # THAT prompt's caps (not the single fixed CONTEXT_PATH context).
+                for pi in range(len(sample_cfg.prompts)):
+                    var prompt = sample_cfg.prompts[pi].copy()
+                    if not prompt.enabled:
+                        continue
+                    var cond = _anima_context_from_caps(prompt.caps_pos, prompt.label, ctx)
+                    var uncond = List[Float32]()
+                    if prompt.cfg != Float32(1.0) and prompt.caps_neg != String(""):
+                        uncond = _anima_context_from_caps(prompt.caps_neg, prompt.label, ctx)
+                    _anima_run_sample_caps(
+                        base, st, lora, ropes.cos, ropes.sin,
+                        cond^, uncond^, samples_dir, completed_step, prompt,
+                        prompt.seed + UInt64(pi), ctx,
+                    )
+            else:
+                # Legacy: the single fixed CONTEXT_PATH context (COND) + zeroed
+                # UNCOND — NOT a prompt-faithful validation.
+                warn_legacy_cached_caption_sampling(String("Anima"))
+                var sample_seed = SEED * UInt64(1099087573) + UInt64(completed_step)
+                var sample_latent = anima_sample_streamed[H, Dh, S_IMG, S_TXT, LATENT_HW](
+                    base, st, lora, ropes.cos, ropes.sin,
+                    context.copy(), context_uncond.copy(),
+                    ANIMA_NUM_STEPS, ANIMA_CFG_SCALE, sample_seed, ctx,
+                )
+                var sample_png = samples_dir + String("/step_") + String(completed_step) + String(".png")
+                anima_decode_latent_to_png[LATENT_HW](sample_latent, sample_png, ctx)
             var sample_secs = Float64(perf_counter_ns() - sample_t0) / 1.0e9
-            print("[cadence] sample written:", sample_png, " (", sample_secs, "s)")
+            print("[cadence] sample(s) done (", sample_secs, "s)")
 
     var t1 = perf_counter_ns()
     var secs = Float64(t1 - t0) / 1.0e9

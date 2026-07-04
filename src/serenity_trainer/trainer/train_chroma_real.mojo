@@ -108,6 +108,9 @@ from serenitymojo.training.sample_prompt_config import (
     validate_step_sample_cadence, should_sample_completed_step,
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+    caps_sampling_active, assert_enabled_sample_prompts,
+    warn_legacy_cached_caption_sampling,
 )
 from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_ONLY,
@@ -516,6 +519,128 @@ def _chroma_run_sample(
     print("[Chroma-lora] sample step=", step, " -> ", out_path)
 
 
+# ── per-prompt validation caps (serenity.sample_prompts.v1) ──────────────────
+# A prompt's caps_pos/caps_neg point at a CACHE-ENTRY-SHAPED safetensors carrying
+# the "t5_embed" key (same key + layout the train loop reads from its cache).
+# `_chroma_txt_cond_from_caps` reuses the loop's cache->cond build (pad/truncate
+# to [N_TXT, TXT_CH]) sourced from that file, so the sample conditioning is the
+# real prompt's T5 embeds, NOT the current step's cached caption (MJ-1045 trap).
+def _chroma_txt_cond_from_caps(path: String, label: String, ctx: DeviceContext) raises -> List[Float32]:
+    if path == String(""):
+        raise Error(String("Chroma sample prompt ") + label + String(": empty caps path"))
+    var st = SafeTensors.open(path)
+    var info = st.tensor_info(String("t5_embed"))
+    if len(info.shape) < 2 or Int(info.shape[len(info.shape) - 1]) != TXT_CH:
+        raise Error(
+            String("Chroma caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors key 't5_embed' shape [1,LT,")
+            + String(TXT_CH) + String("] (LT<=") + String(N_TXT)
+            + String(", zero-padded to ") + String(N_TXT)
+            + String("); got last-dim ") + String(Int(info.shape[len(info.shape) - 1]))
+        )
+    var t5_seq = Int(info.shape[len(info.shape) - 2])
+    var t5_cache = _load_chroma_cache_tensor(st, String("t5_embed"), ctx)
+    var t5_flat = _host_f32_for_step_math(t5_cache, ctx)
+    var txt = List[Float32]()
+    for r in range(N_TXT):
+        if r < t5_seq:
+            for c in range(TXT_CH):
+                txt.append(t5_flat[r * TXT_CH + c])
+        else:
+            for _ in range(TXT_CH):
+                txt.append(Float32(0.0))
+    return txt^
+
+
+def _chroma_sample_prompt_config_for_sampler(sample_file: String) raises -> SamplePromptConfig:
+    if sample_file == String(""):
+        raise Error("Chroma trainer caps sampling requires validation_prompts_file")
+    var cfg = read_sample_prompt_config(sample_file)
+    assert_enabled_sample_prompts(cfg, String("Chroma"))
+    return cfg^
+
+
+# ctx-free preflight: fail loud (naming the prompt) if any enabled prompt is not a
+# valid 512x512 image prompt with a shape-correct caps.positive (and caps.negative
+# when its CFG uses one), BEFORE the train loop starts.
+def _chroma_preflight_sample_caps(sample_cfg: SamplePromptConfig) raises:
+    var checked = 0
+    for i in range(len(sample_cfg.prompts)):
+        var p = sample_cfg.prompts[i].copy()
+        if not p.enabled:
+            continue
+        if p.frames != 1:
+            raise Error(String("Chroma sample prompt ") + p.label + String(": only single-frame image samples supported"))
+        if p.width != LAT_W * 8 or p.height != LAT_H * 8:
+            raise Error(
+                String("Chroma sample prompt ") + p.label + String(": requests ")
+                + String(p.width) + String("x") + String(p.height)
+                + String(" but this binary samples ") + String(LAT_W * 8)
+                + String("x") + String(LAT_H * 8)
+            )
+        _chroma_check_caps_shape(p.caps_pos, p.label)
+        if p.cfg != Float32(1.0) and p.caps_neg != String(""):
+            _chroma_check_caps_shape(p.caps_neg, p.label)
+        checked += 1
+    if checked == 0:
+        raise Error("Chroma trainer requires at least one enabled validation prompt when caps sampling is enabled")
+
+
+def _chroma_check_caps_shape(path: String, label: String) raises:
+    if path == String(""):
+        raise Error(String("Chroma sample prompt ") + label + String(": empty caps path"))
+    var st = SafeTensors.open(path)
+    var info = st.tensor_info(String("t5_embed"))
+    if len(info.shape) < 2 or Int(info.shape[len(info.shape) - 1]) != TXT_CH:
+        raise Error(
+            String("Chroma caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors key 't5_embed' shape [1,LT,")
+            + String(TXT_CH) + String("] (LT<=") + String(N_TXT)
+            + String(", zero-padded to ") + String(N_TXT)
+            + String("); got last-dim ") + String(Int(info.shape[len(info.shape) - 1]))
+        )
+
+
+# One caps-conditioned validation image (per-prompt seed/steps/cfg/label). Mirrors
+# _chroma_run_sample but sources COND (and optional negative UNCOND) from a prompt's
+# caps instead of the step's cached caption.
+def _chroma_run_sample_caps(
+    base: ChromaStackBase,
+    approx: ChromaDitCache,
+    mut loader: TurboPlannedLoader,
+    lora: FluxLoraSet,
+    cond_txt: List[Float32],
+    uncond_txt: List[Float32],     # empty => zeroed CFG-empty cond
+    cos: List[Float32],
+    sin: List[Float32],
+    samples_dir: String,
+    step: Int,
+    prompt: SamplePrompt,
+    seed: UInt64,
+    ctx: DeviceContext,
+) raises:
+    var uncond = uncond_txt.copy()
+    if len(uncond) == 0:
+        for _ in range(N_TXT * TXT_CH):
+            uncond.append(Float32(0.0))
+    var init_noise = _sample_init_noise(seed)
+    var latent = chroma_sample_resident[H, Dh, N_IMG, N_TXT, S](
+        base, approx, loader, lora,
+        cond_txt.copy(), uncond^, init_noise^,
+        cos.copy(), sin.copy(),
+        prompt.steps, prompt.cfg, MOD_INDEX,
+        D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+    )
+    var out_path = (
+        samples_dir + String("/step_") + String(step)
+        + String("_") + prompt.label + String(".png")
+    )
+    chroma_decode_latent_to_png[LAT_C, LAT_H, LAT_W, HT, WT, PATCH, N_IMG, IN_CH](
+        latent, String(SAMPLE_VAE_PATH), out_path, ctx,
+    )
+    print("[Chroma-lora] caps sample step=", step, " prompt=", prompt.label, " -> ", out_path)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -729,10 +854,23 @@ def main() raises:
 
     # samples dir for sample-during-training PNGs (created once if enabled).
     var samples_dir = String(LORA_DIR) + String("/samples")
+    # STANDARD sample-prompts contract: caps sampling is ACTIVE when the config
+    # names a validation_prompts_file. Load+preflight the per-prompt caps here
+    # (fail loud before the run); otherwise the seam falls back to the legacy
+    # cached-caption render with a LOUD warning.
+    var caps_sample_file = sample_cadence.sample_definition_file_name
+    var caps_active = caps_sampling_active(caps_sample_file)
+    var sample_cfg = SamplePromptConfig()
     if sample_enabled:
         makedirs(samples_dir, exist_ok=True)
-        print("[cadence] sample-during-training WIRED -> ", samples_dir,
-              " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG, ")")
+        if caps_active:
+            sample_cfg = _chroma_sample_prompt_config_for_sampler(caps_sample_file)
+            _chroma_preflight_sample_caps(sample_cfg)
+            print("[cadence] sample-during-training WIRED (caps) -> ", samples_dir,
+                  " prompts=", len(sample_cfg.prompts), " file=", caps_sample_file)
+        else:
+            print("[cadence] sample-during-training WIRED (legacy cached-caption) -> ", samples_dir,
+                  " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG, ")")
     if sample_enabled and should_sample_completed_step(sample_cadence, 0):
         print("[cadence] step 0 sample due (fires after the first completed step in this bounded loop)")
     var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
@@ -1014,16 +1152,34 @@ def main() raises:
                     _ = save_chroma_lora_state(lora, sample_state, ctx)
                     print("[Chroma-lora] save_before_sample step=", k, " path=", sample_state)
             # Sample from the CURRENT frozen base + streamed blocks + LIVE LoRA.
-            # v1 conditioning: this step's cached caption T5 embeds (txt_tokens)
-            # as COND, zeros as UNCOND. See chroma_sample_resident.mojo header.
             print(
                 "[cadence] sample due at completed_step=", k,
                 " sample_file=", sample_cadence.sample_definition_file_name,
             )
-            _chroma_run_sample(
-                base, approx, loader, lora, txt_tokens.copy(),
-                cos.copy(), sin.copy(), samples_dir, k, ctx,
-            )
+            if caps_active:
+                # Prompt-faithful: one render per ENABLED prompt, conditioned on
+                # THAT prompt's caps (not the step's cached caption).
+                for pi in range(len(sample_cfg.prompts)):
+                    var prompt = sample_cfg.prompts[pi].copy()
+                    if not prompt.enabled:
+                        continue
+                    var cond = _chroma_txt_cond_from_caps(prompt.caps_pos, prompt.label, ctx)
+                    var uncond = List[Float32]()
+                    if prompt.cfg != Float32(1.0) and prompt.caps_neg != String(""):
+                        uncond = _chroma_txt_cond_from_caps(prompt.caps_neg, prompt.label, ctx)
+                    _chroma_run_sample_caps(
+                        base, approx, loader, lora, cond^, uncond^,
+                        cos.copy(), sin.copy(), samples_dir, k, prompt,
+                        prompt.seed + UInt64(pi), ctx,
+                    )
+            else:
+                # Legacy: reuse this step's cached caption T5 embeds (txt_tokens)
+                # as COND, zeros as UNCOND — NOT a prompt-faithful validation.
+                warn_legacy_cached_caption_sampling(String("Chroma"))
+                _chroma_run_sample(
+                    base, approx, loader, lora, txt_tokens.copy(),
+                    cos.copy(), sin.copy(), samples_dir, k, ctx,
+                )
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)

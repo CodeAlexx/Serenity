@@ -99,6 +99,9 @@ from serenitymojo.training.sample_prompt_config import (
     validate_step_sample_cadence, should_sample_completed_step,
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+    SamplePrompt, SamplePromptConfig, read_sample_prompt_config,
+    caps_sampling_active, assert_enabled_sample_prompts,
+    warn_legacy_cached_caption_sampling,
 )
 from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_ONLY,
@@ -711,6 +714,143 @@ def _sdxl_run_sample(
     print("[SDXL-lora] sample step=", step, " -> ", out_path)
 
 
+# ── per-prompt validation caps (serenity.sample_prompts.v1) ──────────────────
+# SDXL conditioning is TWO tensors: context [1,77,2048] (CLIP-L|CLIP-G hidden)
+# and the ADM y [1,2816] (pooled | sin_embed(time_ids)). A single cap_cache .bin
+# cannot hold both, so caps_pos points at a CACHE-ENTRY-SHAPED safetensors with
+# the SAME keys the train loop reads (text_embedding, pooled, time_ids), and this
+# helper REUSES the loop's exact context/y build sourced from that file — so the
+# ADM y stays in the trainer's [pooled, sin_embed(time_ids)] layout. Y-LAYOUT
+# TRAP: the on-disk sidecar / serve-backend y is [l_pool, g_pool, zeros], a
+# DIFFERENT 2816-vector — NEVER load a sidecar `y` blind. ALWAYS reconstruct y
+# here from `pooled` + sin_embed(`time_ids`) via the trainer's own builder (the
+# `context` tensor IS cross-compatible; only `y` diverges). caps_neg is unused:
+# the SDXL sampler builds its CFG uncond as zeros internally (unchanged legacy).
+struct _SdxlCaps(Movable):
+    var context: Tensor
+    var y: Tensor
+
+    def __init__(out self, var context: Tensor, var y: Tensor):
+        self.context = context^
+        self.y = y^
+
+
+def _sdxl_check_caps_shape(path: String, label: String) raises:
+    if path == String(""):
+        raise Error(String("SDXL sample prompt ") + label + String(": empty caps path"))
+    var stc = SafeTensors.open(path)
+    var ti = stc.tensor_info(String("text_embedding"))
+    if len(ti.shape) < 2 or Int(ti.shape[len(ti.shape) - 1]) != CCTX:
+        raise Error(
+            String("SDXL caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors keys 'text_embedding' [1,")
+            + String(NKV) + String(",") + String(CCTX) + String("] + 'pooled' [1,")
+            + String(POOLED_DIM) + String("] + 'time_ids' [1,6]; got text_embedding last-dim ")
+            + String(Int(ti.shape[len(ti.shape) - 1]))
+        )
+    var pin = stc.tensor_info(String("pooled"))
+    if Int(pin.shape[len(pin.shape) - 1]) != POOLED_DIM:
+        raise Error(
+            String("SDXL caps for prompt '") + label + String("' at ") + path
+            + String(": expected key 'pooled' [1,") + String(POOLED_DIM)
+            + String("]; got last-dim ") + String(Int(pin.shape[len(pin.shape) - 1]))
+        )
+    _ = stc.tensor_info(String("time_ids"))
+
+
+def _sdxl_caps_from_file(path: String, label: String, ctx: DeviceContext) raises -> _SdxlCaps:
+    if path == String(""):
+        raise Error(String("SDXL sample prompt ") + label + String(": empty caps path"))
+    var stc = SafeTensors.open(path)
+    var ti = stc.tensor_info(String("text_embedding"))
+    if len(ti.shape) < 2 or Int(ti.shape[len(ti.shape) - 1]) != CCTX:
+        raise Error(
+            String("SDXL caps for prompt '") + label + String("' at ") + path
+            + String(": expected cache-shaped safetensors keys 'text_embedding' [1,")
+            + String(NKV) + String(",") + String(CCTX) + String("] + 'pooled' [1,")
+            + String(POOLED_DIM) + String("] + 'time_ids' [1,6]; got text_embedding last-dim ")
+            + String(Int(ti.shape[len(ti.shape) - 1]))
+        )
+    var context = _load_cache_preserving_dtype(stc, String("text_embedding"), ctx)  # [1,77,2048]
+    var pooled = _load_cache_preserving_dtype(stc, String("pooled"), ctx)           # [1,1280]
+    var time_ids = _load_cache_preserving_dtype(stc, String("time_ids"), ctx)       # [1,6]
+    var pooled_h = _host_f32_for_step_math(pooled, ctx)
+    if len(pooled_h) != POOLED_DIM:
+        raise Error(String("SDXL sample prompt ") + label + String(": caps pooled length ") + String(len(pooled_h)) + String(" != ") + String(POOLED_DIM))
+    var tid_h = _host_f32_for_step_math(time_ids, ctx)
+    if len(tid_h) != 6:
+        raise Error(String("SDXL sample prompt ") + label + String(": caps time_ids must be length 6"))
+    var y_h = List[Float32]()
+    for i in range(len(pooled_h)):
+        y_h.append(pooled_h[i])
+    for kk in range(6):
+        var se = _sin_embed_256(tid_h[kk])
+        for j in range(len(se)):
+            y_h.append(se[j])
+    if len(y_h) != ADM:
+        raise Error(String("SDXL sample prompt ") + label + String(": ADM y length ") + String(len(y_h)) + String(" != ") + String(ADM))
+    var ys = List[Int]()
+    ys.append(1)
+    ys.append(ADM)
+    var y = Tensor.from_host(y_h^, ys^, STDtype.F32, ctx)
+    return _SdxlCaps(context^, y^)
+
+
+def _sdxl_sample_prompt_config_for_sampler(sample_file: String) raises -> SamplePromptConfig:
+    if sample_file == String(""):
+        raise Error("SDXL trainer caps sampling requires validation_prompts_file")
+    var cfg = read_sample_prompt_config(sample_file)
+    assert_enabled_sample_prompts(cfg, String("SDXL"))
+    return cfg^
+
+
+def _sdxl_preflight_sample_caps(sample_cfg: SamplePromptConfig) raises:
+    var checked = 0
+    for i in range(len(sample_cfg.prompts)):
+        var p = sample_cfg.prompts[i].copy()
+        if not p.enabled:
+            continue
+        if p.frames != 1:
+            raise Error(String("SDXL sample prompt ") + p.label + String(": only single-frame image samples supported"))
+        if p.width != LATENT_HW * 8 or p.height != LATENT_HW * 8:
+            raise Error(
+                String("SDXL sample prompt ") + p.label + String(": requests ")
+                + String(p.width) + String("x") + String(p.height)
+                + String(" but this binary samples ") + String(LATENT_HW * 8)
+                + String("x") + String(LATENT_HW * 8)
+            )
+        _sdxl_check_caps_shape(p.caps_pos, p.label)
+        checked += 1
+    if checked == 0:
+        raise Error("SDXL trainer requires at least one enabled validation prompt when caps sampling is enabled")
+
+
+def _sdxl_run_sample_caps(
+    w: SdxlRealWeights,
+    lora: List[SdxlLoraSet],
+    context: Tensor,
+    y: Tensor,
+    vae_path: String,
+    samples_dir: String,
+    step: Int,
+    prompt: SamplePrompt,
+    seed: UInt64,
+    ctx: DeviceContext,
+) raises:
+    var n_lat = 4 * LATENT_HW * LATENT_HW
+    var init_noise = _host_noise(n_lat, seed)
+    var latent = sdxl_sample_resident[LATENT_HW, LATENT_HW](
+        w, lora, context.clone(ctx), y.clone(ctx), init_noise^,
+        prompt.steps, prompt.cfg, ctx,
+    )
+    var out_path = (
+        samples_dir + String("/step_") + String(step)
+        + String("_") + prompt.label + String(".png")
+    )
+    sdxl_decode_latent_to_png[LATENT_HW, LATENT_HW](latent, vae_path, out_path, ctx)
+    print("[SDXL-lora] caps sample step=", step, " prompt=", prompt.label, " -> ", out_path)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -989,11 +1129,25 @@ def main() raises:
     var samples_dir = String(LORA_DIR) + String("/samples")
     var sdxl_manifest = default_manifest_by_id(String("sdxl"))
     var sample_vae_path = sdxl_manifest.vae_path.copy()
+    # STANDARD sample-prompts contract: caps sampling is ACTIVE when the config
+    # names a validation_prompts_file; load+preflight per-prompt caps (fail loud
+    # before the run). Otherwise the seam uses the legacy cached-(context,y)
+    # render with a LOUD warning.
+    var caps_sample_file = sample_cadence.sample_definition_file_name
+    var caps_active = caps_sampling_active(caps_sample_file)
+    var sample_cfg = SamplePromptConfig()
     if sample_enabled:
         makedirs(samples_dir, exist_ok=True)
-        print("[cadence] sample-during-training WIRED -> ", samples_dir,
-              " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG,
-              " latent=", LATENT_HW, "x", LATENT_HW, " -> ", LATENT_HW * 8, "px)")
+        if caps_active:
+            sample_cfg = _sdxl_sample_prompt_config_for_sampler(caps_sample_file)
+            _sdxl_preflight_sample_caps(sample_cfg)
+            print("[cadence] sample-during-training WIRED (caps) -> ", samples_dir,
+                  " prompts=", len(sample_cfg.prompts), " file=", caps_sample_file,
+                  " latent=", LATENT_HW, "x", LATENT_HW, " -> ", LATENT_HW * 8, "px)")
+        else:
+            print("[cadence] sample-during-training WIRED (legacy cached-caption) -> ", samples_dir,
+                  " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG,
+                  " latent=", LATENT_HW, "x", LATENT_HW, " -> ", LATENT_HW * 8, "px)")
         print("[cadence] sample VAE:", sample_vae_path)
 
     if sample_enabled and should_sample_completed_step(sample_cadence, 0):
@@ -1289,11 +1443,26 @@ def main() raises:
                 " sample_file=", sample_cadence.sample_definition_file_name,
             )
             # Denoise the FROZEN UNet + the LIVE per-ST LoRA at LATENT_HW, decode,
-            # write <LORA_DIR>/samples/step_<k>.png. v1 conditioning reuses the
-            # cached caption's (context, y) as COND, zeros as UNCOND.
-            _sdxl_run_sample(
-                w, lora, context, y, sample_vae_path, samples_dir, k, ctx,
-            )
+            # write <LORA_DIR>/samples/step_<k>_<label>.png.
+            if caps_active:
+                # Prompt-faithful: one render per ENABLED prompt, conditioned on
+                # THAT prompt's caps (context+y) not the step's cached caption.
+                for pi in range(len(sample_cfg.prompts)):
+                    var prompt = sample_cfg.prompts[pi].copy()
+                    if not prompt.enabled:
+                        continue
+                    var caps = _sdxl_caps_from_file(prompt.caps_pos, prompt.label, ctx)
+                    _sdxl_run_sample_caps(
+                        w, lora, caps.context, caps.y, sample_vae_path,
+                        samples_dir, k, prompt, prompt.seed + UInt64(pi), ctx,
+                    )
+            else:
+                # Legacy: reuse the cached caption's (context, y) as COND, zeros
+                # as UNCOND — NOT a prompt-faithful validation.
+                warn_legacy_cached_caption_sampling(String("SDXL"))
+                _sdxl_run_sample(
+                    w, lora, context, y, sample_vae_path, samples_dir, k, ctx,
+                )
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)

@@ -307,6 +307,13 @@ def validate_l2p_train_config(cfg: TrainConfig) raises:
         raise Error("L2P trainer learning_rate does not match compiled constant")
     if not _close_l2p(cfg.max_grad_norm, CLIP_GRAD_NORM):
         raise Error("L2P trainer max_grad_norm does not match compiled constant")
+    # Inline sampling is not wired for L2P: fail loud rather than silently
+    # ignore a sample-prompt config the launcher believed was honored.
+    if cfg.validation_prompts_file != String(""):
+        raise Error(
+            "inline sampling not wired for l2p; remove validation_prompts_file"
+            " or use the standalone sampler"
+        )
 
 
 def _global_norm_l2p(grads: ZImageLoraGrads, start: Int, end: Int) -> Float64:
