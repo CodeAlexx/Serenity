@@ -77,6 +77,7 @@ from serenitymojo.models.flux.flux_stack_lora import (
     build_flux_stack_lora_set, empty_flux_stack_lora_set, total_stack_adapters,
     flux_stack_lora_forward_offload, flux_stack_lora_backward_offload,
     flux_stack_lora_forward_offload_full, flux_stack_lora_backward_offload_full,
+    flux_stack_lora_forward_offload_full_b2, flux_stack_lora_backward_offload_full_b2,
     build_flux_direct_dora_set_from_offload, build_flux_direct_oft_set_for_stack,
     flux_stack_direct_dora_forward_offload, flux_stack_direct_dora_backward_offload,
     flux_stack_direct_oft_forward_offload, flux_stack_direct_oft_backward_offload,
@@ -978,6 +979,27 @@ def main() raises:
             + "wave; LoKr/LoHa/DoRA/OFT fail loud (mirrors Klein's honest scope). "
             + "Use adapter_algo=0 (plain LoRA) with gradient accumulation."
         )
+    # ── TRUE batch-2 (row-stacked) fences (mirrors krea2's honest b2 scope) ──
+    # batch_size==2 dispatches the row-stacked b2 stack (see the loop body). It is
+    # wired for the PLAIN LoRA arm only, requires stack-level LoRA disabled, and
+    # cannot combine with grad accumulation (accum + b2 are the SAME 2× mean — the
+    # lead already has accumulation, so fence both >1).
+    var use_b2 = train_cfg.batch_size == 2
+    if train_cfg.batch_size != 1 and train_cfg.batch_size != 2:
+        raise Error(
+            "Flux trainer: only batch_size 1 or 2 supported; got "
+            + String(train_cfg.batch_size)
+        )
+    if use_b2 and (lokr_active or loha_active or dora_active or oft_active):
+        raise Error(
+            "Flux trainer: batch_size==2 (row-stacked b2) is wired for the plain "
+            + "LoRA arm only; LoKr/LoHa/DoRA/OFT fail loud. Use adapter_algo=0."
+        )
+    if use_b2 and use_grad_accum:
+        raise Error(
+            "Flux trainer: batch_size==2 and grad_accum_steps>1 are mutually "
+            + "exclusive (both are the same 2× mean); pick one."
+        )
     var acc_d_a = List[List[Float32]]()
     var acc_d_b = List[List[Float32]]()
     var acc_st_d_a = List[List[Float32]]()
@@ -1154,37 +1176,111 @@ def main() raises:
                 print("[Flux-oft] save step=", k, " modules=", nmods, " path=", save_path)
             continue
 
-        # ── forward (offload, full depth) -> velocity [N_IMG, OUT_CH] ──
-        # _full path applies BOTH block-projection LoRA (`lora`) and stack-level
-        # LoRA (`stack_lora`) — the complete OneTrainer default surface.
-        var fwd = flux_stack_lora_forward_offload_full[H, Dh, N_IMG, N_TXT, S](
-            noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
-            base, loader, lora, stack_lora, cos.copy(), sin.copy(),
-            D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
-        )
+        # ── forward + backward: batch_size==2 dispatches the ROW-STACKED b2
+        #    stack (two samples row-stacked; frozen GEMMs batched over 2N rows;
+        #    per-sample attention/adaLN; LoRA grads SUM both samples = the batch
+        #    gradient = grad-accum=2 mean under the joint 2N-mean loss). Otherwise
+        #    the b1 `_full` path (block + stack LoRA).
+        var loss: Float32 = 0.0
+        var grads: FluxLoraGradSet
+        if use_b2:
+            if stack_lora.enabled:
+                raise Error(
+                    "Flux b2 (batch_size==2): stack-level LoRA is not supported "
+                    + "this wave (block-projection LoRA only); disable it."
+                )
+            # ── load the paired sample1 (mirrors the sample0 prep above) ──
+            var slot1 = 0 if FIXED_SIGMA_SMOKE else k % len(files)
+            var step_seed1 = UInt64(2) if FIXED_SIGMA_SMOKE else UInt64(k) + UInt64(104729)
+            var st1 = SafeTensors.open(files[slot1])
+            var lat_cache1 = _cache_tensor(st1, String("latent"), ctx)
+            var clip_pool_cache1 = _cache_tensor(st1, String("clip_pool"), ctx)
+            var lat_raw1 = _host_f32_for_step_math(lat_cache1, ctx)
+            var clip_pool1 = _host_f32_for_step_math(clip_pool_cache1, ctx)
+            var t5_info1 = st1.tensor_info(String("t5_embed"))
+            var t5_seq1 = Int(t5_info1.shape[1])
+            var t5_cache1 = _cache_tensor(st1, String("t5_embed"), ctx)
+            var t5_flat1 = _host_f32_for_step_math(t5_cache1, ctx)
+            var txt_tokens1 = List[Float32]()
+            for r in range(N_TXT):
+                if r < t5_seq1:
+                    for c in range(TXT_CH):
+                        txt_tokens1.append(t5_flat1[r * TXT_CH + c])
+                else:
+                    for _ in range(TXT_CH):
+                        txt_tokens1.append(Float32(0.0))
+            for i in range(len(lat_raw1)):
+                lat_raw1[i] = (lat_raw1[i] - VAE_SHIFT) * VAE_SCALE
+            var latent_packed1 = _pack_latents(lat_raw1)
+            var sigma_idx1: Int
+            if FIXED_SIGMA_SMOKE:
+                sigma_idx1 = FIXED_SIGMA_IDX
+            else:
+                var sigma1 = sample_timestep_logit_normal(SEED_BASE + step_seed1, TIMESTEP_SHIFT)
+                sigma_idx1 = Int(sigma1 * Float32(NUM_TRAIN_TIMESTEPS))
+                if sigma_idx1 > NUM_TRAIN_TIMESTEPS - 1:
+                    sigma_idx1 = NUM_TRAIN_TIMESTEPS - 1
+            var sig1 = Float32(sigma_idx1 + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+            var t_model1 = Float32(sigma_idx1) / Float32(NUM_TRAIN_TIMESTEPS)
+            var timestep1 = List[Float32]()
+            timestep1.append(t_model1 * Float32(1000.0))
+            var noise1 = _host_noise(N_IMG * IN_CH, SEED_BASE * UInt64(7919) + step_seed1)
+            var noisy1 = List[Float32]()
+            var target1 = List[Float32]()
+            for i in range(len(latent_packed1)):
+                noisy1.append(noise1[i] * sig1 + latent_packed1[i] * (Float32(1.0) - sig1))
+                target1.append(noise1[i] - latent_packed1[i])
 
-        # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
-        var nout = len(fwd.out)
-        var d_loss = List[Float32]()
-        var sse = 0.0
-        var inv_n = Float32(2.0) / Float32(nout)
-        for i in range(nout):
-            var diff = fwd.out[i] - target[i]
-            sse += Float64(diff) * Float64(diff)
-            d_loss.append(inv_n * diff)
-        var loss = Float32(sse / Float64(nout))
+            var fwd2 = flux_stack_lora_forward_offload_full_b2[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
+                noisy1.copy(), txt_tokens1.copy(), timestep1.copy(), guidance, clip_pool1.copy(),
+                base, loader, lora, cos.copy(), sin.copy(),
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+            )
+            # JOINT 2N-mean MSE over the stacked [target0 | target1].
+            var target_st = List[Float32]()
+            for i in range(len(target)):
+                target_st.append(target[i])
+            for i in range(len(target1)):
+                target_st.append(target1[i])
+            var nout2 = len(fwd2.out)
+            var d_loss2 = List[Float32]()
+            var sse2 = 0.0
+            var inv_n2 = Float32(2.0) / Float32(nout2)
+            for i in range(nout2):
+                var diff = fwd2.out[i] - target_st[i]
+                sse2 += Float64(diff) * Float64(diff)
+                d_loss2.append(inv_n2 * diff)
+            loss = Float32(sse2 / Float64(nout2))
+            grads = flux_stack_lora_backward_offload_full_b2[H, Dh, N_IMG, N_TXT, S](
+                d_loss2, base, loader, lora, cos.copy(), sin.copy(), fwd2,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+            )
+        else:
+            # _full path applies BOTH block-projection LoRA (`lora`) and stack-level
+            # LoRA (`stack_lora`) — the complete OneTrainer default surface.
+            var fwd = flux_stack_lora_forward_offload_full[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
+                base, loader, lora, stack_lora, cos.copy(), sin.copy(),
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+            )
+            var nout = len(fwd.out)
+            var d_loss = List[Float32]()
+            var sse = 0.0
+            var inv_n = Float32(2.0) / Float32(nout)
+            for i in range(nout):
+                var diff = fwd.out[i] - target[i]
+                sse += Float64(diff) * Float64(diff)
+                d_loss.append(inv_n * diff)
+            loss = Float32(sse / Float64(nout))
+            grads = flux_stack_lora_backward_offload_full[H, Dh, N_IMG, N_TXT, S](
+                d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
+                stack_lora, clip_pool.copy(), cos.copy(), sin.copy(), fwd,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
+            )
         if k == 1:
             first_loss = loss
         last_loss = loss
-
-        # ── backward (offload, full depth) ──
-        # `clip_pool` (CLIP-pooled) is the text_embedder lin1 input, needed for
-        # that adapter's d_a in the stack-level backward.
-        var grads = flux_stack_lora_backward_offload_full[H, Dh, N_IMG, N_TXT, S](
-            d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
-            stack_lora, clip_pool.copy(), cos.copy(), sin.copy(), fwd,
-            D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
-        )
 
         # ── gradient accumulation (OneTrainer semantics; default-off when N==1) ─
         # Fast path: accum_steps==1 uses `grads` directly (no zero-clone/copy).
