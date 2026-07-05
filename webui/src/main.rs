@@ -26,6 +26,8 @@ use tokio::{
     sync::{broadcast, Mutex},
 };
 
+mod captioner;
+
 const REPO_ROOT: &str = "/home/alex/serenity-trainer";
 const CUDA_LD: &str = "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib";
 
@@ -651,6 +653,9 @@ async fn main() {
         .route("/api/system/metrics", get(system_metrics))
         .route("/api/dataset/media", get(dataset_media))
         .route("/api/caption", get(caption_get).put(caption_put))
+        .route("/api/captioner/run", post(captioner::run))
+        .route("/api/captioner/status", get(captioner::status))
+        .route("/api/captioner/abort", post(captioner::abort))
         .route("/api/validations", get(validations_get).put(validations_put))
         .route("/api/runs/history", get(runs_history))
         .route("/files/*path", get(file_serve))
