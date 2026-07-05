@@ -78,7 +78,12 @@ from serenitymojo.models.anima.anima_stack_lora import (
     AnimaLoraSet, AnimaLoraGrads, build_anima_lora_set,
     anima_stack_lora_forward_streamed, anima_stack_lora_backward_streamed,
     anima_stack_lora_forward_streamed_b2, anima_stack_lora_backward_streamed_b2,
+    anima_stack_lora_forward_device_resident, anima_stack_lora_backward_device_resident,
+    anima_lora_set_to_device,
     anima_lora_adamw_step, save_anima_lora, save_anima_lora_state,
+)
+from serenitymojo.models.anima.weights import (
+    AnimaBlockWeights, load_anima_block_weights_bf16_normf32,
 )
 from serenitymojo.models.anima.anima_lycoris_stack import (
     AnimaLoKrSet, empty_anima_lokr_set, build_anima_lokr_set,
@@ -845,6 +850,16 @@ def main() raises:
     var base = load_anima_stack_base(st, ctx)
     print("base projections + t_embedder loaded (F32 resident)")
 
+    # ── DEVICE-RESIDENT hot path (MJ-1075 routing fix): all 28 blocks BF16-
+    # resident ONCE (~3.7GiB). The b1 step runs the device stack (0.95s/step in
+    # the OT harness vs 29.5s streamed, parity-gated cos>=0.999997). The streamed
+    # arm remains the b2 route + the parity oracle.
+    var res_blocks = List[AnimaBlockWeights]()
+    if not use_b2:  # b2 runs the streamed arm — don't pay 3.7GB resident for it
+        for bi in range(ANIMA_DEPTH):
+            res_blocks.append(load_anima_block_weights_bf16_normf32(st, bi, ctx))
+        print("blocks resident (BF16 proj, F32 norms):", len(res_blocks), "x 20 weights")
+
     # ── load cached sample (latent + frozen context) ──
     var cache_files = _list_safetensors(cache_dir)
     var cache_path = cache_dir + String("/") + cache_files[0]
@@ -1197,10 +1212,11 @@ def main() raises:
             # ── t_embedder: sigma -> (t_cond RAW, base_adaln) ──
             var temb = _prepare_timestep(sigma, base, ctx)
 
-            # ── forward (streamed 28-block) ──
-            var fwd = anima_stack_lora_forward_streamed[H, Dh, S_IMG, S_TXT](
+            # ── forward (DEVICE-RESIDENT 28-block; LoRA uploaded once per step) ──
+            var lora_dev = anima_lora_set_to_device(lora, STDtype.BF16, ctx)
+            var fwd = anima_stack_lora_forward_device_resident[H, Dh, S_IMG, S_TXT](
                 patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
-                base, st, lora, ropes.cos, ropes.sin,
+                base, res_blocks, lora_dev, ropes.cos, ropes.sin,
                 B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
             )
 
@@ -1226,9 +1242,9 @@ def main() raises:
             last_loss = loss
 
             # ── backward (streamed) ──
-            grads = anima_stack_lora_backward_streamed[H, Dh, S_IMG, S_TXT](
+            grads = anima_stack_lora_backward_device_resident[H, Dh, S_IMG, S_TXT](
                 d_out, patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
-                base, st, lora, ropes.cos, ropes.sin, fwd,
+                base, res_blocks, lora_dev, ropes.cos, ropes.sin, fwd,
                 B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
             )
 
