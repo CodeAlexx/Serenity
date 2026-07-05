@@ -32,7 +32,7 @@ comptime SERENITY_IDEOGRAM4_CACHE = "/home/alex/serenity-trainer/output/eri2_ide
 comptime SERENITY_KREA2_CHECKPOINT = "/home/alex/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494/raw.safetensors"
 comptime SERENITY_KREA2_VAE = "/home/alex/.cache/huggingface/hub/models--Qwen--Qwen-Image/snapshots/75e0b4be04f60ec59a75f475837eced720f823b6/vae"
 comptime SERENITY_KREA2_CACHE = "/home/alex/eri2_stage_512/cache.safetensors"
-comptime SERENITY_KREA2_WORKSPACE = "/home/alex/trainings/krea2_eri2_lora"
+comptime SERENITY_KREA2_WORKSPACE = "/home/alex/mojodiffusion/output/krea2_eri2_lora_adamw"
 comptime SERENITY_KREA2_SAMPLE_PROMPTS = "/home/alex/mojodiffusion/serenitymojo/configs/krea2_samples.json"
 # HiDream-O1 — serenitymojo train_hidream_o1_real (P4 of
 # HIDREAM_O1_TRAINING_CAMPAIGN.md). Weights dir is COMPTIME in the trainer
@@ -1007,11 +1007,14 @@ def trainer_ui_apply_model_preset(mut cfg: TrainerUIConfig, prefer_model_type: B
         cfg.peft_type = String("LORA")
         cfg.timestep_shift = 1.0
         cfg.quantized_resident = String("fp8_e4m3")
-        cfg.sample_cfg = 1.0
-        cfg.sample_steps = 20.0
+        # Pinned to the PROVEN eri2 run recipe (user request 2026-07-04):
+        # save/sample every 500, 30-step cfg-3.5 renders, sample-at-start via
+        # krea2_samples.json defaults.
+        cfg.sample_cfg = 3.5
+        cfg.sample_steps = 30.0
         cfg.sample_after = 500.0
         cfg.max_train_steps = 2000.0
-        cfg.save_every = 40.0
+        cfg.save_every = 500.0
         cfg.save_filename_prefix = String("eri2_krea2")
         cfg.frames = String("1")
         cfg.resolution = String("512")
