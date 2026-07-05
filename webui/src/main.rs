@@ -359,6 +359,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
                     _ => "failed".into(),
                 };
             }
+            append_history(r);
             let _ = stc.events.send(json!({"type": "status", "run": &*r}).to_string());
         }
     });
@@ -457,20 +458,130 @@ async fn samples(State(st): State<Arc<AppState>>, AxPath(id): AxPath<u64>) -> Js
     Json(json!({"samples": out.iter().map(|p| format!("/files{p}")).collect::<Vec<_>>()}))
 }
 
+fn media_ok(p: &str) -> bool {
+    // read-only serving scope: user-owned media/text under /home/alex, no traversal, no dotfiles
+    p.starts_with("/home/alex/")
+        && !p.contains("..")
+        && !p.split('/').any(|seg| seg.starts_with('.') && seg.len() > 2)
+        && [".png", ".jpg", ".jpeg", ".webp", ".txt", ".json"].iter().any(|e| p.to_lowercase().ends_with(e))
+}
+
 async fn file_serve(AxPath(path): AxPath<String>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    // only serve from the output tree (gallery scope)
     let full = format!("/{path}");
-    if !full.starts_with("/home/alex/mojodiffusion/output/") || full.contains("..") {
+    if !media_ok(&full) {
         return StatusCode::FORBIDDEN.into_response();
     }
     match std::fs::read(&full) {
         Ok(bytes) => {
-            let ct = if full.ends_with(".png") { "image/png" } else { "application/octet-stream" };
+            let low = full.to_lowercase();
+            let ct = if low.ends_with(".png") { "image/png" }
+                else if low.ends_with(".jpg") || low.ends_with(".jpeg") { "image/jpeg" }
+                else if low.ends_with(".webp") { "image/webp" }
+                else if low.ends_with(".json") { "application/json" }
+                else { "text/plain; charset=utf-8" };
             ([(axum::http::header::CONTENT_TYPE, ct)], bytes).into_response()
         }
         Err(_) => StatusCode::NOT_FOUND.into_response(),
     }
+}
+
+#[derive(Deserialize)]
+struct PathQ { path: String }
+
+/// Dataset browser: images in a folder + caption sidecar presence (UI_MAP §6/§7)
+async fn dataset_media(axum::extract::Query(q): axum::extract::Query<PathQ>) -> Json<Value> {
+    if !q.path.starts_with("/home/alex/") || q.path.contains("..") {
+        return Json(json!({"error": "path out of scope"}));
+    }
+    let mut items = vec![];
+    if let Ok(rd) = std::fs::read_dir(&q.path) {
+        let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+        files.sort();
+        for p in files {
+            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+            if ["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
+                let cap = p.with_extension("txt");
+                items.push(json!({
+                    "image": format!("/files{}", p.display()),
+                    "path": p.to_string_lossy(),
+                    "caption_path": cap.exists().then(|| cap.to_string_lossy().to_string()),
+                }));
+            }
+        }
+    }
+    Json(json!({"count": items.len(), "items": items}))
+}
+
+/// Caption sidecar read/write — string-native (kills the Mojo CaptionerTab byte-slice crash class)
+async fn caption_get(axum::extract::Query(q): axum::extract::Query<PathQ>) -> Json<Value> {
+    if !q.path.starts_with("/home/alex/") || !q.path.ends_with(".txt") || q.path.contains("..") {
+        return Json(json!({"error": "caption path out of scope"}));
+    }
+    Json(json!({"path": q.path, "text": std::fs::read_to_string(&q.path).unwrap_or_default()}))
+}
+
+#[derive(Deserialize)]
+struct CaptionPut { path: String, text: String }
+
+async fn caption_put(Json(b): Json<CaptionPut>) -> (StatusCode, Json<Value>) {
+    if !b.path.starts_with("/home/alex/") || !b.path.ends_with(".txt") || b.path.contains("..") {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "caption path out of scope"})));
+    }
+    match std::fs::write(&b.path, &b.text) {
+        Ok(_) => (StatusCode::OK, Json(json!({"saved": b.path}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+/// Validation prompts (samples JSON) editor
+async fn validations_get(axum::extract::Query(q): axum::extract::Query<PathQ>) -> Json<Value> {
+    if !q.path.ends_with(".json") || q.path.contains("..") {
+        return Json(json!({"error": "json path required"}));
+    }
+    match std::fs::read_to_string(&q.path).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+        Some(v) => Json(json!({"path": q.path, "content": v})),
+        None => Json(json!({"error": format!("cannot read/parse {}", q.path)})),
+    }
+}
+
+#[derive(Deserialize)]
+struct ValidationsPut { path: String, content: Value }
+
+async fn validations_put(Json(b): Json<ValidationsPut>) -> (StatusCode, Json<Value>) {
+    if !b.path.starts_with("/home/alex/") || !b.path.ends_with(".json") || b.path.contains("..") {
+        return (StatusCode::FORBIDDEN, Json(json!({"error": "path out of scope"})));
+    }
+    // enforce the user's 1024 minimum for image validation renders (samples validator rule)
+    if let Some(d) = b.content.get("defaults") {
+        let w = d.get("width").and_then(|v| v.as_u64()).unwrap_or(1024);
+        let h = d.get("height").and_then(|v| v.as_u64()).unwrap_or(1024);
+        let enforce = d.get("enforce_min_image_size").and_then(|v| v.as_bool()).unwrap_or(true);
+        if enforce && (w < 1024 || h < 1024) {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": "image validation samples must be 1024x1024 or larger (user standard)"})));
+        }
+    }
+    match std::fs::write(&b.path, serde_json::to_string_pretty(&b.content).unwrap()) {
+        Ok(_) => (StatusCode::OK, Json(json!({"saved": b.path}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
+fn history_path() -> String {
+    format!("{REPO_ROOT}/webui/runs_history.jsonl")
+}
+
+fn append_history(r: &RunInfo) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(history_path()) {
+        let _ = writeln!(f, "{}", serde_json::to_string(r).unwrap_or_default());
+    }
+}
+
+async fn runs_history() -> Json<Value> {
+    let s = std::fs::read_to_string(history_path()).unwrap_or_default();
+    let rows: Vec<Value> = s.lines().rev().take(50).filter_map(|l| serde_json::from_str(l).ok()).collect();
+    Json(json!({"history": rows}))
 }
 
 async fn events(State(st): State<Arc<AppState>>) -> Sse<EvStream> {
@@ -538,6 +649,10 @@ async fn main() {
         .route("/api/runs/:id/samples", get(samples))
         .route("/api/events", get(events))
         .route("/api/system/metrics", get(system_metrics))
+        .route("/api/dataset/media", get(dataset_media))
+        .route("/api/caption", get(caption_get).put(caption_put))
+        .route("/api/validations", get(validations_get).put(validations_put))
+        .route("/api/runs/history", get(runs_history))
         .route("/files/*path", get(file_serve))
         .nest_service("/", tower_http::services::ServeDir::new(static_dir).append_index_html_on_directories(true))
         .with_state(st);

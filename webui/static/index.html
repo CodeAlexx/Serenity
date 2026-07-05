@@ -67,12 +67,16 @@
   <nav>
     <div class="grp">SERENITY</div>
     <div class="grp">CONFIGURE</div>
+    <a data-sec="general">General</a>
     <a data-sec="model" class="sel">Model</a>
     <a data-sec="lora">LoRA / Network</a>
     <a data-sec="dataset">Dataset</a>
+    <a data-sec="captioner">Captioner</a>
+    <a data-sec="validations">Validations</a>
     <a data-sec="training">Training</a>
     <a data-sec="sampling">Sampling</a>
     <a data-sec="resume">Resume</a>
+    <a data-sec="backup">Backup</a>
     <a data-sec="runs">Runs</a>
     <a data-sec="logs">Logs</a>
     <a data-sec="samples">Samples</a>
@@ -80,6 +84,20 @@
   </nav>
 
   <div id="center">
+    <!-- GENERAL -->
+    <div class="sec" id="sec-general">
+      <div class="panel"><h3>WORKSPACE</h3><div class="sub">Run identity and locations</div>
+        <div class="row"><label>Run name</label><input id="g_runname" oninput="$('runname_top').value=this.value;$('runname_top').dispatchEvent(new Event('input'))"></div>
+        <div class="row"><label>Output root</label><input value="/home/alex/mojodiffusion/output/<run name>" disabled></div>
+        <div class="row"><label>Train device</label><input value="cuda (RTX 3090 Ti)" disabled></div>
+      </div>
+      <div class="panel"><h3>NOT WIRED (honesty panel)</h3><div class="sub">Present in the Mojo UI but consumed by no runner — kept visible so nothing silently lies (UI_MAP §8.5)</div>
+        <div class="row"><label>Tensorboard</label><input disabled value="[not wired]"></div>
+        <div class="row"><label>Continue last backup</label><input disabled value="[not wired — use Resume tab with the .state file]"></div>
+        <div class="row"><label>Multi-GPU</label><input disabled value="[not wired — single 3090 Ti]"></div>
+      </div>
+    </div>
+
     <!-- MODEL -->
     <div class="sec show" id="sec-model">
       <div class="panel"><h3>BASE MODEL</h3><div class="sub">Method, architecture, and checkpoint</div>
@@ -117,9 +135,60 @@
 
     <!-- DATASET -->
     <div class="sec" id="sec-dataset">
-      <div class="panel"><h3>DATASET</h3><div class="sub">Pre-staged cache (latents + text conditioning)</div>
+      <div class="panel"><h3>DATASET</h3><div class="sub">Pre-staged cache (latents + text conditioning) — training reads the CACHE, the browser below reads the raw image folder</div>
         <div class="row"><label>Cache path</label><input id="cache"></div>
         <div class="row"><label>Caption dropout</label><input id="caption_dropout" type="number" step="0.01" value="0"></div>
+        <div class="row"><label>Image folder</label><input id="ds_folder" placeholder="/home/alex/1_giger/gigerver3"></div>
+        <div class="row"><label></label><button style="background:var(--acc);color:#08131f;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer" onclick="scanDataset()">Scan folder</button></div>
+      </div>
+      <div class="panel"><h3>MEDIA <span id="ds_count" style="color:var(--dim);font-weight:400"></span></h3>
+        <div id="ds_grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px"></div>
+      </div>
+      <div class="panel" id="ds_cap_panel" style="display:none"><h3>CAPTION</h3><div class="sub" id="ds_cap_path"></div>
+        <textarea id="ds_cap_text" style="width:100%;height:110px;background:#12171d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:13px/1.5 ui-monospace,monospace"></textarea>
+        <button style="background:var(--ok);color:#08130d;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer;margin-top:8px" onclick="saveCaption()">Save caption</button>
+        <span id="ds_cap_msg" style="color:var(--dim);font-size:12px;margin-left:10px"></span>
+      </div>
+    </div>
+
+    <!-- CAPTIONER -->
+    <div class="sec" id="sec-captioner">
+      <div class="panel"><h3>CAPTIONER</h3><div class="sub">Caption model settings — the Mojo UI queued to a command file NO runner consumes (UI_MAP §7); the web UI keeps the honest state until a captioner runner is wired</div>
+        <div class="grid2"><div>
+          <div class="row"><label>Model</label><select id="cap_model"><option>Qwen3-VL-8B-Instruct</option><option>Qwen3-VL-4B-Instruct</option><option>Qwen2.5-VL-7B-Instruct</option><option>Qwen2.5-VL-3B-Instruct</option><option>Custom…</option></select></div>
+          <div class="row"><label>Custom model id</label><input id="cap_custom" placeholder=""></div>
+          <div class="row"><label>Quantization</label><select id="cap_quant"><option>8-bit</option><option>None</option><option>4-bit</option></select></div>
+          <div class="row"><label>Attention</label><select id="cap_attn"><option>flash_attention_2</option><option>eager</option></select></div>
+        </div><div>
+          <div class="row"><label>Prompt</label><input id="cap_prompt" value="Describe this media."></div>
+          <div class="row"><label>Max tokens</label><input id="cap_maxtok" type="number" value="128"></div>
+          <div class="row"><label>Skip existing</label><input id="cap_skip" type="checkbox" checked></div>
+        </div></div>
+        <button disabled style="background:var(--panel);color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:7px 14px;margin-top:8px">Queue caption run — runner not wired (honest 501)</button>
+        <div class="sub" style="margin-top:8px">Caption viewing/editing works today: use the Dataset tab's grid — click an image, edit its sidecar, save.</div>
+      </div>
+    </div>
+
+    <!-- VALIDATIONS -->
+    <div class="sec" id="sec-validations">
+      <div class="panel"><h3>VALIDATION PROMPTS</h3><div class="sub">serenity.sample_prompts.v1 editor — 1024×1024 minimum enforced on save</div>
+        <div class="row"><label>Prompts file</label><input id="val_file" placeholder="/home/alex/mojodiffusion/serenitymojo/configs/krea2_samples.json"></div>
+        <div class="row"><label></label><button style="background:var(--acc);color:#08131f;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer" onclick="loadValidations()">Load</button></div>
+        <textarea id="val_json" style="display:none;width:100%;height:380px;background:#12171d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:12px/1.5 ui-monospace,monospace;margin-top:10px"></textarea>
+        <button id="val_save" style="display:none;background:var(--ok);color:#08130d;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer;margin-top:8px" onclick="saveValidations()">Save prompts file</button>
+        <span id="val_msg" style="color:var(--dim);font-size:12px;margin-left:10px"></span>
+      </div>
+    </div>
+
+    <!-- BACKUP -->
+    <div class="sec" id="sec-backup">
+      <div class="panel"><h3>SAVES</h3><div class="sub">Checkpoint cadence (rolling-backup knobs are Mojo snapshot-only — not shown)</div>
+        <div class="row"><label>Save every</label><input value="see Training → Save every" disabled></div>
+        <div class="row"><label>Resume states</label><input value="every save writes <ckpt>.state — full resume via Resume tab" disabled></div>
+      </div>
+      <div class="panel"><h3>PRESET SNAPSHOT</h3><div class="sub">The EXACT config + argv the server will launch — live dry-run, stronger than the Mojo static panel</div>
+        <button style="background:var(--acc);color:#08131f;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer" onclick="dryRun()">Preview launch (dry run)</button>
+        <pre id="dry_out" style="background:#0b0e12;border:1px solid var(--line);border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;margin-top:10px"></pre>
       </div>
     </div>
 
@@ -206,6 +275,11 @@
 </main>
 <div id="lightbox" onclick="this.style.display='none'"><img id="lbimg"></div>
 <script>
+// surface any script failure in the validation slot instead of dying silently
+window.onerror = (m, s, l) => { const el = document.getElementById("valid"); if (el) el.textContent = "JS error: " + m + " @" + l; };
+window.addEventListener("unhandledrejection", e => {
+  const el = document.getElementById("valid");
+  if (el) el.textContent = ("async error: " + (e.reason && (e.reason.message || e.reason))).slice(0, 200); });
 let PRESETS = [], RUN = null;
 const $ = id => document.getElementById(id);
 const RECIPE_FIELDS = ["learning_rate","lora_rank","lora_alpha","max_steps","save_every","sample_every",
@@ -245,7 +319,7 @@ $("network_algorithm").onchange = () => $("algo_show").value = $("network_algori
 $("runname_top").oninput = () => { $("projname").textContent = $("runname_top").value;
   $("workspace_dir").value = "/home/alex/mojodiffusion/output/" + $("runname_top").value; };
 
-$("startbtn").onclick = async () => {
+function buildLaunchBody() {
   const overrides = {};
   for (const f of RECIPE_FIELDS.concat(EXTRA_FIELDS)) {
     const el = $(f); if (!el) continue;
@@ -259,6 +333,10 @@ $("startbtn").onclick = async () => {
                  cache: $("cache").value || null, run_name: $("runname_top").value || null };
   if ($("resume_state").value) { body.resume_state = $("resume_state").value;
                                  body.start_step = parseInt($("start_step").value || "0"); }
+  return body;
+}
+$("startbtn").onclick = async () => {
+  const body = buildLaunchBody();
   const r = await fetch("/api/runs", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
   const j = await r.json();
   if (!r.ok) { $("msg").textContent = "✗ " + j.error; $("valid").textContent = "VALIDATION — " + j.error; return; }
@@ -284,10 +362,75 @@ async function refreshGallery() {
     `<img src="${s}" loading="lazy" onclick="$('lbimg').src='${s}';$('lightbox').style.display='flex'">`).join("");
 }
 async function refreshRuns() {
-  const j = await (await fetch("/api/runs")).json();
-  $("runslist").innerHTML = j.runs.length ? j.runs.map(r =>
-    `#${r.id} ${r.preset_id} — ${r.status} — step ${r.step}/${r.total_steps} — <a style="color:var(--acc)" href="/files${r.log_path}">log</a>`).join("<br>") : "no runs this session";
+  const live = await (await fetch("/api/runs")).json();
+  const hist = await (await fetch("/api/runs/history")).json();
+  const row = r => `#${r.id} ${r.preset_id} — ${r.status} — step ${r.step}/${r.total_steps} — loss ${(r.loss||0).toFixed(4)} — <a style="color:var(--acc)" href="/files${r.log_path}">log</a>`;
+  const liveHtml = live.runs.length ? "<b>THIS SESSION</b><br>" + live.runs.map(row).join("<br>") : "";
+  const histHtml = hist.history.length ? "<br><b>HISTORY</b><br>" + hist.history.map(row).join("<br>") : "";
+  $("runslist").innerHTML = (liveHtml + histHtml) || "no runs recorded";
 }
+
+/* ── dataset browser + caption editor ── */
+let CUR_CAP = null;
+async function scanDataset() {
+  const j = await (await fetch("/api/dataset/media?path=" + encodeURIComponent($("ds_folder").value))).json();
+  if (j.error) { $("ds_count").textContent = "— " + j.error; return; }
+  $("ds_count").textContent = `— ${j.count} images`;
+  $("ds_grid").innerHTML = j.items.map((it, i) =>
+    `<img src="${it.image}" loading="lazy" style="width:100%;border-radius:6px;border:1px solid var(--line);cursor:pointer" onclick='openCaption(${JSON.stringify(JSON.stringify(it))})'>`).join("");
+}
+async function openCaption(itJson) {
+  const it = JSON.parse(itJson);
+  $("lbimg").src = it.image; $("lightbox").style.display = "flex";
+  if (!it.caption_path) { $("ds_cap_panel").style.display = "none"; return; }
+  CUR_CAP = it.caption_path;
+  const j = await (await fetch("/api/caption?path=" + encodeURIComponent(it.caption_path))).json();
+  $("ds_cap_panel").style.display = "block";
+  $("ds_cap_path").textContent = it.caption_path;
+  $("ds_cap_text").value = j.text || "";
+}
+async function saveCaption() {
+  const r = await fetch("/api/caption", {method:"PUT", headers:{"content-type":"application/json"},
+    body: JSON.stringify({path: CUR_CAP, text: $("ds_cap_text").value})});
+  const j = await r.json();
+  $("ds_cap_msg").textContent = r.ok ? "✓ saved" : "✗ " + j.error;
+}
+
+/* ── validations editor ── */
+async function loadValidations() {
+  const j = await (await fetch("/api/validations?path=" + encodeURIComponent($("val_file").value))).json();
+  if (j.error) { $("val_msg").textContent = "✗ " + j.error; return; }
+  $("val_json").style.display = "block"; $("val_save").style.display = "inline-block";
+  $("val_json").value = JSON.stringify(j.content, null, 1);
+  $("val_msg").textContent = "";
+}
+async function saveValidations() {
+  let content;
+  try { content = JSON.parse($("val_json").value); } catch (e) { $("val_msg").textContent = "✗ invalid JSON: " + e.message; return; }
+  const r = await fetch("/api/validations", {method:"PUT", headers:{"content-type":"application/json"},
+    body: JSON.stringify({path: $("val_file").value, content})});
+  const j = await r.json();
+  $("val_msg").textContent = r.ok ? "✓ saved" : "✗ " + j.error;
+}
+
+/* ── dry-run preview (Backup tab) ── */
+async function dryRun() {
+  const body = buildLaunchBody(); body.dry_run = true;
+  const r = await fetch("/api/runs", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  $("dry_out").textContent = r.ok
+    ? "BINARY: " + j.binary + "\nARGS:   " + j.args.join(" ") + "\n\nCONFIG (" + j.config_written + "):\n" + JSON.stringify(j.config, null, 2)
+    : "✗ " + j.error;
+}
+
+/* ── form persistence (the Mojo curated-12 idea, localStorage) ── */
+const PERSIST = ["learning_rate","lora_rank","lora_alpha","max_steps","save_every","sample_every","seed","caption_dropout"];
+function persistSave() { const o = {}; for (const f of PERSIST) o[f] = $(f).value; localStorage.setItem("swt_cfg", JSON.stringify(o)); }
+function persistLoad() {
+  try { const o = JSON.parse(localStorage.getItem("swt_cfg") || "{}");
+        for (const f of PERSIST) if (o[f] !== undefined && o[f] !== "") $(f).value = o[f]; } catch (e) {}
+}
+PERSIST.forEach(f => { const el = $(f); if (el) el.addEventListener("change", persistSave); });
 function connectSSE() {
   const es = new EventSource("/api/events");
   es.onmessage = e => {
@@ -321,7 +464,17 @@ async function pollSystem() {
   $("h_vram").textContent = `${(m.vram_used_mb/1024).toFixed(1)} / ${(m.vram_total_mb/1024).toFixed(1)} GB`;
   $("h_ram").textContent = `${m.ram_used_gb} / ${m.ram_total_gb} GB`;
 }
-loadPresets(); connectSSE(); pollSystem(); setInterval(pollSystem, 5000);
+/* hash routing (#dataset etc.) — deep-linkable tabs */
+function routeHash() {
+  const h = location.hash.replace("#", "");
+  const a = document.querySelector(`nav a[data-sec="${h}"]`);
+  if (a) a.click();
+}
+window.addEventListener("hashchange", routeHash);
+
+loadPresets().then(() => { persistLoad(); $("g_runname").value = $("runname_top").value; routeHash(); })
+             .catch(e => { $("valid").textContent = "PRESETS FAIL: " + (e.message || e); });
+connectSSE(); pollSystem(); setInterval(pollSystem, 5000);
 </script>
 </body>
 </html>
