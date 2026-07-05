@@ -154,9 +154,13 @@ def _append_preview_asset(
 
 
 def _basename(path: String) -> String:
+    # RAW-BYTE scan for '/': String(path[byte=i]) asserts when byte i lands
+    # mid-codepoint (crashes on any non-ASCII path char). '/' is single-byte
+    # ASCII so the slice at last+1 is always a codepoint boundary.
+    var b = path.as_bytes()
     var last = -1
-    for i in range(path.byte_length()):
-        if String(path[byte=i]) == String("/"):
+    for i in range(len(b)):
+        if b[i] == 0x2F:  # '/'
             last = i
     if last >= 0 and last + 1 < path.byte_length():
         return String(path[byte=last + 1:])

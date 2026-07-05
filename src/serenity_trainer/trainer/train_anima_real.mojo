@@ -79,6 +79,7 @@ from serenitymojo.models.anima.anima_stack_lora import (
     anima_stack_lora_forward_streamed, anima_stack_lora_backward_streamed,
     anima_stack_lora_forward_streamed_b2, anima_stack_lora_backward_streamed_b2,
     anima_stack_lora_forward_device_resident, anima_stack_lora_backward_device_resident,
+    anima_stack_lora_forward_device_resident_b2, anima_stack_lora_backward_device_resident_b2,
     anima_lora_set_to_device,
     anima_lora_adamw_step, save_anima_lora, save_anima_lora_state,
 )
@@ -853,12 +854,12 @@ def main() raises:
     # ── DEVICE-RESIDENT hot path (MJ-1075 routing fix): all 28 blocks BF16-
     # resident ONCE (~3.7GiB). The b1 step runs the device stack (0.95s/step in
     # the OT harness vs 29.5s streamed, parity-gated cos>=0.999997). The streamed
-    # arm remains the b2 route + the parity oracle.
+    # arm remains the parity oracle. b1 AND b2 (TRUE batch-2) both run the device
+    # stack, so the 28 blocks are pinned resident for either batch size.
     var res_blocks = List[AnimaBlockWeights]()
-    if not use_b2:  # b2 runs the streamed arm — don't pay 3.7GB resident for it
-        for bi in range(ANIMA_DEPTH):
-            res_blocks.append(load_anima_block_weights_bf16_normf32(st, bi, ctx))
-        print("blocks resident (BF16 proj, F32 norms):", len(res_blocks), "x 20 weights")
+    for bi in range(ANIMA_DEPTH):
+        res_blocks.append(load_anima_block_weights_bf16_normf32(st, bi, ctx))
+    print("blocks resident (BF16 proj, F32 norms):", len(res_blocks), "x 20 weights")
 
     # ── load cached sample (latent + frozen context) ──
     var cache_files = _list_safetensors(cache_dir)
@@ -1153,11 +1154,13 @@ def main() raises:
             var base_adaln_b2 = temb0.base_adaln.copy()
             for i in range(len(temb1.base_adaln)):
                 base_adaln_b2.append(temb1.base_adaln[i])
-            # forward (B=2). ropes.cos/sin are the SINGLE-sample table; the b2 stack
-            # doubles them internally (both samples share the same image grid).
-            var fwd = anima_stack_lora_forward_streamed_b2[H, Dh, S_IMG, S_TXT](
+            # forward (B=2, DEVICE-RESIDENT; LoRA uploaded once per step). ropes.cos/
+            # sin are the SINGLE-sample table; the b2 stack doubles them internally
+            # (both samples share the same image grid).
+            var lora_dev_b2 = anima_lora_set_to_device(lora, STDtype.BF16, ctx)
+            var fwd = anima_stack_lora_forward_device_resident_b2[H, Dh, S_IMG, S_TXT](
                 patches_b2.copy(), t_cond_b2.copy(), base_adaln_b2.copy(), context_b2.copy(),
-                base, st, lora, ropes.cos, ropes.sin,
+                base, res_blocks, lora_dev_b2, ropes.cos, ropes.sin,
                 2, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
             )
             # JOINT 2N-mean MSE: d_out = 2/(2N)*(pred-target); loss = sse/(2N).
@@ -1174,9 +1177,9 @@ def main() raises:
             if step == 0:
                 first_loss = loss
             last_loss = loss
-            grads = anima_stack_lora_backward_streamed_b2[H, Dh, S_IMG, S_TXT](
+            grads = anima_stack_lora_backward_device_resident_b2[H, Dh, S_IMG, S_TXT](
                 d_out_b2, patches_b2.copy(), t_cond_b2.copy(), base_adaln_b2.copy(), context_b2.copy(),
-                base, st, lora, ropes.cos, ropes.sin, fwd,
+                base, res_blocks, lora_dev_b2, ropes.cos, ropes.sin, fwd,
                 2, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
             )
         else:
