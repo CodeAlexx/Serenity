@@ -50,6 +50,37 @@
   .kv span { text-align:right; background:#12171d; border:1px solid var(--line); border-radius:4px; padding:1px 8px; margin-bottom:3px; font-size:12px; min-width:70px; }
   hr { border:0; border-top:1px solid var(--line); margin:12px 0; }
   #msg { margin-top:8px; font-size:12px; color:var(--dim); word-break:break-all; }
+  /* dataset stats + cells */
+  .dschips { display:flex; flex-wrap:wrap; gap:8px; margin-bottom:10px; }
+  .dschip { background:#12171d; border:1px solid var(--line); border-radius:6px; padding:4px 10px; font-size:12px; color:var(--fg); }
+  .dschip b { color:var(--dim); font-weight:500; margin-right:5px; }
+  .dschip.warn { border-color:var(--orange); color:var(--orange); }
+  .dscell { position:relative; }
+  .dscell img { width:100%; border-radius:6px; border:2px solid var(--line); cursor:pointer; display:block; }
+  .dscell.miss img { border-color:var(--orange); }
+  .dscell.ok img { border-color:var(--ok); }
+  .dsbadge { position:absolute; top:4px; left:4px; font-size:10px; font-weight:700; padding:2px 6px; border-radius:4px; pointer-events:none; }
+  .dsbadge.miss { background:var(--orange); color:#1a1206; }
+  .dsbadge.ok { background:rgba(76,175,125,.85); color:#08130d; }
+  .dsres { color:var(--dim); font-size:11px; }
+  /* validation structured editor */
+  .vdefaults { display:grid; grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:8px 14px; }
+  .vfield { display:flex; flex-direction:column; gap:2px; }
+  .vfield label { color:var(--dim); font-size:11px; }
+  .vfield input { font-size:12px; padding:4px 7px; }
+  .vtoggles { display:flex; flex-wrap:wrap; gap:14px; margin:10px 0 2px; font-size:12px; color:var(--dim); }
+  .vtoggles label { display:flex; gap:5px; align-items:center; }
+  .vtoggles input { width:auto; }
+  .vprompt { background:#12171d; border:1px solid var(--line); border-radius:8px; padding:10px 12px; margin-bottom:10px; }
+  .vprompt-head { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+  .vprompt-head input { flex:1; }
+  .vprompt textarea { width:100%; height:60px; background:#0b0e12; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px; font:12px/1.5 ui-monospace,monospace; resize:vertical; }
+  .voverrides { display:grid; grid-template-columns:repeat(auto-fill,minmax(84px,1fr)); gap:6px 10px; margin-top:6px; }
+  .vcaps { color:var(--dim); font-size:11px; margin-top:6px; word-break:break-all; }
+  .vdel { background:var(--bad); color:#fff; border:0; border-radius:6px; padding:5px 10px; font-weight:700; cursor:pointer; font-size:12px; }
+  .vbtn { background:var(--acc); color:#08131f; border:0; border-radius:6px; padding:7px 14px; font-weight:600; cursor:pointer; }
+  .vbtn.ok { background:var(--ok); color:#08130d; }
+  .vbtn.ghost { background:var(--panel); color:var(--fg); border:1px solid var(--line); }
   #lightbox { display:none; position:fixed; inset:0; background:rgba(0,0,0,.85); z-index:9; align-items:center; justify-content:center; }
   #lightbox img { max-width:92vw; max-height:92vh; border-radius:8px; }
 </style>
@@ -142,9 +173,11 @@
         <div class="row"><label></label><button style="background:var(--acc);color:#08131f;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer" onclick="scanDataset()">Scan folder</button></div>
       </div>
       <div class="panel"><h3>MEDIA <span id="ds_count" style="color:var(--dim);font-weight:400"></span></h3>
+        <div id="ds_stats" class="dschips" style="display:none"></div>
         <div id="ds_grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px"></div>
       </div>
       <div class="panel" id="ds_cap_panel" style="display:none"><h3>CAPTION</h3><div class="sub" id="ds_cap_path"></div>
+        <img id="ds_cap_img" style="max-width:260px;max-height:200px;border-radius:6px;border:1px solid var(--line);margin-bottom:10px;display:block">
         <textarea id="ds_cap_text" style="width:100%;height:110px;background:#12171d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:13px/1.5 ui-monospace,monospace"></textarea>
         <button style="background:var(--ok);color:#08130d;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer;margin-top:8px" onclick="saveCaption()">Save caption</button>
         <span id="ds_cap_msg" style="color:var(--dim);font-size:12px;margin-left:10px"></span>
@@ -153,30 +186,44 @@
 
     <!-- CAPTIONER -->
     <div class="sec" id="sec-captioner">
-      <div class="panel"><h3>CAPTIONER</h3><div class="sub">Caption model settings — the Mojo UI queued to a command file NO runner consumes (UI_MAP §7); the web UI keeps the honest state until a captioner runner is wired</div>
+      <div class="panel"><h3>CAPTIONER</h3><div class="sub">Qwen3-VL vision captioner — writes a .txt sidecar next to each image in the folder (ai-toolkit venv, GPU). Edit results in the Dataset tab.</div>
         <div class="grid2"><div>
-          <div class="row"><label>Model</label><select id="cap_model"><option>Qwen3-VL-8B-Instruct</option><option>Qwen3-VL-4B-Instruct</option><option>Qwen2.5-VL-7B-Instruct</option><option>Qwen2.5-VL-3B-Instruct</option><option>Custom…</option></select></div>
-          <div class="row"><label>Custom model id</label><input id="cap_custom" placeholder=""></div>
-          <div class="row"><label>Quantization</label><select id="cap_quant"><option>8-bit</option><option>None</option><option>4-bit</option></select></div>
-          <div class="row"><label>Attention</label><select id="cap_attn"><option>flash_attention_2</option><option>eager</option></select></div>
+          <div class="row"><label>Image folder</label><input id="cap_folder" placeholder="/home/alex/1_giger/gigerver3"></div>
+          <div class="row"><label>Model</label><select id="cap_model">
+            <option value="Qwen/Qwen3-VL-4B-Instruct">Qwen3-VL-4B-Instruct (fast)</option>
+            <option value="Qwen/Qwen3-VL-8B-Instruct">Qwen3-VL-8B-Instruct</option>
+            <option value="prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it">Qwen3-VL-8B-Abliterated-Caption</option>
+            <option value="__custom__">Custom…</option></select></div>
+          <div class="row"><label>Custom model id</label><input id="cap_custom" placeholder="org/model-id"></div>
+          <div class="row"><label>Max tokens</label><input id="cap_maxtok" type="number" value="512"></div>
         </div><div>
-          <div class="row"><label>Prompt</label><input id="cap_prompt" value="Describe this media."></div>
-          <div class="row"><label>Max tokens</label><input id="cap_maxtok" type="number" value="128"></div>
-          <div class="row"><label>Skip existing</label><input id="cap_skip" type="checkbox" checked></div>
+          <div class="row"><label>Prompt</label><input id="cap_prompt" placeholder="(default detailed training caption)"></div>
+          <div class="row"><label>One sentence</label><input id="cap_one" type="checkbox"></div>
+          <div class="row"><label>Skip existing .txt</label><input id="cap_skip" type="checkbox" checked></div>
         </div></div>
-        <button disabled style="background:var(--panel);color:var(--dim);border:1px solid var(--line);border-radius:6px;padding:7px 14px;margin-top:8px">Queue caption run — runner not wired (honest 501)</button>
-        <div class="sub" style="margin-top:8px">Caption viewing/editing works today: use the Dataset tab's grid — click an image, edit its sidecar, save.</div>
+        <button id="cap_run" style="background:var(--acc);color:#08131f;border:0;border-radius:6px;padding:7px 16px;font-weight:600;cursor:pointer;margin-top:8px" onclick="runCaptioner()">Run captioner</button>
+        <button id="cap_abort" style="background:var(--bad);color:#fff;border:0;border-radius:6px;padding:7px 16px;font-weight:600;cursor:pointer;margin-top:8px;display:none" onclick="abortCaptioner()">Abort</button>
+        <span id="cap_msg" style="color:var(--dim);font-size:12px;margin-left:10px"></span>
+      </div>
+      <div class="panel" id="cap_prog_panel" style="display:none"><h3>PROGRESS <span id="cap_prog_count" style="color:var(--dim);font-weight:400"></span></h3>
+        <div id="cap_bar" style="height:5px;background:#12171d;border-radius:3px;overflow:hidden;margin:6px 0 10px"><div id="cap_barfill" style="height:100%;width:0%;background:var(--acc);transition:width .3s"></div></div>
+        <div class="sub" id="cap_current"></div>
+        <div id="cap_results" style="margin-top:10px;display:grid;gap:8px"></div>
       </div>
     </div>
 
     <!-- VALIDATIONS -->
     <div class="sec" id="sec-validations">
-      <div class="panel"><h3>VALIDATION PROMPTS</h3><div class="sub">serenity.sample_prompts.v1 editor — 1024×1024 minimum enforced on save</div>
+      <div class="panel"><h3>VALIDATION PROMPTS</h3><div class="sub">serenity.sample_prompts.v1 editor — structured per-prompt rows (blank override = inherit default); 1024×1024 minimum enforced on save unless the file sets enforce_min_image_size = false</div>
         <div class="row"><label>Prompts file</label><input id="val_file" placeholder="/home/alex/mojodiffusion/serenitymojo/configs/krea2_samples.json"></div>
-        <div class="row"><label></label><button style="background:var(--acc);color:#08131f;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer" onclick="loadValidations()">Load</button></div>
+        <div class="row"><label></label><button class="vbtn" onclick="loadValidations()">Load</button></div>
+        <div id="val_struct" style="display:none;margin-top:12px"></div>
         <textarea id="val_json" style="display:none;width:100%;height:380px;background:#12171d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:12px/1.5 ui-monospace,monospace;margin-top:10px"></textarea>
-        <button id="val_save" style="display:none;background:var(--ok);color:#08130d;border:0;border-radius:6px;padding:7px 14px;font-weight:600;cursor:pointer;margin-top:8px" onclick="saveValidations()">Save prompts file</button>
-        <span id="val_msg" style="color:var(--dim);font-size:12px;margin-left:10px"></span>
+        <div id="val_actions" style="display:none;margin-top:10px">
+          <button class="vbtn ok" onclick="saveValidations()">Save prompts file</button>
+          <button class="vbtn ghost" style="margin-left:8px" onclick="toggleValRaw()">Toggle raw JSON</button>
+          <span id="val_msg" style="color:var(--dim);font-size:12px;margin-left:10px"></span>
+        </div>
       </div>
     </div>
 
@@ -227,6 +274,8 @@
       <div class="panel"><h3>SAMPLING</h3><div class="sub">Inline validation renders (1024×1024 minimum, from the samples JSON)</div>
         <div class="row"><label>Sample every</label><input id="sample_every" type="number"></div>
         <div class="row"><label>Prompts file</label><input id="validation_prompts_file" placeholder="preset / config default"></div>
+        <div class="row"><label></label><button class="vbtn ghost" onclick="editPromptsFromSampling()">Edit these prompts →</button></div>
+        <div id="samp_preview" class="sub" style="margin-top:8px"></div>
       </div>
     </div>
 
@@ -370,47 +419,236 @@ async function refreshRuns() {
   $("runslist").innerHTML = (liveHtml + histHtml) || "no runs recorded";
 }
 
+/* ── small escapers for HTML injection into the editors ── */
+function escHtml(s){ return String(s).replace(/[&<>]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function escAttr(s){ return String(s).replace(/[&<>"]/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
 /* ── dataset browser + caption editor ── */
-let CUR_CAP = null;
+let CUR_CAP = null, CUR_CAP_ITEM = -1;
+let DS_ITEMS = [], DS_RES = {}, DS_RES_SEEN = 0;
 async function scanDataset() {
   const j = await (await fetch("/api/dataset/media?path=" + encodeURIComponent($("ds_folder").value))).json();
-  if (j.error) { $("ds_count").textContent = "— " + j.error; return; }
+  if (j.error) { $("ds_count").textContent = "— " + j.error; $("ds_stats").style.display = "none"; $("ds_grid").innerHTML = ""; return; }
+  DS_ITEMS = j.items; DS_RES = {}; DS_RES_SEEN = 0;
   $("ds_count").textContent = `— ${j.count} images`;
-  $("ds_grid").innerHTML = j.items.map((it, i) =>
-    `<img src="${it.image}" loading="lazy" style="width:100%;border-radius:6px;border:1px solid var(--line);cursor:pointer" onclick='openCaption(${JSON.stringify(JSON.stringify(it))})'>`).join("");
+  renderDsGrid(); updateDsStats();
 }
-async function openCaption(itJson) {
-  const it = JSON.parse(itJson);
-  $("lbimg").src = it.image; $("lightbox").style.display = "flex";
-  if (!it.caption_path) { $("ds_cap_panel").style.display = "none"; return; }
-  CUR_CAP = it.caption_path;
-  const j = await (await fetch("/api/caption?path=" + encodeURIComponent(it.caption_path))).json();
+function renderDsGrid() {
+  $("ds_grid").innerHTML = DS_ITEMS.map((it, i) => {
+    const miss = !it.caption_path;
+    return `<div class="dscell ${miss?'miss':'ok'}" data-i="${i}">`
+      + `<img src="${it.image}" loading="lazy" onload="dsResTally(this)" onclick="openCaption(${i})">`
+      + `<span class="dsbadge ${miss?'miss':'ok'}">${miss?'no caption':'✓'}</span>`
+      + `</div>`;
+  }).join("");
+}
+function dsResTally(img) {
+  const w = img.naturalWidth, h = img.naturalHeight;
+  if (!w || !h) return;
+  const k = w + "×" + h;
+  DS_RES[k] = (DS_RES[k] || 0) + 1; DS_RES_SEEN++;
+  updateDsStats();
+}
+function updateDsStats() {
+  const n = DS_ITEMS.length;
+  if (!n) { $("ds_stats").style.display = "none"; return; }
+  const cap = DS_ITEMS.filter(it => it.caption_path).length;
+  const miss = n - cap, pct = Math.round(100 * cap / n);
+  const buckets = Object.entries(DS_RES).sort((a,b)=>b[1]-a[1]).slice(0,6).map(([k,c]) => `${k} (${c})`).join(", ");
+  let html = `<span class="dschip"><b>images</b>${n}</span>`
+    + `<span class="dschip"><b>captioned</b>${cap} (${pct}%)</span>`
+    + `<span class="dschip ${miss?'warn':''}"><b>missing</b>${miss}</span>`;
+  if (DS_RES_SEEN) html += `<span class="dschip"><b>resolutions</b><span class="dsres">${buckets || '—'} · from ${DS_RES_SEEN} loaded</span></span>`;
+  $("ds_stats").innerHTML = html; $("ds_stats").style.display = "flex";
+}
+function dsCapPathFor(it) { return it.caption_path || it.path.replace(/\.(png|jpe?g|webp)$/i, ".txt"); }
+async function openCaption(i) {
+  const it = DS_ITEMS[i]; if (!it) return;
+  CUR_CAP_ITEM = i; CUR_CAP = dsCapPathFor(it);
+  $("ds_cap_img").src = it.image;
   $("ds_cap_panel").style.display = "block";
-  $("ds_cap_path").textContent = it.caption_path;
-  $("ds_cap_text").value = j.text || "";
+  $("ds_cap_panel").scrollIntoView({ behavior: "smooth", block: "nearest" });
+  $("ds_cap_path").textContent = CUR_CAP + (it.caption_path ? "" : "  (new — created on save)");
+  $("ds_cap_msg").textContent = "";
+  if (it.caption_path) {
+    const j = await (await fetch("/api/caption?path=" + encodeURIComponent(it.caption_path))).json();
+    $("ds_cap_text").value = j.text || "";
+  } else { $("ds_cap_text").value = ""; }
 }
 async function saveCaption() {
+  if (!CUR_CAP) return;
   const r = await fetch("/api/caption", {method:"PUT", headers:{"content-type":"application/json"},
     body: JSON.stringify({path: CUR_CAP, text: $("ds_cap_text").value})});
   const j = await r.json();
-  $("ds_cap_msg").textContent = r.ok ? "✓ saved" : "✗ " + j.error;
+  if (!r.ok) { $("ds_cap_msg").textContent = "✗ " + j.error; return; }
+  $("ds_cap_msg").textContent = "✓ saved";
+  const it = DS_ITEMS[CUR_CAP_ITEM];
+  if (it && !it.caption_path) {                 // newly created → flip indicator + stats
+    it.caption_path = CUR_CAP;
+    const cell = $("ds_grid").querySelector(`.dscell[data-i="${CUR_CAP_ITEM}"]`);
+    if (cell) { cell.classList.remove("miss"); cell.classList.add("ok");
+      const b = cell.querySelector(".dsbadge"); b.className = "dsbadge ok"; b.textContent = "✓"; }
+    updateDsStats();
+  }
 }
 
-/* ── validations editor ── */
+/* ── captioner runner (polled status) ── */
+let CAP_POLL = null;
+function capModelId() {
+  const v = $("cap_model").value;
+  return v === "__custom__" ? ($("cap_custom").value || "").trim() : v;
+}
+function capEsc(s) { return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;"); }
+async function runCaptioner() {
+  const folder = $("cap_folder").value.trim();
+  if (!folder) { $("cap_msg").textContent = "✗ set an image folder"; return; }
+  const model = capModelId();
+  if (!model) { $("cap_msg").textContent = "✗ set a custom model id"; return; }
+  const body = { folder, model,
+    prompt: $("cap_prompt").value || null,
+    max_tokens: parseInt($("cap_maxtok").value || "512"),
+    skip_existing: $("cap_skip").checked,
+    one_sentence: $("cap_one").checked };
+  const r = await fetch("/api/captioner/run", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) { $("cap_msg").textContent = "✗ " + (j.error || r.status); return; }
+  $("cap_msg").textContent = "▶ loading " + model + " …";
+  $("cap_run").style.display = "none"; $("cap_abort").style.display = "inline-block";
+  $("cap_prog_panel").style.display = "block";
+  $("cap_results").innerHTML = ""; $("cap_barfill").style.width = "0%";
+  if (CAP_POLL) clearInterval(CAP_POLL);
+  CAP_POLL = setInterval(pollCaptioner, 1000);
+  pollCaptioner();
+}
+async function abortCaptioner() {
+  await fetch("/api/captioner/abort", {method:"POST"});
+  $("cap_msg").textContent = "aborting…";
+}
+async function pollCaptioner() {
+  let s;
+  try { s = (await (await fetch("/api/captioner/status")).json()).status; } catch (e) { return; }
+  const pct = s.total ? Math.round(100 * s.done / s.total) : 0;
+  $("cap_barfill").style.width = pct + "%";
+  $("cap_prog_count").textContent = `— ${s.done} / ${s.total} done` + (s.found ? ` (${s.found} images found)` : "");
+  $("cap_current").textContent = s.fatal ? ("✗ " + s.fatal)
+    : !s.running ? ""
+    : s.current_file ? ("captioning: " + s.current_file)
+    : "loading model …";
+  $("cap_results").innerHTML = s.results.slice().reverse().map(rw =>
+    `<div style="background:#12171d;border:1px solid var(--line);border-radius:6px;padding:8px">
+       <div style="color:var(--acc);font-size:12px;font-weight:600">${capEsc(rw.file)}</div>
+       <div style="font-size:12px;margin-top:3px;white-space:pre-wrap">${capEsc(rw.caption)}</div>
+     </div>`).join("");
+  if (!s.running) {
+    if (CAP_POLL) { clearInterval(CAP_POLL); CAP_POLL = null; }
+    $("cap_run").style.display = "inline-block"; $("cap_abort").style.display = "none";
+    if (s.fatal) $("cap_msg").textContent = "✗ " + s.fatal;
+    else if (s.aborted) $("cap_msg").textContent = "aborted after " + s.done;
+    else $("cap_msg").textContent = `✓ done — ${s.done} caption${s.done === 1 ? "" : "s"} written.`;
+    if (s.folder && s.done > 0) {
+      $("cap_current").innerHTML = `<a style="color:var(--acc);cursor:pointer" onclick="capOpenInDataset('${capEsc(s.folder)}')">Open folder in Dataset tab for editing →</a>`;
+    }
+  }
+}
+function capOpenInDataset(folder) {
+  $("ds_folder").value = folder;
+  const a = document.querySelector('nav a[data-sec="dataset"]');
+  if (a) a.click();
+  if (typeof scanDataset === "function") scanDataset();
+}
+
+/* ── validations / sample-prompt structured editor (serenity.sample_prompts.v1) ── */
+let VAL_DOC = null, VAL_MODE = "struct";
+const VAL_DEF_NUM = [["sample_every","Sample every"],["width","Width"],["height","Height"],["steps","Steps"],["cfg","CFG"],["seed","Seed"],["frames","Frames"],["fps","FPS"]];
+const VAL_DEF_BOOL = [["sample_at_start","Sample at start"],["save_before_sample","Save before sample"],["precache_required","Precache required"],["enforce_min_image_size","Enforce ≥1024"]];
+const VAL_OVR = [["seed","Seed"],["width","W"],["height","H"],["steps","Steps"],["cfg","CFG"]];
+function isSampleDoc(c) { return c && typeof c === "object" && (Array.isArray(c.prompts) || c.defaults); }
+
 async function loadValidations() {
   const j = await (await fetch("/api/validations?path=" + encodeURIComponent($("val_file").value))).json();
-  if (j.error) { $("val_msg").textContent = "✗ " + j.error; return; }
-  $("val_json").style.display = "block"; $("val_save").style.display = "inline-block";
-  $("val_json").value = JSON.stringify(j.content, null, 1);
-  $("val_msg").textContent = "";
+  if (j.error) { $("val_msg").textContent = "✗ " + j.error; $("val_actions").style.display = "none"; return; }
+  VAL_DOC = j.content;
+  $("val_actions").style.display = "block"; $("val_msg").textContent = "";
+  if (isSampleDoc(VAL_DOC)) renderValStruct();     // v1 → structured
+  else showValRaw();                               // arbitrary JSON → raw only
+}
+function renderValStruct() {
+  const d = VAL_DOC.defaults || (VAL_DOC.defaults = {});
+  const prompts = VAL_DOC.prompts || (VAL_DOC.prompts = []);
+  let h = `<div class="panel" style="background:#12171d"><h3 style="font-size:12px">DEFAULTS</h3><div class="vdefaults">`;
+  for (const [k,lab] of VAL_DEF_NUM)
+    h += `<div class="vfield"><label>${lab}</label><input type="number" step="any" id="vd_${k}" value="${d[k]??''}"></div>`;
+  h += `</div><div class="vfield" style="margin-top:8px"><label>Negative (default)</label><input id="vd_negative" value="${escAttr(d.negative??'')}"></div><div class="vtoggles">`;
+  for (const [k,lab] of VAL_DEF_BOOL)
+    h += `<label><input type="checkbox" id="vd_${k}" ${d[k]?'checked':''}>${lab}</label>`;
+  h += `</div></div>`;
+  h += `<div style="display:flex;align-items:center;justify-content:space-between;margin:6px 0"><b style="font-size:12px">PROMPTS (${prompts.length})</b><button class="vbtn" onclick="valAddPrompt()">+ Add prompt</button></div>`;
+  h += `<div id="val_prompts">` + prompts.map((p,i)=>valPromptHtml(p,i)).join("") + `</div>`;
+  $("val_struct").innerHTML = h;
+  $("val_struct").style.display = "block"; $("val_json").style.display = "none";
+  VAL_MODE = "struct";
+}
+function valPromptHtml(p, i) {
+  const d = VAL_DOC.defaults || {};
+  let h = `<div class="vprompt" data-i="${i}"><div class="vprompt-head"><input placeholder="id" value="${escAttr(p.id||p.label||'')}" data-f="id"><button class="vdel" onclick="valRemovePrompt(${i})">Remove</button></div>`;
+  h += `<textarea data-f="prompt" placeholder="prompt text">${escHtml(p.prompt||p.text||'')}</textarea><div class="voverrides">`;
+  for (const [k,lab] of VAL_OVR)
+    h += `<div class="vfield"><label>${lab}</label><input type="number" step="any" data-f="${k}" value="${p[k]??''}" placeholder="${d[k]??'def'}"></div>`;
+  h += `</div><div class="vfield" style="margin-top:6px"><label>Negative (override)</label><input data-f="negative" value="${escAttr(p.negative??'')}" placeholder="default"></div>`;
+  if (p.caps) h += `<div class="vcaps">caps · pos: ${escHtml(p.caps.positive||'—')} · neg: ${escHtml(p.caps.negative||'—')} (preserved on save)</div>`;
+  h += `</div>`;
+  return h;
+}
+function collectValStruct() {
+  const d = VAL_DOC.defaults || {};
+  for (const [k] of VAL_DEF_NUM) { const el = $("vd_"+k); if (el) { const v = el.value.trim(); if (v==="") delete d[k]; else d[k] = Number(v); } }
+  { const el = $("vd_negative"); if (el) d.negative = el.value; }
+  for (const [k] of VAL_DEF_BOOL) { const el = $("vd_"+k); if (el) d[k] = el.checked; }
+  VAL_DOC.defaults = d;
+  const orig = VAL_DOC.prompts || [];
+  VAL_DOC.prompts = [...document.querySelectorAll("#val_prompts .vprompt")].map(row => {
+    const i = +row.dataset.i;
+    const base = (orig[i] && typeof orig[i] === "object") ? {...orig[i]} : {};   // preserves caps + unknown keys
+    const get = f => row.querySelector(`[data-f="${f}"]`);
+    const id = get("id").value.trim();
+    if (id) base.id = id; else delete base.id;
+    delete base.label;                       // normalize label → id
+    base.prompt = get("prompt").value; delete base.text;
+    for (const [k] of VAL_OVR) { const v = get(k).value.trim(); if (v==="") delete base[k]; else base[k] = Number(v); }
+    const neg = get("negative").value; if (neg==="") delete base.negative; else base.negative = neg;
+    return base;
+  });
+  if (!VAL_DOC.schema) VAL_DOC.schema = "serenity.sample_prompts.v1";
+}
+function valAddPrompt() { collectValStruct(); VAL_DOC.prompts.push({ id:"", prompt:"" }); renderValStruct(); }
+function valRemovePrompt(i) { collectValStruct(); VAL_DOC.prompts.splice(i,1); renderValStruct(); }
+function showValRaw() {
+  if (VAL_MODE === "struct" && isSampleDoc(VAL_DOC)) collectValStruct();
+  $("val_json").value = JSON.stringify(VAL_DOC, null, 1);
+  $("val_json").style.display = "block"; $("val_struct").style.display = "none";
+  VAL_MODE = "raw";
+}
+function toggleValRaw() {
+  if (VAL_MODE === "raw") {
+    try { VAL_DOC = JSON.parse($("val_json").value); } catch (e) { $("val_msg").textContent = "✗ invalid JSON: " + e.message; return; }
+    $("val_msg").textContent = "";
+    if (isSampleDoc(VAL_DOC)) renderValStruct(); else $("val_msg").textContent = "not a sample-prompts doc — staying in raw";
+  } else { showValRaw(); }
 }
 async function saveValidations() {
   let content;
-  try { content = JSON.parse($("val_json").value); } catch (e) { $("val_msg").textContent = "✗ invalid JSON: " + e.message; return; }
+  if (VAL_MODE === "raw") { try { content = JSON.parse($("val_json").value); } catch (e) { $("val_msg").textContent = "✗ invalid JSON: " + e.message; return; } }
+  else { collectValStruct(); content = VAL_DOC; }
   const r = await fetch("/api/validations", {method:"PUT", headers:{"content-type":"application/json"},
     body: JSON.stringify({path: $("val_file").value, content})});
   const j = await r.json();
   $("val_msg").textContent = r.ok ? "✓ saved" : "✗ " + j.error;
+}
+async function editPromptsFromSampling() {
+  const p = $("validation_prompts_file").value.trim();
+  if (p) $("val_file").value = p;
+  document.querySelector('nav a[data-sec="validations"]').click();
+  await loadValidations();
 }
 
 /* ── dry-run preview (Backup tab) ── */
