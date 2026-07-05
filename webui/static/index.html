@@ -5,79 +5,226 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Serenity Web Trainer</title>
 <style>
-  :root { --bg:#101418; --panel:#1a2027; --line:#2a323c; --fg:#d7dee7; --dim:#7d8a99; --acc:#4fa3ff; --ok:#4caf7d; --bad:#e05a5a; }
+  :root { --bg:#101418; --panel:#1a2027; --line:#2a323c; --fg:#d7dee7; --dim:#7d8a99; --acc:#4fa3ff; --ok:#4caf7d; --bad:#e05a5a; --orange:#e8963c; }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.45 system-ui, sans-serif; }
-  header { padding:10px 16px; border-bottom:1px solid var(--line); display:flex; gap:12px; align-items:center; }
-  header h1 { font-size:15px; margin:0; letter-spacing:.06em; color:var(--acc); }
-  #gpu { color:var(--dim); font-size:12px; margin-left:auto; }
-  main { display:grid; grid-template-columns: 330px 1fr; gap:0; min-height:calc(100vh - 45px); }
-  #left { border-right:1px solid var(--line); padding:14px; }
-  #right { padding:14px; overflow-x:hidden; }
-  label { display:block; color:var(--dim); font-size:11px; text-transform:uppercase; letter-spacing:.05em; margin:10px 0 3px; }
-  input, select { width:100%; background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 9px; font:inherit; }
-  button { border:0; border-radius:6px; padding:9px 16px; font:inherit; font-weight:600; cursor:pointer; }
-  #start { background:var(--ok); color:#08130d; width:100%; margin-top:14px; }
-  #stopb { background:var(--bad); color:#fff; width:100%; margin-top:8px; display:none; }
-  .rail { display:grid; grid-template-columns:repeat(auto-fit,minmax(110px,1fr)); gap:8px; margin-bottom:12px; }
-  .stat { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:8px 10px; }
-  .stat b { display:block; font-size:11px; color:var(--dim); font-weight:600; text-transform:uppercase; }
-  .stat span { font-size:16px; }
-  #bar { height:6px; background:var(--panel); border-radius:3px; overflow:hidden; margin-bottom:12px; }
-  #barfill { height:100%; width:0%; background:var(--acc); transition:width .3s; }
-  #log { background:#0b0e12; border:1px solid var(--line); border-radius:8px; padding:10px; height:220px; overflow-y:auto; font:12px/1.5 ui-monospace, monospace; white-space:pre-wrap; word-break:break-all; }
-  #gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; margin-top:14px; }
+  header { padding:8px 16px; border-bottom:1px solid var(--line); display:flex; gap:14px; align-items:center; }
+  header h1 { font-size:14px; margin:0; letter-spacing:.06em; color:var(--acc); }
+  #runname_top { background:var(--panel); border:1px solid var(--line); border-radius:6px; color:var(--fg); padding:5px 10px; width:200px; font:inherit; }
+  #livetarget { color:var(--dim); font-size:12px; }
+  #startbtn { background:var(--orange); color:#1a1206; border:0; border-radius:6px; padding:8px 20px; font-weight:700; cursor:pointer; margin-left:auto; }
+  #stopbtn { background:var(--bad); color:#fff; border:0; border-radius:6px; padding:8px 16px; font-weight:700; cursor:pointer; display:none; }
+  #valid { font-size:12px; color:var(--dim); }
+  main { display:grid; grid-template-columns: 170px 1fr 250px; min-height:calc(100vh - 46px); }
+  /* ── left nav ── */
+  nav { border-right:1px solid var(--line); padding:12px 0; }
+  nav .grp { color:var(--dim); font-size:10px; letter-spacing:.1em; padding:10px 16px 4px; }
+  nav a { display:block; padding:7px 16px; color:var(--fg); text-decoration:none; font-size:13px; border-left:3px solid transparent; cursor:pointer; }
+  nav a.sel { border-left-color:var(--orange); background:var(--panel); color:var(--orange); }
+  nav a.dim { color:var(--dim); }
+  #project { padding:12px 16px; color:var(--dim); font-size:12px; border-top:1px solid var(--line); margin-top:12px; }
+  /* ── center ── */
+  #center { padding:14px 18px; overflow-x:hidden; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; margin-bottom:14px; }
+  .panel h3 { margin:0 0 2px; font-size:13px; }
+  .panel .sub { color:var(--dim); font-size:11px; margin-bottom:12px; }
+  .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 24px; }
+  .row { display:grid; grid-template-columns:150px 1fr; align-items:center; gap:10px; margin:5px 0; }
+  .row label { color:var(--dim); font-size:12px; }
+  input, select { width:100%; background:#12171d; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font:inherit; font-size:13px; }
+  input[type=checkbox] { width:auto; }
+  .sec { display:none; }
+  .sec.show { display:block; }
+  #log { background:#0b0e12; border:1px solid var(--line); border-radius:8px; padding:10px; height:420px; overflow-y:auto; font:12px/1.5 ui-monospace, monospace; white-space:pre-wrap; word-break:break-all; }
+  #gallery { display:grid; grid-template-columns:repeat(auto-fill,minmax(180px,1fr)); gap:10px; }
   #gallery img { width:100%; border-radius:8px; border:1px solid var(--line); cursor:pointer; }
-  .unwired { color:var(--dim); }
-  h2 { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:var(--dim); margin:16px 0 8px; }
+  #runslist { font:13px/1.8 ui-monospace, monospace; }
+  /* ── right rail ── */
+  aside { border-left:1px solid var(--line); padding:14px; font-size:13px; }
+  aside h2 { font-size:12px; letter-spacing:.06em; color:var(--fg); margin:0 0 8px; }
+  #statuspill { color:var(--dim); font-weight:700; }
+  #bar { height:5px; background:var(--panel); border-radius:3px; overflow:hidden; margin:8px 0 12px; }
+  #barfill { height:100%; width:0%; background:var(--acc); transition:width .3s; }
+  .kv { display:grid; grid-template-columns:1fr auto; gap:2px 10px; }
+  .kv b { color:var(--dim); font-weight:500; font-size:12px; }
+  .kv span { text-align:right; background:#12171d; border:1px solid var(--line); border-radius:4px; padding:1px 8px; margin-bottom:3px; font-size:12px; min-width:70px; }
+  hr { border:0; border-top:1px solid var(--line); margin:12px 0; }
+  #msg { margin-top:8px; font-size:12px; color:var(--dim); word-break:break-all; }
   #lightbox { display:none; position:fixed; inset:0; background:rgba(0,0,0,.85); z-index:9; align-items:center; justify-content:center; }
   #lightbox img { max-width:92vw; max-height:92vh; border-radius:8px; }
 </style>
 </head>
 <body>
-<header><h1>SERENITY WEB TRAINER</h1><span id="runstate" class="unwired">idle</span><span id="gpu"></span></header>
+<header>
+  <h1>SERENITY TRAINER</h1>
+  <input id="runname_top" placeholder="run name">
+  <span id="livetarget">Live target — …</span>
+  <span id="valid">VALIDATION — …</span>
+  <button id="stopbtn">Stop</button>
+  <button id="startbtn">Start training</button>
+</header>
 <main>
-  <div id="left">
-    <label>Model</label><select id="preset"></select>
-    <label>Run name</label><input id="run_name">
-    <label>Dataset cache</label><input id="cache">
-    <label>Learning rate</label><input id="learning_rate" type="number" step="0.00001">
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
-      <div><label>Rank</label><input id="lora_rank" type="number"></div>
-      <div><label>Alpha</label><input id="lora_alpha" type="number"></div>
-      <div><label>Steps</label><input id="max_steps" type="number"></div>
-      <div><label>Save every</label><input id="save_every" type="number"></div>
-      <div><label>Sample every</label><input id="sample_every" type="number"></div>
-      <div><label>Seed</label><input id="seed" type="number" placeholder="preset"></div>
+  <nav>
+    <div class="grp">SERENITY</div>
+    <div class="grp">CONFIGURE</div>
+    <a data-sec="model" class="sel">Model</a>
+    <a data-sec="lora">LoRA / Network</a>
+    <a data-sec="dataset">Dataset</a>
+    <a data-sec="training">Training</a>
+    <a data-sec="sampling">Sampling</a>
+    <a data-sec="resume">Resume</a>
+    <a data-sec="runs">Runs</a>
+    <a data-sec="logs">Logs</a>
+    <a data-sec="samples">Samples</a>
+    <div id="project">PROJECT<br><b id="projname">—</b></div>
+  </nav>
+
+  <div id="center">
+    <!-- MODEL -->
+    <div class="sec show" id="sec-model">
+      <div class="panel"><h3>BASE MODEL</h3><div class="sub">Method, architecture, and checkpoint</div>
+        <div class="grid2">
+          <div>
+            <div class="row"><label>Train Method</label>
+              <select id="network_algorithm"><option>LORA</option><option>LOKR</option><option>LOHA</option><option>DORA</option><option>OFT</option></select></div>
+            <div class="row"><label>Architecture</label><select id="preset"></select></div>
+            <div class="row"><label>Base Model</label><input id="checkpoint"></div>
+            <div class="row"><label>VAE (override)</label><input id="vae_override" placeholder="preset default"></div>
+            <div class="row"><label>Quantized base</label>
+              <select id="quantized_resident"><option value="off">off (bf16)</option><option value="fp8_e4m3">fp8_e4m3 (device)</option><option value="fp8_e4m3_host">fp8_e4m3_host</option><option value="streamed_base_opt_in">streamed_base_opt_in</option></select></div>
+          </div>
+          <div>
+            <div class="row"><label>Destination</label><input id="workspace_dir" disabled></div>
+            <div class="row"><label>Format</label><input value="SAFETENSORS (PEFT pairs)" disabled></div>
+            <div class="row"><label>Backend</label><input id="backend_show" disabled></div>
+            <div class="row"><label>Checkpoint file</label><input id="checkpoint_show" disabled></div>
+          </div>
+        </div>
+      </div>
     </div>
-    <label>Resume .state (optional — full resume)</label><input id="resume_state" placeholder="/path/to/ckpt.safetensors.state">
-    <label>Start step (with resume)</label><input id="start_step" type="number" placeholder="0">
-    <button id="start">START TRAINING</button>
-    <button id="stopb">STOP</button>
-    <div id="msg" style="margin-top:10px;font-size:12px;color:var(--dim)"></div>
+
+    <!-- LORA -->
+    <div class="sec" id="sec-lora">
+      <div class="panel"><h3>NETWORK</h3><div class="sub">Adapter dimensions — targets are per-model (qkv, proj, mlp, modulation where wired)</div>
+        <div class="grid2"><div>
+          <div class="row"><label>Rank</label><input id="lora_rank" type="number"></div>
+          <div class="row"><label>Alpha</label><input id="lora_alpha" type="number"></div>
+        </div><div>
+          <div class="row"><label>Algorithm</label><input id="algo_show" disabled></div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- DATASET -->
+    <div class="sec" id="sec-dataset">
+      <div class="panel"><h3>DATASET</h3><div class="sub">Pre-staged cache (latents + text conditioning)</div>
+        <div class="row"><label>Cache path</label><input id="cache"></div>
+        <div class="row"><label>Caption dropout</label><input id="caption_dropout" type="number" step="0.01" value="0"></div>
+      </div>
+    </div>
+
+    <!-- TRAINING -->
+    <div class="sec" id="sec-training">
+      <div class="panel"><h3>RECIPE</h3><div class="sub">Steps, schedule, loss</div>
+        <div class="grid2"><div>
+          <div class="row"><label>Max steps</label><input id="max_steps" type="number"></div>
+          <div class="row"><label>Learning rate</label><input id="learning_rate" type="number" step="0.00001"></div>
+          <div class="row"><label>Timestep shift</label><input id="timestep_shift" type="number" step="0.1"></div>
+          <div class="row"><label>Seed</label><input id="seed" type="number" placeholder="preset"></div>
+          <div class="row"><label>Batch size</label><input id="batch_size" type="number" value="1" min="1" max="2"></div>
+          <div class="row"><label>Grad accum steps</label><input id="gradient_accumulation_steps" type="number" value="1" min="1"></div>
+        </div><div>
+          <div class="row"><label>Loss fn</label><select id="loss_fn"><option value="">mse (default)</option><option>huber</option><option>smooth_l1</option></select></div>
+          <div class="row"><label>Huber delta</label><input id="huber_delta" type="number" step="0.01" placeholder="—"></div>
+          <div class="row"><label>Min-SNR gamma</label><input id="min_snr_gamma_flow" type="number" step="0.1" placeholder="off"></div>
+          <div class="row"><label>Max grad norm</label><input id="max_grad_norm" type="number" step="0.1" placeholder="preset"></div>
+          <div class="row"><label>Save every</label><input id="save_every" type="number"></div>
+        </div></div>
+      </div>
+      <div class="panel"><h3>OPTIMIZER</h3><div class="sub">AdamW family — consumed per backend capability table</div>
+        <div class="grid2"><div>
+          <div class="row"><label>Optimizer</label><select id="optimizer_name"><option>ADAMW</option><option>ADAMW8BIT</option></select></div>
+          <div class="row"><label>Weight decay</label><input id="optimizer_weight_decay" type="number" step="0.00001" value="0.00001"></div>
+          <div class="row"><label>Warmup steps</label><input id="optimizer_warmup_steps" type="number" value="0"></div>
+        </div><div>
+          <div class="row"><label>EMA</label><input id="ema_enabled" type="checkbox"></div>
+          <div class="row"><label>EMA decay</label><input id="ema_decay" type="number" step="0.0001" value="0.999"></div>
+        </div></div>
+      </div>
+    </div>
+
+    <!-- SAMPLING -->
+    <div class="sec" id="sec-sampling">
+      <div class="panel"><h3>SAMPLING</h3><div class="sub">Inline validation renders (1024×1024 minimum, from the samples JSON)</div>
+        <div class="row"><label>Sample every</label><input id="sample_every" type="number"></div>
+        <div class="row"><label>Prompts file</label><input id="validation_prompts_file" placeholder="preset / config default"></div>
+      </div>
+    </div>
+
+    <!-- RESUME -->
+    <div class="sec" id="sec-resume">
+      <div class="panel"><h3>RESUME</h3><div class="sub">FULL resume needs the .state file path — the PEFT path silently warm-resumes (MJ-1077)</div>
+        <div class="row"><label>.state file</label><input id="resume_state" placeholder="/path/to/ckpt.safetensors.state"></div>
+        <div class="row"><label>Start step</label><input id="start_step" type="number" placeholder="0"></div>
+      </div>
+    </div>
+
+    <!-- RUNS / LOGS / SAMPLES -->
+    <div class="sec" id="sec-runs"><div class="panel"><h3>RUNS</h3><div id="runslist">—</div></div></div>
+    <div class="sec" id="sec-logs"><div class="panel"><h3>LIVE LOG</h3><div id="log"></div></div></div>
+    <div class="sec" id="sec-samples"><div class="panel"><h3>SAMPLES</h3><div id="gallery"></div></div></div>
+    <div id="msg"></div>
   </div>
-  <div id="right">
+
+  <aside>
+    <h2>LIVE STATUS</h2>
+    <span id="statuspill">IDLE</span>
     <div id="bar"><div id="barfill"></div></div>
-    <div class="rail">
-      <div class="stat"><b>Step</b><span id="s_step">–</span></div>
-      <div class="stat"><b>Epoch</b><span id="s_epoch">–</span></div>
-      <div class="stat"><b>Loss</b><span id="s_loss">–</span></div>
-      <div class="stat"><b>Grad</b><span id="s_grad">–</span></div>
-      <div class="stat"><b>Speed</b><span id="s_speed">–</span></div>
-      <div class="stat"><b>ETA</b><span id="s_eta">–</span></div>
+    <div class="kv">
+      <b>Step</b><span id="s_step">0 / 0</span>
+      <b>Epoch</b><span id="s_epoch">0 / 0</span>
+      <b>Loss</b><span id="s_loss">0.0</span>
+      <b>Grad</b><span id="s_grad">0.0</span>
+      <b>Speed</b><span id="s_speed">0.0 s/step</span>
+      <b>ETA</b><span id="s_eta">0s</span>
+      <b>Status</b><span id="s_status">Idle</span>
     </div>
-    <h2>Live log</h2><div id="log"></div>
-    <h2>Samples</h2><div id="gallery"></div>
-  </div>
+    <hr>
+    <div class="kv">
+      <b>Samples</b><span id="s_samples">0</span>
+      <b>Backend</b><span id="s_backend">—</span>
+    </div>
+    <hr>
+    <div class="kv">
+      <b>GPU Model</b><span id="h_gpu"></span>
+      <b>Driver</b><span id="h_drv"></span>
+      <b>GPU</b><span id="h_util"></span>
+      <b>VRAM</b><span id="h_vram"></span>
+      <b>RAM</b><span id="h_ram"></span>
+    </div>
+  </aside>
 </main>
 <div id="lightbox" onclick="this.style.display='none'"><img id="lbimg"></div>
 <script>
 let PRESETS = [], RUN = null;
 const $ = id => document.getElementById(id);
-const fields = ["learning_rate","lora_rank","lora_alpha","max_steps","save_every","sample_every"];
+const RECIPE_FIELDS = ["learning_rate","lora_rank","lora_alpha","max_steps","save_every","sample_every",
+                       "timestep_shift","quantized_resident"];
+const EXTRA_FIELDS = ["network_algorithm","caption_dropout","batch_size","gradient_accumulation_steps",
+                      "loss_fn","huber_delta","min_snr_gamma_flow","max_grad_norm","optimizer_warmup_steps",
+                      "validation_prompts_file","vae_override"];
+
+// nav
+document.querySelectorAll("nav a[data-sec]").forEach(a => a.onclick = () => {
+  document.querySelectorAll("nav a").forEach(x => x.classList.remove("sel")); a.classList.add("sel");
+  document.querySelectorAll(".sec").forEach(s => s.classList.remove("show"));
+  $("sec-" + a.dataset.sec).classList.add("show");
+  if (a.dataset.sec === "runs") refreshRuns();
+  if (a.dataset.sec === "samples") refreshGallery();
+});
 
 async function loadPresets() {
-  const r = await fetch("/api/presets"); const j = await r.json();
+  const j = await (await fetch("/api/presets")).json();
   PRESETS = j.presets;
   $("preset").innerHTML = PRESETS.map(p =>
     `<option value="${p.id}" ${p.wired?"":"disabled"}>${p.label}${p.wired?"":" (not wired)"}</option>`).join("");
@@ -85,27 +232,43 @@ async function loadPresets() {
 }
 function applyPreset() {
   const p = PRESETS.find(x => x.id === $("preset").value); if (!p) return;
-  $("run_name").value = p.run_name; $("cache").value = p.cache;
-  for (const f of fields) if (p.recipe[f] !== undefined) $(f).value = p.recipe[f];
+  $("runname_top").value = p.run_name; $("cache").value = p.cache; $("checkpoint").value = p.checkpoint;
+  $("workspace_dir").value = "/home/alex/mojodiffusion/output/" + p.run_name;
+  $("backend_show").value = p.backend; $("checkpoint_show").value = p.checkpoint;
+  $("livetarget").textContent = "Live target — " + p.label;
+  $("projname").textContent = p.run_name; $("s_backend").textContent = p.label;
+  for (const f of RECIPE_FIELDS) if (p.recipe[f] !== undefined) $(f).value = p.recipe[f];
+  $("valid").textContent = p.wired ? "VALIDATION — Ready" : "VALIDATION — backend not wired";
 }
 $("preset").onchange = applyPreset;
+$("network_algorithm").onchange = () => $("algo_show").value = $("network_algorithm").value;
+$("runname_top").oninput = () => { $("projname").textContent = $("runname_top").value;
+  $("workspace_dir").value = "/home/alex/mojodiffusion/output/" + $("runname_top").value; };
 
-$("start").onclick = async () => {
+$("startbtn").onclick = async () => {
   const overrides = {};
-  for (const f of fields) { const v = $(f).value; if (v !== "") overrides[f] = parseFloat(v); }
+  for (const f of RECIPE_FIELDS.concat(EXTRA_FIELDS)) {
+    const el = $(f); if (!el) continue;
+    const v = el.type === "checkbox" ? el.checked : el.value;
+    if (v !== "" && v !== false) overrides[f] = (el.type === "number") ? parseFloat(v) : v;
+  }
   if ($("seed").value !== "") overrides.seed = parseInt($("seed").value);
+  if ($("ema_enabled").checked) { overrides.ema = true; overrides.ema_decay = parseFloat($("ema_decay").value); }
+  overrides.optimizer = { optimizer: $("optimizer_name").value, weight_decay: parseFloat($("optimizer_weight_decay").value) };
   const body = { preset_id: $("preset").value, overrides,
-                 cache: $("cache").value || null, run_name: $("run_name").value || null };
+                 cache: $("cache").value || null, run_name: $("runname_top").value || null };
   if ($("resume_state").value) { body.resume_state = $("resume_state").value;
                                  body.start_step = parseInt($("start_step").value || "0"); }
   const r = await fetch("/api/runs", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
   const j = await r.json();
-  if (!r.ok) { $("msg").textContent = "✗ " + j.error; return; }
+  if (!r.ok) { $("msg").textContent = "✗ " + j.error; $("valid").textContent = "VALIDATION — " + j.error; return; }
   RUN = j.run_id; $("msg").textContent = "▶ " + j.tail;
-  $("runstate").textContent = "RUNNING"; $("runstate").style.color = "var(--ok)";
-  $("stopb").style.display = "block"; $("log").textContent = "";
+  $("statuspill").textContent = "RUNNING"; $("statuspill").style.color = "var(--ok)";
+  $("s_status").textContent = "Training"; $("stopbtn").style.display = "inline-block";
+  $("log").textContent = "";
+  document.querySelector('nav a[data-sec="logs"]').click();
 };
-$("stopb").onclick = async () => { if (RUN != null) await fetch(`/api/runs/${RUN}/stop`, {method:"POST"}); };
+$("stopbtn").onclick = async () => { if (RUN != null) await fetch(`/api/runs/${RUN}/stop`, {method:"POST"}); };
 
 function logline(t) {
   const el = $("log"); el.textContent += t + "\n";
@@ -114,10 +277,16 @@ function logline(t) {
 }
 async function refreshGallery() {
   if (RUN == null) return;
-  const r = await fetch(`/api/runs/${RUN}/samples`); const j = await r.json();
+  const j = await (await fetch(`/api/runs/${RUN}/samples`)).json();
   if (!j.samples) return;
+  $("s_samples").textContent = j.samples.length;
   $("gallery").innerHTML = j.samples.map(s =>
     `<img src="${s}" loading="lazy" onclick="$('lbimg').src='${s}';$('lightbox').style.display='flex'">`).join("");
+}
+async function refreshRuns() {
+  const j = await (await fetch("/api/runs")).json();
+  $("runslist").innerHTML = j.runs.length ? j.runs.map(r =>
+    `#${r.id} ${r.preset_id} — ${r.status} — step ${r.step}/${r.total_steps} — <a style="color:var(--acc)" href="/files${r.log_path}">log</a>`).join("<br>") : "no runs this session";
 }
 function connectSSE() {
   const es = new EventSource("/api/events");
@@ -125,30 +294,34 @@ function connectSSE() {
     const m = JSON.parse(e.data);
     if (m.type === "progress" && m.run.id === RUN) {
       const r = m.run;
-      $("s_step").textContent = `${r.step}/${r.total_steps}`;
-      $("s_epoch").textContent = `${r.epoch}/${r.total_epochs}`;
+      $("s_step").textContent = `${r.step} / ${r.total_steps}`;
+      $("s_epoch").textContent = `${r.epoch} / ${r.total_epochs}`;
       $("s_loss").textContent = r.loss.toFixed(4);
       $("s_grad").textContent = r.grad_norm.toFixed(4);
-      $("s_speed").textContent = r.s_per_step.toFixed(1) + "s";
-      $("s_eta").textContent = r.eta || "–";
+      $("s_speed").textContent = r.s_per_step.toFixed(1) + " s/step";
+      $("s_eta").textContent = r.eta || "—";
       $("barfill").style.width = (100 * r.step / Math.max(1, r.total_steps)) + "%";
     } else if (m.type === "log" && m.run_id === RUN) {
       logline(m.line);
-      if (m.line.includes("sample") && m.line.includes(".png")) refreshGallery();
+      if (m.line.includes(".png")) refreshGallery();
     } else if (m.type === "status" && m.run.id === RUN) {
-      $("runstate").textContent = m.run.status.toUpperCase();
-      $("runstate").style.color = m.run.status === "failed" ? "var(--bad)" : "var(--dim)";
-      $("stopb").style.display = "none";
-      refreshGallery();
+      $("statuspill").textContent = m.run.status.toUpperCase();
+      $("statuspill").style.color = m.run.status === "failed" ? "var(--bad)" : "var(--dim)";
+      $("s_status").textContent = m.run.status;
+      $("stopbtn").style.display = "none";
+      refreshGallery(); refreshRuns();
     }
   };
   es.onerror = () => setTimeout(connectSSE, 3000);
 }
-async function pollGpu() {
-  const r = await fetch("/api/runs"); const j = await r.json();
-  $("gpu").textContent = j.gpu_busy ? ("GPU: " + j.gpu_busy) : "GPU: free";
+async function pollSystem() {
+  const m = await (await fetch("/api/system/metrics")).json();
+  $("h_gpu").textContent = m.gpu_name; $("h_drv").textContent = m.gpu_driver;
+  $("h_util").textContent = `${m.gpu_util}% ${m.gpu_temp}C`;
+  $("h_vram").textContent = `${(m.vram_used_mb/1024).toFixed(1)} / ${(m.vram_total_mb/1024).toFixed(1)} GB`;
+  $("h_ram").textContent = `${m.ram_used_gb} / ${m.ram_total_gb} GB`;
 }
-loadPresets(); connectSSE(); pollGpu(); setInterval(pollGpu, 10000); setInterval(refreshGallery, 30000);
+loadPresets(); connectSSE(); pollSystem(); setInterval(pollSystem, 5000);
 </script>
 </body>
 </html>

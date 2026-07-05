@@ -392,6 +392,38 @@ async fn list_runs(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"runs": &*st.runs.lock().await, "gpu_busy": gpu_busy()}))
 }
 
+async fn system_metrics() -> Json<Value> {
+    // GPU via nvidia-smi (the Mojo UI used a MojoUI backend API — UI_MAP §5)
+    let gpu = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=name,driver_version,utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let g: Vec<String> = gpu.split(',').map(|s| s.trim().to_string()).collect();
+    // RAM from /proc/meminfo
+    let mem = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let memkb = |key: &str| -> u64 {
+        mem.lines()
+            .find(|l| l.starts_with(key))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    };
+    let total = memkb("MemTotal:");
+    let avail = memkb("MemAvailable:");
+    Json(json!({
+        "gpu_name": g.first().cloned().unwrap_or_default(),
+        "gpu_driver": g.get(1).cloned().unwrap_or_default(),
+        "gpu_util": g.get(2).cloned().unwrap_or_default(),
+        "gpu_temp": g.get(3).cloned().unwrap_or_default(),
+        "vram_used_mb": g.get(4).cloned().unwrap_or_default(),
+        "vram_total_mb": g.get(5).cloned().unwrap_or_default(),
+        "ram_used_gb": format!("{:.1}", (total.saturating_sub(avail)) as f64 / 1048576.0),
+        "ram_total_gb": format!("{:.1}", total as f64 / 1048576.0),
+    }))
+}
+
 async fn get_presets(State(st): State<Arc<AppState>>) -> Json<Value> {
     Json(json!({"presets": st.presets}))
 }
@@ -505,6 +537,7 @@ async fn main() {
         .route("/api/runs/:id/stop", post(stop))
         .route("/api/runs/:id/samples", get(samples))
         .route("/api/events", get(events))
+        .route("/api/system/metrics", get(system_metrics))
         .route("/files/*path", get(file_serve))
         .nest_service("/", tower_http::services::ServeDir::new(static_dir).append_index_html_on_directories(true))
         .with_state(st);
