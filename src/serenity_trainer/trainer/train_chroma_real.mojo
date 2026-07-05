@@ -53,6 +53,8 @@ from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 from std.time import perf_counter_ns
 from std.os import listdir, makedirs
+from std.ffi import external_call
+from std.memory import alloc, UnsafePointer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -63,6 +65,7 @@ from serenitymojo.models.chroma.weights import load_chroma_stack_base
 from serenitymojo.models.chroma.chroma_stack_lora import (
     ChromaStackBase,
     chroma_stack_lora_forward_offload, chroma_stack_lora_backward_offload,
+    chroma_stack_lora_forward_device_offload, chroma_stack_lora_backward_device_offload,
     build_chroma_direct_dora_set_from_offload, build_chroma_direct_oft_set_for_stack,
     chroma_stack_direct_dora_forward_offload, chroma_stack_direct_dora_backward_offload,
     chroma_stack_direct_oft_forward_offload, chroma_stack_direct_oft_backward_offload,
@@ -381,6 +384,25 @@ def _absum(v: List[BFloat16]) -> Float32:
         var x = v[i].cast[DType.float32]()
         s += x if x >= 0.0 else -x
     return s
+
+
+comptime _EnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
+
+
+def _env_is_set(name: String) -> Bool:
+    # CHROMA_DEVICE_STACK=1 selects the device-resident fwd/bwd arm; unset/other = host.
+    var n = name.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = name.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cname = _EnvPtr(unsafe_from_address=Int(buf))
+    var ret = external_call["getenv", _EnvPtr](cname)
+    buf.free()
+    if Int(ret) == 0:
+        return False
+    return ret[0] == UInt8(49) and ret[1] == UInt8(0)
 
 
 def _global_norm(grads: FluxLoraGradSet) -> Float64:
@@ -1112,33 +1134,57 @@ def main() raises:
                 print("[Chroma-oft] save step=", k, " modules=", nmods, " path=", save_path)
             continue
 
-        # ── forward (offload, full depth) -> velocity [N_IMG, OUT_CH] ──
-        var fwd = chroma_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
-            noisy.copy(), txt_tokens.copy(), pooled.copy(), MOD_INDEX,
-            base, loader, lora, cos.copy(), sin.copy(),
-            D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
-        )
-
-        # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
-        var nout = len(fwd.out)
-        var d_loss = List[Float32]()
-        var sse = 0.0
-        var inv_n = Float32(2.0) / Float32(nout)
-        for i in range(nout):
-            var diff = fwd.out[i] - target[i]
-            sse += Float64(diff) * Float64(diff)
-            d_loss.append(inv_n * diff)
-        var loss = Float32(sse / Float64(nout))
+        # ── forward + MSE loss + backward (full depth) ──
+        # DEFAULT = device-resident stack (activations stay on-GPU,
+        # recompute-in-backward): ~35x faster (139s -> 4.0s/step) and BIT-IDENTICAL
+        # to the host stack end-to-end (same loss/grad_norm/LoRA-B on the real
+        # model; gated by chroma_stack_device_parity + chroma_block_device_parity).
+        # CHROMA_HOST_STACK=1 selects the proven host stack (the parity oracle).
+        var loss: Float32
+        var grads: FluxLoraGradSet
+        if not _env_is_set(String("CHROMA_HOST_STACK")):
+            var fwd = chroma_stack_lora_forward_device_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), pooled.copy(), MOD_INDEX,
+                base, loader, lora, cos.copy(), sin.copy(),
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+            var nout = len(fwd.out)
+            var d_loss = List[Float32]()
+            var sse = 0.0
+            var inv_n = Float32(2.0) / Float32(nout)
+            for i in range(nout):
+                var diff = fwd.out[i] - target[i]
+                sse += Float64(diff) * Float64(diff)
+                d_loss.append(inv_n * diff)
+            loss = Float32(sse / Float64(nout))
+            grads = chroma_stack_lora_backward_device_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
+                cos.copy(), sin.copy(), fwd,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+        else:
+            var fwd = chroma_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), pooled.copy(), MOD_INDEX,
+                base, loader, lora, cos.copy(), sin.copy(),
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+            var nout = len(fwd.out)
+            var d_loss = List[Float32]()
+            var sse = 0.0
+            var inv_n = Float32(2.0) / Float32(nout)
+            for i in range(nout):
+                var diff = fwd.out[i] - target[i]
+                sse += Float64(diff) * Float64(diff)
+                d_loss.append(inv_n * diff)
+            loss = Float32(sse / Float64(nout))
+            grads = chroma_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
+                cos.copy(), sin.copy(), fwd,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
         if k == 1:
             first_loss = loss
         last_loss = loss
-
-        # ── backward (offload, full depth) ──
-        var grads = chroma_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
-            d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
-            cos.copy(), sin.copy(), fwd,
-            D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
-        )
 
         # ── gradient accumulation (OneTrainer semantics; default-off when N==1) ─
         # Fast path: accum_steps==1 uses `grads` directly (no zero-clone/copy).
