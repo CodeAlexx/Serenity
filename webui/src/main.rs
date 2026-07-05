@@ -91,6 +91,9 @@ struct LaunchReq {
     resume_state: Option<String>,
     #[serde(default)]
     start_step: Option<u64>,
+    /// build the config + argv and return them WITHOUT spawning (wiring verification)
+    #[serde(default)]
+    dry_run: bool,
 }
 
 fn gpu_busy() -> Option<String> {
@@ -179,10 +182,14 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         return (StatusCode::CONFLICT, Json(json!({"error": format!("GPU busy: {who}")})));
     }
     // ---- build the runner config: base template + preset recipe + overrides ----
-    let base_path = Path::new(REPO_ROOT).join(&p.base_config);
-    let mut cfg: Value = match std::fs::read_to_string(&base_path).ok().and_then(|s| serde_json::from_str(&s).ok()) {
-        Some(v) => v,
-        None => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("base config missing/unreadable: {} — run this model once via CLI or add the template", base_path.display())}))),
+    let mut cfg: Value = if p.base_config.is_empty() {
+        json!({}) // ideogram4: all-argv contract, no runner config template
+    } else {
+        let base_path = Path::new(REPO_ROOT).join(&p.base_config);
+        match std::fs::read_to_string(&base_path).ok().and_then(|s| serde_json::from_str(&s).ok()) {
+            Some(v) => v,
+            None => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("base config missing/unreadable: {} — run this model once via CLI or add the template", base_path.display())}))),
+        }
     };
     let run_name = req.run_name.clone().unwrap_or_else(|| p.run_name.clone());
     let workspace = format!("/home/alex/mojodiffusion/output/{run_name}");
@@ -210,18 +217,60 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "cannot write runner config"})));
     }
     let steps = cfg.get("max_steps").and_then(|v| v.as_u64()).unwrap_or(2000);
-    // ---- argv shapes 1 + 2 (UI_MAP §4) + the resume slot the Mojo UI never wired ----
+    let getf = |k: &str, d: f64| cfg.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    let getu = |k: &str, d: u64| cfg.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
+    // ---- all 4 argv shapes (UI_MAP §4) + the resume slot the Mojo UI never wired ----
     let mut args: Vec<String> = match p.argv_shape.as_str() {
         "krea2" => vec![cache.clone(), steps.to_string(), cfg_path.clone()],
         "config_runner" => vec![cfg_path.clone(), steps.to_string()],
+        // shape 3: <stage_dir> <steps> <lr> <rank> <out_dir> - <config.json>
+        // (argv wins for steps/lr/rank/out_dir; "-" keeps EMA config-owned)
+        "hidream" => vec![
+            cache.clone(),
+            steps.to_string(),
+            format!("{}", getf("learning_rate", 1e-4)),
+            format!("{}", getu("lora_rank", 16)),
+            workspace.clone(),
+            "-".into(),
+            cfg_path.clone(),
+        ],
+        // shape 4: the 18-arg ideogram4 line (TrainerRuntimeBridge.mojo:354-403).
+        // argv 11 levers "-" (defaults stay byte-identical, C13), argv 16 resume "-",
+        // argv 17 prompt "-" (no inline sampling in unit 2), argv 18 resolution.
+        "ideogram4" => vec![
+            format!("{workspace}/progress.log"),
+            format!("{}/transformer/diffusion_pytorch_model.safetensors", p.checkpoint),
+            cache.clone(),
+            "/home/alex/mojodiffusion/output".into(),
+            steps.to_string(),
+            format!("{}", getu("lora_rank", 16)),
+            format!("{}", getf("lora_alpha", 16.0)),
+            format!("{}", getf("learning_rate", 1e-4)),
+            format!("{}", getu("save_every", 500)),
+            format!("{}", getf("caption_dropout", 0.0)),
+            "-".into(),
+            format!("{}", getu("sample_every", 0)),
+            "20".into(),
+            "4.5".into(),
+            format!("{}", getu("seed", 42)),
+            "-".into(),
+            "-".into(),
+            "512".into(),
+        ],
         other => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("argv shape {other} not wired")}))),
     };
     if let Some(state) = &req.resume_state {
+        if p.argv_shape != "krea2" && p.argv_shape != "config_runner" {
+            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": "resume is wired for krea2/config-runner shapes only"})));
+        }
         if !state.ends_with(".state") && !state.contains(".state.") {
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": "resume_state must be the .state file path (MJ-1077: the PEFT path silently warm-resumes)"})));
         }
         args.push(state.clone());
         args.push(req.start_step.unwrap_or(0).to_string());
+    }
+    if req.dry_run {
+        return (StatusCode::OK, Json(json!({"dry_run": true, "binary": p.binary, "args": args, "config_written": cfg_path, "config": cfg})));
     }
     let log_path = format!("{workspace}/train_web.log");
     let log_file = match std::fs::File::create(&log_path) {
