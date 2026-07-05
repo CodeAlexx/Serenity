@@ -496,20 +496,35 @@ async fn dataset_media(axum::extract::Query(q): axum::extract::Query<PathQ>) -> 
     if !q.path.starts_with("/home/alex/") || q.path.contains("..") {
         return Json(json!({"error": "path out of scope"}));
     }
-    let mut items = vec![];
+    // Recursive to depth 2 (folder + one subdir level): users point at a dataset
+    // PARENT (e.g. 1_giger/ with images in gigerver3/) and expect to see them.
+    let mut files: Vec<std::path::PathBuf> = vec![];
     if let Ok(rd) = std::fs::read_dir(&q.path) {
-        let mut files: Vec<_> = rd.flatten().map(|e| e.path()).collect();
-        files.sort();
-        for p in files {
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-            if ["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
-                let cap = p.with_extension("txt");
-                items.push(json!({
-                    "image": format!("/files{}", p.display()),
-                    "path": p.to_string_lossy(),
-                    "caption_path": cap.exists().then(|| cap.to_string_lossy().to_string()),
-                }));
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                if p.file_name().and_then(|n| n.to_str()).map(|n| n.starts_with('.')).unwrap_or(true) {
+                    continue;
+                }
+                if let Ok(rd2) = std::fs::read_dir(&p) {
+                    files.extend(rd2.flatten().map(|e2| e2.path()).filter(|p2| p2.is_file()));
+                }
+            } else {
+                files.push(p);
             }
+        }
+    }
+    files.sort();
+    let mut items = vec![];
+    for p in files {
+        let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        if ["png", "jpg", "jpeg", "webp"].contains(&ext.as_str()) {
+            let cap = p.with_extension("txt");
+            items.push(json!({
+                "image": format!("/files{}", p.display()),
+                "path": p.to_string_lossy(),
+                "caption_path": cap.exists().then(|| cap.to_string_lossy().to_string()),
+            }));
         }
     }
     Json(json!({"count": items.len(), "items": items}))
