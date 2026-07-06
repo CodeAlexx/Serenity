@@ -324,7 +324,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         eta: String::new(),
     };
     st.runs.lock().await.push(info.clone());
-    board::run_started(&workspace, &p.id, steps);
+    board::run_started(&workspace, &p.id, steps, &cfg);
     // TAIL the child's log file -> parse + broadcast SSE (no pipe: see spawn note)
     *st.child.lock().await = Some(child);
     let stc = st.clone();

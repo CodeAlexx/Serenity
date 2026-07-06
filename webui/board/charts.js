@@ -1247,6 +1247,14 @@ function escapeHtmlCharts(str) {
 
 var _artifactSliderState = {};
 
+// Workspace sample images are served by the supervisor's /files scope (img_url).
+// Fall back to the DB blob route for board-stored artifacts that lack a path.
+function artifactSrc(run, artifact) {
+    if (artifact.img_url) return artifact.img_url;
+    return '/api/runs/' + encodeURIComponent(run) + '/blob/' +
+           encodeURIComponent(artifact.blob_key);
+}
+
 function createArtifactGallery(containerId, allResults) {
     var el = document.getElementById(containerId);
     if (!el) return;
@@ -1288,10 +1296,9 @@ function createArtifactGallery(containerId, allResults) {
         html += '</div>';
 
         html += '<div class="artifact-preview-wrap">';
-        if (isImage && current.blob_key) {
-            html += '<img class="artifact-preview-img" src="/api/runs/' +
-                    encodeURIComponent(result.run) + '/blob/' +
-                    encodeURIComponent(current.blob_key) + '" ' +
+        if (isImage && (current.img_url || current.blob_key)) {
+            html += '<img class="artifact-preview-img" src="' +
+                    artifactSrc(result.run, current) + '" ' +
                     'alt="Step ' + current.step + '">';
         } else {
             html += '<div class="artifact-preview-placeholder">' +
@@ -1309,10 +1316,9 @@ function createArtifactGallery(containerId, allResults) {
 
             html += '<div class="artifact-filmstrip-item' + activeClass + '" ' +
                     'data-index="' + idx + '" data-section-key="' + escapedKey + '" title="Step ' + artifact.step + '">';
-            if (thumbIsImage && artifact.blob_key) {
-                html += '<img class="artifact-filmstrip-thumb" src="/api/runs/' +
-                        encodeURIComponent(result.run) + '/blob/' +
-                        encodeURIComponent(artifact.blob_key) + '" ' +
+            if (thumbIsImage && (artifact.img_url || artifact.blob_key)) {
+                html += '<img class="artifact-filmstrip-thumb" src="' +
+                        artifactSrc(result.run, artifact) + '" ' +
                         'alt="Step ' + artifact.step + '" loading="lazy">';
             } else {
                 html += '<div class="artifact-filmstrip-placeholder">' +

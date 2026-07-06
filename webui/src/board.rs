@@ -32,7 +32,7 @@ use axum::{
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use rusqlite::{params, Connection};
@@ -99,7 +99,13 @@ CREATE TABLE IF NOT EXISTS runs (
     last_wall_time    REAL,
     last_step         INTEGER,
     max_steps         INTEGER,
-    active_session_id TEXT
+    active_session_id TEXT,
+    hparams_json      TEXT
+);
+CREATE TABLE IF NOT EXISTS lora_cache (
+    path         TEXT PRIMARY KEY,
+    mtime        REAL NOT NULL,
+    metrics_json TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS scalars (
     run       TEXT    NOT NULL,
@@ -129,6 +135,10 @@ pub fn init() {
     conn.pragma_update(None, "synchronous", "NORMAL").ok();
     conn.pragma_update(None, "busy_timeout", 5000).ok();
     conn.execute_batch(SCHEMA).expect("board schema");
+    // Older board.db files predate the hparams column; add it if missing (the
+    // CREATE above is a no-op for an existing table). Duplicate-column error is
+    // the expected already-migrated case and is ignored.
+    conn.execute("ALTER TABLE runs ADD COLUMN hparams_json TEXT", []).ok();
 
     let (tx, _rx) = broadcast::channel(1024);
     let _ = BOARD.set(Board {
@@ -245,23 +255,54 @@ pub fn ingest(workspace: &str, step: u64, epoch: u64, loss: f64, grad_norm: f64,
     ingest_step(&conn, &run, workspace, "web", step, epoch, loss, grad_norm, s_per_step, max_steps);
 }
 
-/// Called at run launch — upsert the run row as running (web source).
-pub fn run_started(workspace: &str, preset_id: &str, max_steps: u64) {
+/// Pull the recipe fields the HParams tab compares from the merged runner config.
+/// Only keys that are actually present are stored — nothing is fabricated. The
+/// optimizer field is an object (`{"optimizer":"ADAMW",...}`) in every runner
+/// config, so its inner name is unwrapped to a plain string.
+fn extract_hparams(cfg: &Value, preset_id: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    for k in [
+        "learning_rate", "lora_rank", "lora_alpha", "max_steps",
+        "batch_size", "timestep_shift", "quantized_resident",
+    ] {
+        if let Some(v) = cfg.get(k) {
+            m.insert(k.to_string(), v.clone());
+        }
+    }
+    let opt_name = match cfg.get("optimizer") {
+        Some(Value::Object(o)) => o.get("optimizer").and_then(|v| v.as_str()).map(String::from),
+        Some(Value::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    if let Some(name) = opt_name {
+        m.insert("optimizer".into(), json!(name));
+    }
+    if !preset_id.is_empty() {
+        m.insert("preset_id".into(), json!(preset_id));
+    }
+    Value::Object(m)
+}
+
+/// Called at run launch — upsert the run row as running (web source) and record
+/// the merged recipe (learning_rate, lora_rank, ... ) for the HParams tab.
+pub fn run_started(workspace: &str, preset_id: &str, max_steps: u64, cfg: &Value) {
     if BOARD.get().is_none() {
         return;
     }
     let run = basename(workspace);
     let start = now_s();
     let sid = format!("s{}", (start * 1000.0) as i64);
+    let hparams_json = extract_hparams(cfg, preset_id).to_string();
     let conn = board().db.lock().unwrap();
     conn.execute(
-        "INSERT INTO runs (name, workspace_dir, source, preset_id, status, start_time, max_steps, active_session_id) \
-         VALUES (?, ?, 'web', ?, 'running', ?, ?, ?) \
+        "INSERT INTO runs (name, workspace_dir, source, preset_id, status, start_time, max_steps, active_session_id, hparams_json) \
+         VALUES (?, ?, 'web', ?, 'running', ?, ?, ?, ?) \
          ON CONFLICT(name) DO UPDATE SET \
            workspace_dir = excluded.workspace_dir, source = 'web', preset_id = excluded.preset_id, \
            status = 'running', start_time = excluded.start_time, max_steps = excluded.max_steps, \
-           active_session_id = excluded.active_session_id, last_wall_time = NULL, last_step = NULL",
-        params![run, workspace, preset_id, start, max_steps as i64, sid],
+           active_session_id = excluded.active_session_id, last_wall_time = NULL, last_step = NULL, \
+           hparams_json = excluded.hparams_json",
+        params![run, workspace, preset_id, start, max_steps as i64, sid, hparams_json],
     )
     .ok();
 }
@@ -498,18 +539,27 @@ async fn list_runs() -> Json<Value> {
 }
 
 async fn tags(Path(run): Path<String>) -> Json<Value> {
-    let conn = board().db.lock().unwrap();
+    let ws;
     let mut scalars: Vec<String> = Vec::new();
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT DISTINCT tag FROM scalars WHERE run = ? ORDER BY tag")
     {
-        if let Ok(rows) = stmt.query_map(params![run], |r| r.get::<_, String>(0)) {
-            scalars = rows.flatten().collect();
+        let conn = board().db.lock().unwrap();
+        if let Ok(mut stmt) =
+            conn.prepare("SELECT DISTINCT tag FROM scalars WHERE run = ? ORDER BY tag")
+        {
+            if let Ok(rows) = stmt.query_map(params![run], |r| r.get::<_, String>(0)) {
+                scalars = rows.flatten().collect();
+            }
         }
+        ws = run_workspace(&conn, &run);
     }
+    // artifact "tags" = per-image-slot groups discovered on disk (e.g.
+    // "turbo_samples/step_0_0"), one series the Artifacts filmstrip slides over.
+    let mut artifacts: Vec<String> = collect_artifacts(&ws).into_iter().map(|a| a.tag).collect();
+    artifacts.sort();
+    artifacts.dedup();
     Json(json!({
         "scalars": scalars,
-        "tensors": [], "artifacts": [], "text_events": [], "audio": [],
+        "tensors": [], "artifacts": artifacts, "text_events": [], "audio": [],
         "trace_events": [], "eval_suites": [], "pr_curves": [],
         "graphs": [], "meshes": [], "embeddings": [],
     }))
@@ -655,6 +705,638 @@ async fn null_json() -> Json<Value> {
     Json(Value::Null)
 }
 
+// ── artifacts (workspace sample images, served via the /files scope) ──────────
+
+/// The run's workspace dir from the DB, falling back to OUTPUT_DIR/<run> so the
+/// artifacts view works for CLI runs the tailer has not registered yet.
+fn run_workspace(conn: &Connection, run: &str) -> String {
+    conn.query_row(
+        "SELECT workspace_dir FROM runs WHERE name = ?",
+        params![run],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .unwrap_or_else(|| format!("{OUTPUT_DIR}/{run}"))
+}
+
+struct ArtifactRow {
+    tag: String,
+    step: i64,
+    path: String, // absolute
+    width: i64,
+    height: i64,
+    mtime: f64,
+}
+
+/// Read a PNG's IHDR to get (width, height); returns (0,0) if not a PNG.
+fn png_dims(path: &FsPath) -> (i64, i64) {
+    use std::io::Read;
+    let Ok(mut f) = std::fs::File::open(path) else { return (0, 0); };
+    let mut buf = [0u8; 24];
+    if f.read_exact(&mut buf).is_err() {
+        return (0, 0);
+    }
+    if &buf[0..8] != b"\x89PNG\r\n\x1a\n" {
+        return (0, 0);
+    }
+    let w = u32::from_be_bytes([buf[16], buf[17], buf[18], buf[19]]) as i64;
+    let h = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]) as i64;
+    (w, h)
+}
+
+fn trailing_digits(s: &str) -> Option<i64> {
+    let d: String = s.chars().filter(|c| c.is_ascii_digit()).collect();
+    if d.is_empty() { None } else { d.parse().ok() }
+}
+
+fn mtime_secs(path: &FsPath) -> f64 {
+    std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|m| m.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// Discover sample PNGs under samples/ and turbo_samples/. Two on-disk shapes:
+///  - step-subdir: `turbo_samples/step_1500/step_0_0.png` → tag
+///    "turbo_samples/step_0_0" (the image slot), step 1500 (from the subdir).
+///    The filmstrip then slides one slot across checkpoints.
+///  - flat file:   `samples/sample_500.png` → tag "samples", step from filename.
+fn collect_artifacts(workspace: &str) -> Vec<ArtifactRow> {
+    let mut out = Vec::new();
+    for sub in ["samples", "turbo_samples"] {
+        let root = FsPath::new(workspace).join(sub);
+        let Ok(rd) = std::fs::read_dir(&root) else { continue; };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                let step = p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(trailing_digits)
+                    .unwrap_or(0);
+                if let Ok(rd2) = std::fs::read_dir(&p) {
+                    for e2 in rd2.flatten() {
+                        let f = e2.path();
+                        if f.extension().map(|x| x == "png").unwrap_or(false) {
+                            let stem = f.file_stem().and_then(|n| n.to_str()).unwrap_or("img");
+                            let (w, h) = png_dims(&f);
+                            out.push(ArtifactRow {
+                                tag: format!("{sub}/{stem}"),
+                                step,
+                                path: f.to_string_lossy().to_string(),
+                                width: w,
+                                height: h,
+                                mtime: mtime_secs(&f),
+                            });
+                        }
+                    }
+                }
+            } else if p.extension().map(|x| x == "png").unwrap_or(false) {
+                let stem = p.file_stem().and_then(|n| n.to_str()).unwrap_or("img");
+                let (w, h) = png_dims(&p);
+                out.push(ArtifactRow {
+                    tag: sub.to_string(),
+                    step: trailing_digits(stem).unwrap_or(0),
+                    path: p.to_string_lossy().to_string(),
+                    width: w,
+                    height: h,
+                    mtime: mtime_secs(&p),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| a.tag.cmp(&b.tag).then(a.step.cmp(&b.step)));
+    out
+}
+
+#[derive(Deserialize)]
+struct ArtifactQ {
+    tag: String,
+}
+
+/// Port of read_artifacts: metadata list for one tag. `blob_key` carries the
+/// absolute path and `img_url` the /files URL the browser actually loads.
+async fn artifacts(Path(run): Path<String>, Query(q): Query<ArtifactQ>) -> Json<Value> {
+    let ws = {
+        let conn = board().db.lock().unwrap();
+        run_workspace(&conn, &run)
+    };
+    let out: Vec<Value> = collect_artifacts(&ws)
+        .into_iter()
+        .filter(|a| a.tag == q.tag)
+        .map(|a| {
+            json!({
+                "step": a.step,
+                "wall_time": a.mtime,
+                "blob_key": a.path,
+                "img_url": format!("/files{}", a.path),
+                "mime_type": "image/png",
+                "width": a.width,
+                "height": a.height,
+                "kind": "image",
+                "meta": {},
+            })
+        })
+        .collect();
+    Json(Value::Array(out))
+}
+
+// ── hparams (real recipe stored at run launch) ────────────────────────────────
+
+fn run_hparams(conn: &Connection, run: &str) -> Value {
+    let hp: Option<String> = conn
+        .query_row("SELECT hparams_json FROM runs WHERE name = ?", params![run], |r| r.get(0))
+        .ok()
+        .flatten();
+    hp.and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+/// Final observed scalars, exposed as hparams "metrics" (the parcoords color dim).
+fn run_metrics(conn: &Connection, run: &str) -> Value {
+    let mut m = serde_json::Map::new();
+    let last = |tag: &str| {
+        conn.query_row(
+            "SELECT value FROM scalars WHERE run = ? AND tag = ? ORDER BY step DESC LIMIT 1",
+            params![run, tag],
+            |r| r.get::<_, f64>(0),
+        )
+        .ok()
+    };
+    if let Some(v) = last(TAG_LOSS) {
+        if v.is_finite() {
+            m.insert("final_loss".into(), json!(v));
+        }
+    }
+    if let Some(v) = last(TAG_GRAD) {
+        if v.is_finite() {
+            m.insert("final_grad_norm".into(), json!(v));
+        }
+    }
+    Value::Object(m)
+}
+
+async fn hparams(Path(run): Path<String>) -> Json<Value> {
+    let conn = board().db.lock().unwrap();
+    Json(json!({
+        "hparams": run_hparams(&conn, &run),
+        "metrics": run_metrics(&conn, &run),
+    }))
+}
+
+#[derive(Deserialize)]
+struct RunsQ {
+    runs: String,
+}
+
+async fn compare_hparams(Query(q): Query<RunsQ>) -> Json<Value> {
+    let conn = board().db.lock().unwrap();
+    let mut out: Vec<Value> = Vec::new();
+    for run in q.runs.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let exists = conn
+            .query_row("SELECT 1 FROM runs WHERE name = ?", params![run], |_| Ok(()))
+            .is_ok();
+        if !exists {
+            continue;
+        }
+        out.push(json!({
+            "run": run,
+            "hparams": run_hparams(&conn, run),
+            "metrics": run_metrics(&conn, run),
+        }));
+    }
+    Json(Value::Array(out))
+}
+
+// ── LoRA weight analytics (pure-Rust safetensors reader) ──────────────────────
+//
+// Port of serenityboard/lora_analytics.py. We read A/B weight pairs straight
+// from the checkpoint header, convert bf16/f16→f32, and compute per-layer norms.
+// L1/L2 (Frobenius) are exact; spectral norms are the top singular value via
+// power iteration on the small (rank×rank) Gram matrix — no linear-algebra
+// dependency. Metrics that need the full singular spectrum (effective_rank,
+// condition_number) are intentionally omitted; the frontend renders them as "-".
+
+/// finite→Number, non-finite→Null (JSON has no Inf/NaN; matches the frontend's
+/// null→"-" rendering).
+fn numj(x: f64) -> Value {
+    if x.is_finite() {
+        json!(x)
+    } else {
+        Value::Null
+    }
+}
+
+/// (file, data_section_start, tensor-header-map) for a safetensors file.
+fn read_st_header(path: &str) -> Option<(std::fs::File, u64, serde_json::Map<String, Value>)> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path).ok()?;
+    let mut lenb = [0u8; 8];
+    f.read_exact(&mut lenb).ok()?;
+    let hlen = u64::from_le_bytes(lenb);
+    if hlen > 100 * 1024 * 1024 {
+        return None; // sanity guard against a bogus header length
+    }
+    let mut hbuf = vec![0u8; hlen as usize];
+    f.read_exact(&mut hbuf).ok()?;
+    let v: Value = serde_json::from_slice(&hbuf).ok()?;
+    Some((f, 8 + hlen, v.as_object()?.clone()))
+}
+
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (h >> 15) & 1;
+    let exp = (h >> 10) & 0x1f;
+    let mant = h & 0x3ff;
+    let val = if exp == 0 {
+        (mant as f32) * 2f32.powi(-24)
+    } else if exp == 0x1f {
+        if mant == 0 { f32::INFINITY } else { f32::NAN }
+    } else {
+        (1.0 + (mant as f32) / 1024.0) * 2f32.powi(exp as i32 - 15)
+    };
+    if sign == 1 { -val } else { val }
+}
+
+/// Load one tensor as f32 with its (rows, cols) shape (cols = product of dims>0).
+fn load_tensor(
+    f: &mut std::fs::File,
+    data_start: u64,
+    ent: &Value,
+) -> Option<(Vec<f32>, usize, usize)> {
+    use std::io::{Read, Seek, SeekFrom};
+    let dtype = ent.get("dtype")?.as_str()?;
+    let shape: Vec<usize> = ent
+        .get("shape")?
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_u64().map(|x| x as usize))
+        .collect();
+    let offs = ent.get("data_offsets")?.as_array()?;
+    let a = offs.first()?.as_u64()?;
+    let b = offs.get(1)?.as_u64()?;
+    f.seek(SeekFrom::Start(data_start + a)).ok()?;
+    let mut raw = vec![0u8; (b - a) as usize];
+    f.read_exact(&mut raw).ok()?;
+    let vals: Vec<f32> = match dtype {
+        "F32" | "float32" => raw
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        "BF16" | "bfloat16" => raw
+            .chunks_exact(2)
+            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+            .collect(),
+        "F16" | "float16" => raw
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        _ => return None,
+    };
+    let (rows, cols) = if shape.len() >= 2 {
+        (shape[0], shape[1..].iter().product())
+    } else if shape.len() == 1 {
+        (shape[0], 1)
+    } else {
+        (vals.len(), 1)
+    };
+    Some((vals, rows, cols))
+}
+
+fn l1_l2(v: &[f32]) -> (f64, f64) {
+    let mut l1 = 0f64;
+    let mut sq = 0f64;
+    for &x in v {
+        let x = x as f64;
+        l1 += x.abs();
+        sq += x * x;
+    }
+    (l1, sq.sqrt())
+}
+
+/// Largest singular value of a row-major (rows×cols) matrix, via power iteration
+/// on the smaller of the two Gram matrices (dimension = min(rows,cols) = rank).
+fn spectral_norm(m: &[f32], rows: usize, cols: usize) -> f64 {
+    if rows == 0 || cols == 0 || m.len() < rows * cols {
+        return 0.0;
+    }
+    let k = rows.min(cols);
+    let mut g = vec![0f64; k * k];
+    if rows <= cols {
+        // G = M Mᵀ  (k = rows)
+        for i in 0..rows {
+            let ri = &m[i * cols..(i + 1) * cols];
+            for j in i..rows {
+                let rj = &m[j * cols..(j + 1) * cols];
+                let mut s = 0f64;
+                for c in 0..cols {
+                    s += ri[c] as f64 * rj[c] as f64;
+                }
+                g[i * k + j] = s;
+                g[j * k + i] = s;
+            }
+        }
+    } else {
+        // G = Mᵀ M  (k = cols)
+        for r in 0..rows {
+            let row = &m[r * cols..(r + 1) * cols];
+            for i in 0..cols {
+                let a = row[i] as f64;
+                for j in i..cols {
+                    g[i * k + j] += a * row[j] as f64;
+                }
+            }
+        }
+        for i in 0..cols {
+            for j in (i + 1)..cols {
+                g[j * k + i] = g[i * k + j];
+            }
+        }
+    }
+    // power iteration for λ_max(G); σ_max = sqrt(λ_max)
+    let mut v = vec![1f64 / (k as f64).sqrt(); k];
+    let mut lambda = 0f64;
+    for _ in 0..128 {
+        let mut w = vec![0f64; k];
+        for i in 0..k {
+            let gi = &g[i * k..(i + 1) * k];
+            let mut s = 0f64;
+            for j in 0..k {
+                s += gi[j] * v[j];
+            }
+            w[i] = s;
+        }
+        let norm = w.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm <= 1e-20 {
+            lambda = 0.0;
+            break;
+        }
+        for i in 0..k {
+            v[i] = w[i] / norm;
+        }
+        lambda = norm; // ||G v|| with unit v ≈ λ_max as it converges
+    }
+    lambda.max(0.0).sqrt()
+}
+
+/// Per-layer metrics for one LoRA safetensors file (name → metric map).
+fn analyze_file(path: &str) -> Option<serde_json::Map<String, Value>> {
+    let (mut f, data_start, hdr) = read_st_header(path)?;
+    // Suffixes are matched against the lowercased key, so ".lora_A.weight" and
+    // ".lora_a.weight" collapse to one entry.
+    let a_suf = [".lora_down.weight", ".lora_a.weight", ".lora.down.weight"];
+    let b_suf = [".lora_up.weight", ".lora_b.weight", ".lora.up.weight"];
+    let mut a_keys: HashMap<String, String> = HashMap::new();
+    let mut b_keys: HashMap<String, String> = HashMap::new();
+    for (k, ent) in hdr.iter() {
+        if k == "__metadata__" {
+            continue;
+        }
+        let ndim = ent.get("shape").and_then(|s| s.as_array()).map(|a| a.len()).unwrap_or(0);
+        if ndim < 2 {
+            continue;
+        }
+        let lower = k.to_lowercase();
+        let mut matched = false;
+        for suf in a_suf {
+            if lower.ends_with(suf) {
+                a_keys.insert(k[..k.len() - suf.len()].to_string(), k.clone());
+                matched = true;
+                break;
+            }
+        }
+        if matched {
+            continue;
+        }
+        for suf in b_suf {
+            if lower.ends_with(suf) {
+                b_keys.insert(k[..k.len() - suf.len()].to_string(), k.clone());
+                break;
+            }
+        }
+    }
+    let mut bases: Vec<&String> = a_keys.keys().filter(|b| b_keys.contains_key(*b)).collect();
+    bases.sort();
+    let mut layers = serde_json::Map::new();
+    for base in bases {
+        let (av, ar, ac) = load_tensor(&mut f, data_start, &hdr[&a_keys[base]])?;
+        let (bv, br, bc) = load_tensor(&mut f, data_start, &hdr[&b_keys[base]])?;
+        let (a_l1, a_l2) = l1_l2(&av);
+        let (b_l1, b_l2) = l1_l2(&bv);
+        let a_spec = spectral_norm(&av, ar, ac);
+        let b_spec = spectral_norm(&bv, br, bc);
+        let ab_ratio = if a_spec > 1e-12 { b_spec / a_spec } else { f64::INFINITY };
+        layers.insert(
+            base.clone(),
+            json!({
+                "a_l1_norm": numj(a_l1),
+                "a_l2_norm": numj(a_l2),
+                "a_spectral_norm": numj(a_spec),
+                "b_l1_norm": numj(b_l1),
+                "b_l2_norm": numj(b_l2),
+                "b_spectral_norm": numj(b_spec),
+                "ab_ratio": numj(ab_ratio),
+            }),
+        );
+    }
+    Some(layers)
+}
+
+/// analyze_file with a DB cache keyed by (path, mtime) so repeat views are instant.
+fn analyze_cached(path: &str) -> Option<serde_json::Map<String, Value>> {
+    let mtime = mtime_secs(FsPath::new(path));
+    {
+        let conn = board().db.lock().unwrap();
+        let hit: Option<(f64, String)> = conn
+            .query_row(
+                "SELECT mtime, metrics_json FROM lora_cache WHERE path = ?",
+                params![path],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .ok();
+        if let Some((mt, js)) = hit {
+            if (mt - mtime).abs() < 1e-6 {
+                if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(&js) {
+                    return Some(m);
+                }
+            }
+        }
+    }
+    let layers = analyze_file(path)?;
+    let js = Value::Object(layers.clone()).to_string();
+    {
+        let conn = board().db.lock().unwrap();
+        conn.execute(
+            "INSERT INTO lora_cache (path, mtime, metrics_json) VALUES (?, ?, ?) \
+             ON CONFLICT(path) DO UPDATE SET mtime = excluded.mtime, metrics_json = excluded.metrics_json",
+            params![path, mtime, js],
+        )
+        .ok();
+    }
+    Some(layers)
+}
+
+fn summary_stats(layers: &serde_json::Map<String, Value>) -> Value {
+    let n = layers.len().max(1) as f64;
+    let mut sum_ab = 0f64;
+    let mut cnt_ab = 0f64;
+    let mut sum_b = 0f64;
+    let mut max_b = 0f64;
+    for m in layers.values() {
+        if let Some(r) = m.get("ab_ratio").and_then(|v| v.as_f64()) {
+            sum_ab += r;
+            cnt_ab += 1.0;
+        }
+        if let Some(b) = m.get("b_spectral_norm").and_then(|v| v.as_f64()) {
+            sum_b += b;
+            if b > max_b {
+                max_b = b;
+            }
+        }
+    }
+    json!({
+        "mean_ab_ratio": if cnt_ab > 0.0 { sum_ab / cnt_ab } else { 0.0 },
+        "mean_b_spectral": sum_b / n,
+        "max_b_spectral": max_b,
+        "num_layers": layers.len(),
+    })
+}
+
+/// The ab_ratio-dominance check from lora_analytics.diagnose (the eff-rank /
+/// condition checks need the full spectrum, which we do not compute).
+fn diagnose(layers: &serde_json::Map<String, Value>) -> Vec<String> {
+    let n = layers.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let dominant = layers
+        .values()
+        .filter(|m| m.get("ab_ratio").and_then(|v| v.as_f64()).map(|r| r > 2.0).unwrap_or(false))
+        .count();
+    let mut out = Vec::new();
+    if dominant as f64 > n as f64 * 0.5 {
+        let pct = dominant as f64 / n as f64 * 100.0;
+        out.push(format!(
+            "B matrices dominating A across {pct:.0}% of layers (ab_ratio > 2.0) — possible overtraining or LR too high"
+        ));
+    }
+    out
+}
+
+#[derive(Deserialize)]
+struct LoraAnalyzeReq {
+    path: String,
+}
+
+async fn lora_analyze(Json(req): Json<LoraAnalyzeReq>) -> (StatusCode, Json<Value>) {
+    let path = req.path.clone();
+    if !path.ends_with(".safetensors") {
+        return (StatusCode::BAD_REQUEST, Json(json!({"detail": "Only .safetensors files are supported"})));
+    }
+    if !FsPath::new(&path).is_file() {
+        return (StatusCode::NOT_FOUND, Json(json!({"detail": format!("File not found: {path}")})));
+    }
+    let layers = match tokio::task::spawn_blocking(move || analyze_cached(&path)).await {
+        Ok(Some(l)) => l,
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"detail": "failed to read LoRA weights"}))),
+    };
+    let n = layers.len();
+    // NOTE: no "summary" key here — the frontend uses `!!data.summary` to switch
+    // into two-file compare layout, so a single-file analyze must omit it.
+    (
+        StatusCode::OK,
+        Json(json!({
+            "layers": layers,
+            "diagnostics": diagnose(&layers),
+            "num_layers": n,
+        })),
+    )
+}
+
+#[derive(Deserialize)]
+struct LoraCompareReq {
+    path_a: String,
+    path_b: String,
+}
+
+async fn lora_compare(Json(req): Json<LoraCompareReq>) -> (StatusCode, Json<Value>) {
+    for p in [&req.path_a, &req.path_b] {
+        if !p.ends_with(".safetensors") {
+            return (StatusCode::BAD_REQUEST, Json(json!({"detail": "Only .safetensors files are supported"})));
+        }
+        if !FsPath::new(p).is_file() {
+            return (StatusCode::NOT_FOUND, Json(json!({"detail": format!("File not found: {p}")})));
+        }
+    }
+    let (pa, pb) = (req.path_a.clone(), req.path_b.clone());
+    let (ma, mb) = match tokio::task::spawn_blocking(move || (analyze_cached(&pa), analyze_cached(&pb))).await {
+        Ok((Some(a), Some(b))) => (a, b),
+        _ => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"detail": "failed to read LoRA weights"}))),
+    };
+    // union of layer names, sorted
+    let mut names: Vec<String> = ma.keys().chain(mb.keys()).cloned().collect();
+    names.sort();
+    names.dedup();
+    let diff_keys = [
+        "a_l1_norm", "a_l2_norm", "a_spectral_norm",
+        "b_l1_norm", "b_l2_norm", "b_spectral_norm", "ab_ratio",
+    ];
+    let mut layers = serde_json::Map::new();
+    let (mut sum_da, mut sum_db, mut cnt) = (0f64, 0f64, 0f64);
+    for name in &names {
+        let m1 = ma.get(name);
+        let m2 = mb.get(name);
+        let mut e = serde_json::Map::new();
+        e.insert("lora1".into(), m1.cloned().unwrap_or(Value::Null));
+        e.insert("lora2".into(), m2.cloned().unwrap_or(Value::Null));
+        if let (Some(m1), Some(m2)) = (m1, m2) {
+            for key in diff_keys {
+                let va = m1.get(key).and_then(|v| v.as_f64());
+                let vb = m2.get(key).and_then(|v| v.as_f64());
+                let pct = match (va, vb) {
+                    (Some(a), Some(b)) if a.abs() > 1e-12 => (b - a) / a.abs() * 100.0,
+                    _ => 0.0,
+                };
+                e.insert(format!("diff_{key}_pct"), numj(pct));
+            }
+            if let Some(v) = e.get("diff_a_spectral_norm_pct").and_then(|v| v.as_f64()) {
+                sum_da += v;
+                sum_db += e.get("diff_b_spectral_norm_pct").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                cnt += 1.0;
+            }
+        }
+        layers.insert(name.clone(), Value::Object(e));
+    }
+    let n = layers.len();
+    let mut diags = diagnose(&ma);
+    diags.extend(diagnose(&mb));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "layers": layers,
+            "file_b": true,
+            "summary": {
+                "mean_diff_a_spectral_pct": if cnt > 0.0 { sum_da / cnt } else { 0.0 },
+                "mean_diff_b_spectral_pct": if cnt > 0.0 { sum_db / cnt } else { 0.0 },
+            },
+            "summary_a": summary_stats(&ma),
+            "summary_b": summary_stats(&mb),
+            "diagnostics": diags,
+            "num_layers": n,
+        })),
+    )
+}
+
+/// Upload variants need multipart (an extra dependency + feature); the path
+/// endpoints cover server-side checkpoint reads. Return a clear hint instead of 404.
+async fn lora_upload_unsupported() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::NOT_IMPLEMENTED,
+        Json(json!({"detail": "upload analysis is not supported here — use the path input (server reads the checkpoint directly)"})),
+    )
+}
+
 // ── live WebSocket ───────────────────────────────────────────────────────────
 
 async fn ws_live(ws: WebSocketUpgrade) -> Response {
@@ -792,7 +1474,8 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route("/api/board/runs/:run/notes", get(get_notes).put(put_notes))
         .route("/api/board/runs/:run/traces", get(empty_arr))
         .route("/api/board/runs/:run/eval", get(empty_arr))
-        .route("/api/board/runs/:run/artifacts", get(empty_arr))
+        .route("/api/board/runs/:run/artifacts", get(artifacts))
+        .route("/api/board/runs/:run/hparams", get(hparams))
         .route("/api/board/runs/:run/pr-curves", get(empty_arr))
         .route("/api/board/runs/:run/audio", get(empty_arr))
         .route("/api/board/runs/:run/histograms", get(empty_arr))
@@ -801,6 +1484,10 @@ pub fn router() -> Router<std::sync::Arc<crate::AppState>> {
         .route("/api/board/runs/:run/custom-scalars/layout", get(null_json))
         .route("/api/board/runs/:run/custom-scalars/data", get(empty_obj))
         .route("/api/board/compare/scalars", get(compare_scalars))
-        .route("/api/board/compare/hparams", get(empty_obj))
+        .route("/api/board/compare/hparams", get(compare_hparams))
+        .route("/api/board/lora/analyze", post(lora_analyze))
+        .route("/api/board/lora/compare", post(lora_compare))
+        .route("/api/board/lora/analyze-upload", post(lora_upload_unsupported))
+        .route("/api/board/lora/compare-upload", post(lora_upload_unsupported))
         .route("/api/board/ws/live", get(ws_live))
 }
