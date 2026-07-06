@@ -601,6 +601,23 @@ async fn runs_history() -> Json<Value> {
     Json(json!({"history": rows}))
 }
 
+/// Full UI state persistence (theme + every form field) — server-owned so it
+/// survives any browser/machine, unlike localStorage.
+fn ui_state_path() -> String {
+    format!("{REPO_ROOT}/webui/ui_state.json")
+}
+
+async fn ui_state_get() -> Json<Value> {
+    Json(std::fs::read_to_string(ui_state_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!({})))
+}
+
+async fn ui_state_put(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+    match std::fs::write(ui_state_path(), serde_json::to_string_pretty(&body).unwrap_or_default()) {
+        Ok(_) => (StatusCode::OK, Json(json!({"saved": true}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
 async fn events(State(st): State<Arc<AppState>>) -> Sse<EvStream> {
     let rx = st.events.subscribe();
     Sse::new(EvStream::new(rx)).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
@@ -673,6 +690,7 @@ async fn main() {
         .route("/api/captioner/abort", post(captioner::abort))
         .route("/api/validations", get(validations_get).put(validations_put))
         .route("/api/runs/history", get(runs_history))
+        .route("/api/ui/state", get(ui_state_get).put(ui_state_put))
         .route("/files/*path", get(file_serve))
         .nest_service("/", tower_http::services::ServeDir::new(static_dir).append_index_html_on_directories(true))
         .with_state(st);
