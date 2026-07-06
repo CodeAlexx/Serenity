@@ -27,6 +27,7 @@ use tokio::{
 };
 
 mod captioner;
+mod board;
 
 const REPO_ROOT: &str = "/home/alex/serenity-trainer";
 const CUDA_LD: &str = "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib";
@@ -120,7 +121,8 @@ fn gpu_busy() -> Option<String> {
 }
 
 /// Parse the two accepted progress line shapes (UI_MAP §5) with plain string ops.
-fn parse_progress(line: &str, run: &mut RunInfo) -> bool {
+/// pub(crate) so the board tailer can feed CLI-run log lines through the SAME parser.
+pub(crate) fn parse_progress(line: &str, run: &mut RunInfo) -> bool {
     // shape 2 (klein/krea2/tqdm): "[X] step 1613/2000 | epoch 14/17 | loss 0.59 | grad_norm 0.15 | 2.1s/step | ... | ETA 0:13:20"
     let grab = |key: &str| -> Option<String> {
         let i = line.find(key)? + key.len();
@@ -320,6 +322,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         eta: String::new(),
     };
     st.runs.lock().await.push(info.clone());
+    board::run_started(&workspace, &p.id, steps);
     // pump stdout -> logfile + parse + broadcast SSE events
     let stdout = child.stdout.take().unwrap();
     *st.child.lock().await = Some(child);
@@ -335,6 +338,9 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             let mut runs = stc.runs.lock().await;
             if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
                 let parsed = parse_progress(&line, r);
+                if parsed {
+                    board::ingest(&r.workspace_dir, r.step, r.epoch, r.loss, r.grad_norm, r.s_per_step, r.total_steps);
+                }
                 let ev = if parsed {
                     json!({"type": "progress", "run": &*r}).to_string()
                 } else {
@@ -362,6 +368,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
                 };
             }
             append_history(r);
+            board::run_ended(&r.workspace_dir, &r.status);
             let _ = stc.events.send(json!({"type": "status", "run": &*r}).to_string());
         }
     });
@@ -675,8 +682,10 @@ async fn main() {
         events: tx,
         next_id: Mutex::new(0),
     });
+    board::init();
     let static_dir = PathBuf::from(REPO_ROOT).join("webui/static");
     let app = Router::new()
+        .merge(board::router())
         .route("/api/presets", get(get_presets))
         .route("/api/runs", get(list_runs).post(launch))
         .route("/api/runs/:id/stop", post(stop))
