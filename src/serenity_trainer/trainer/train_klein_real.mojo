@@ -62,6 +62,7 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_forward_device_inputs_resident_moddev_rope_scratch,
     klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch,
     klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_b2,
+    klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_b2rs,
     klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape,
     KleinStackForwardB2,
     klein_stack_lora_backward, klein_stack_lora_backward_resident,
@@ -70,6 +71,7 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_backward_resident_moddev_rope_scratch,
     klein_stack_lora_backward_offload_turbo_moddev_rope_scratch,
     klein_stack_lora_backward_offload_turbo_moddev_rope_scratch_b2,
+    klein_stack_lora_backward_offload_turbo_moddev_rope_scratch_b2rs,
     klein_stack_lora_backward_graph,
     klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch,
     klein_stack_direct_dora_forward_offload_turbo_moddev_rope_scratch,
@@ -183,6 +185,16 @@ comptime KLEIN_V2_ENGINE = True
 # hand-chain. False = previous hand-chain path (C13 gate-don't-delete).
 comptime KLEIN_V2_GRAPH = True
 comptime KLEIN_V2_GRAPH_PATH = KLEIN_V2_ENGINE and KLEIN_V2_GRAPH
+# TRUE-batch ROW-STACKED b2 (fleet b2rs rung B, 2026-07-06): the 24 single
+# blocks run ONCE per pair over [2S, D] rows with [2, D] adaLN packs and REAL
+# B=2 cuDNN flash (gate: models/klein/parity/klein_single_block_b2rs_parity —
+# 8/8 cos=1.0 vs the per-sample pair). False = the interleaved _b2 oracle
+# (every block computed twice per pair; C13 gate-don't-delete).
+# 2026-07-06 MEASURED: b2rs fwd is FASTER (14.0 vs 15.2 s/12) and loss-gated
+# (step-1 0.7737 vs 0.7740) but the batched BACKWARD is slower (43.3 vs 37.6
+# s/12) -> 5.34 vs 4.96 s/pair total. Default stays on the interleaved oracle
+# until the backward attribution (flash-bwd-vs-math at B=2, nsys) lands.
+comptime KLEIN_B2_ROWSTACK = False
 
 from serenitymojo.training.lora_adamw_ot_fused import (
     LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
@@ -2128,15 +2140,27 @@ def main() raises:
             var mods1 = build_klein_step_mods_device_cached(
                 mod_weights, prep1.sigma, cfg.timestep_dim, cfg.d_model, ctx
             )
-            var fwd_b2 = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_b2[H, Dh, N_IMG, N_TXT, S](
-                prep0.x_t, txt0, prep1.x_t, txt1, base, loader, lora_dev,
-                mods0[0].copy(), mods0[1].copy(), mods0[2].copy(),
-                mods1[0].copy(), mods1[1].copy(), mods1[2].copy(),
-                mods0[3].copy(), mods0[4].copy(), mods1[3].copy(), mods1[4].copy(),
-                cos_dev[], sin_dev[],
-                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
-                cfg.out_channels, cfg.eps, ctx, scratch_fwd,
-            )
+            var fwd_b2: KleinStackForwardB2
+            comptime if KLEIN_B2_ROWSTACK:
+                fwd_b2 = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_b2rs[H, Dh, N_IMG, N_TXT, S](
+                    prep0.x_t, txt0, prep1.x_t, txt1, base, loader, lora_dev,
+                    mods0[0].copy(), mods0[1].copy(), mods0[2].copy(),
+                    mods1[0].copy(), mods1[1].copy(), mods1[2].copy(),
+                    mods0[3].copy(), mods0[4].copy(), mods1[3].copy(), mods1[4].copy(),
+                    cos_dev[], sin_dev[],
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_fwd,
+                )
+            else:
+                fwd_b2 = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_b2[H, Dh, N_IMG, N_TXT, S](
+                    prep0.x_t, txt0, prep1.x_t, txt1, base, loader, lora_dev,
+                    mods0[0].copy(), mods0[1].copy(), mods0[2].copy(),
+                    mods1[0].copy(), mods1[1].copy(), mods1[2].copy(),
+                    mods0[3].copy(), mods0[4].copy(), mods1[3].copy(), mods1[4].copy(),
+                    cos_dev[], sin_dev[],
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_fwd,
+                )
             var t_fwd1_b2 = perf_counter_ns()
             perf_forward_seconds += Float64(t_fwd1_b2 - t_fwd0) / 1.0e9
             # joint 2N-mean loss = mean of the two single-sample losses; each
@@ -2155,14 +2179,24 @@ def main() raises:
                 print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss, " b2=1")
             t_bwd0 = perf_counter_ns()
             perf_loss_seconds += Float64(t_bwd0 - t_fwd1_b2) / 1.0e9
-            g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch_b2[H, Dh, N_IMG, N_TXT, S](
-                d0, d1, base, loader, lora_dev,
-                mods0[0].copy(), mods0[1].copy(), mods0[2].copy(),
-                mods1[0].copy(), mods1[1].copy(), mods1[2].copy(),
-                mods0[4].copy(), mods1[4].copy(), cos_dev[], sin_dev[], fwd_b2,
-                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
-                cfg.out_channels, cfg.eps, ctx, scratch_bwd,
-            )
+            comptime if KLEIN_B2_ROWSTACK:
+                g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch_b2rs[H, Dh, N_IMG, N_TXT, S](
+                    d0, d1, base, loader, lora_dev,
+                    mods0[0].copy(), mods0[1].copy(), mods0[2].copy(),
+                    mods1[0].copy(), mods1[1].copy(), mods1[2].copy(),
+                    mods0[4].copy(), mods1[4].copy(), cos_dev[], sin_dev[], fwd_b2,
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_bwd,
+                )
+            else:
+                g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch_b2[H, Dh, N_IMG, N_TXT, S](
+                    d0, d1, base, loader, lora_dev,
+                    mods0[0].copy(), mods0[1].copy(), mods0[2].copy(),
+                    mods1[0].copy(), mods1[1].copy(), mods1[2].copy(),
+                    mods0[4].copy(), mods1[4].copy(), cos_dev[], sin_dev[], fwd_b2,
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_bwd,
+                )
         elif use_activation_tape_offload:
             var fwd_tape = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape[H, Dh, N_IMG, N_TXT, S](
                 x_t_dev, txt_tokens_t, base,
