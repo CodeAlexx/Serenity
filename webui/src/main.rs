@@ -503,6 +503,9 @@ async fn dataset_media(axum::extract::Query(q): axum::extract::Query<PathQ>) -> 
     if !q.path.starts_with("/home/alex/") || q.path.contains("..") {
         return Json(json!({"error": "path out of scope"}));
     }
+    if !std::path::Path::new(&q.path).is_dir() {
+        return Json(json!({"error": format!("folder not found: {}", q.path)}));
+    }
     // Recursive to depth 2 (folder + one subdir level): users point at a dataset
     // PARENT (e.g. 1_giger/ with images in gigerver3/) and expect to see them.
     let mut files: Vec<std::path::PathBuf> = vec![];
