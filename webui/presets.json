@@ -226,12 +226,12 @@
       "id": "sdxl",
       "label": "SDXL 1.0",
       "backend": "sdxl",
-      "wired": false,
+      "wired": true,
       "argv_shape": "config_runner",
       "binary": "target/serenity_sdxl_live_trainer",
-      "base_config": "target/serenity_sdxl_train_config.json",
+      "base_config": "/home/alex/mojodiffusion/serenitymojo/configs/sdxl.json",
       "checkpoint": "",
-      "cache": "",
+      "cache": "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_sdxl_512_smoke",
       "run_name": "sdxl_lora",
       "workspace_dir": "/home/alex/mojodiffusion/output/alina_sdxl",
       "save_filename_prefix": "sdxl",
@@ -245,7 +245,8 @@
         "sample_every": 0,
         "quantized_resident": "off"
       },
-      "_unwired_note": "FROZEN by user mandate 2026-07-04 (no sdxl work) \u2014 row kept for completeness"
+      "_unwired_note": "FROZEN by user mandate 2026-07-04 (no sdxl work) \u2014 row kept for completeness",
+      "_sampling_note": "inline sampler is a 128x128 comptime binary; 1024 validation renders FAIL LOUD \u2014 sample_every=0 until the sampler arm is rebuilt (unfreeze 2026-07-06)"
     },
     {
       "id": "sd35",
