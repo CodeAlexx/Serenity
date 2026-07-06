@@ -21,7 +21,6 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncBufReadExt, BufReader},
     process::{Child, Command},
     sync::{broadcast, Mutex},
 };
@@ -281,9 +280,12 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         Ok(f) => f,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": format!("log create: {e}")}))),
     };
-    // stdbuf -oL: the child now writes to a PIPE (no tty), where libc stdio
-    // block-buffers ~4-8KB — without line buffering, SSE events arrive in
-    // delayed bursts instead of live lines.
+    // DECOUPLED OUTPUT (2026-07-05 incident): the child writes its log FILE
+    // directly — no pipe to this server. A server restart/crash can no longer
+    // break the child (a piped child dies on SIGPIPE at its next print once
+    // the server is gone; KillMode=process alone doesn't cover that). The
+    // supervisor TAILS the file for parsing/SSE instead. stdbuf -oL keeps
+    // lines flushing promptly to the file for live tailing.
     let mut cmd = Command::new("stdbuf");
     cmd.arg("-oL")
         .arg("-eL")
@@ -292,7 +294,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         .current_dir(REPO_ROOT)
         .env("MODULAR_DEVICE_CONTEXT_SYNC_MODE", "true")
         .env("LD_LIBRARY_PATH", CUDA_LD)
-        .stdout(Stdio::piped())
+        .stdout(Stdio::from(log_file.try_clone().unwrap()))
         .stderr(Stdio::from(log_file.try_clone().unwrap()));
     let mut child = match cmd.spawn() {
         Ok(c) => c,
@@ -323,53 +325,91 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
     };
     st.runs.lock().await.push(info.clone());
     board::run_started(&workspace, &p.id, steps);
-    // pump stdout -> logfile + parse + broadcast SSE events
-    let stdout = child.stdout.take().unwrap();
+    // TAIL the child's log file -> parse + broadcast SSE (no pipe: see spawn note)
     *st.child.lock().await = Some(child);
     let stc = st.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(stdout).lines();
-        let mut lf = std::fs::OpenOptions::new().append(true).open(&log_path).ok();
-        while let Ok(Some(line)) = lines.next_line().await {
-            use std::io::Write;
-            if let Some(f) = lf.as_mut() {
-                let _ = writeln!(f, "{line}");
-            }
-            let mut runs = stc.runs.lock().await;
-            if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
-                let parsed = parse_progress(&line, r);
-                if parsed {
-                    board::ingest(&r.workspace_dir, r.step, r.epoch, r.loss, r.grad_norm, r.s_per_step, r.total_steps);
+        let mut offset: u64 = 0;
+        let mut pending = String::new();
+        loop {
+            // read any new bytes
+            if let Ok(mut f) = std::fs::File::open(&log_path) {
+                use std::io::{Read, Seek, SeekFrom};
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                if len > offset {
+                    let _ = f.seek(SeekFrom::Start(offset));
+                    let mut buf = String::new();
+                    if f.read_to_string(&mut buf).is_ok() {
+                        offset = len;
+                        pending.push_str(&buf);
+                        while let Some(nl) = pending.find('\n') {
+                            let line: String = pending.drain(..=nl).collect();
+                            let line = line.trim_end();
+                            if line.is_empty() { continue; }
+                            let mut runs = stc.runs.lock().await;
+                            if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
+                                let parsed = parse_progress(line, r);
+                                if parsed {
+                                    board::ingest(&r.workspace_dir, r.step, r.epoch, r.loss, r.grad_norm, r.s_per_step, r.total_steps);
+                                }
+                                let ev = if parsed {
+                                    json!({"type": "progress", "run": &*r}).to_string()
+                                } else {
+                                    json!({"type": "log", "run_id": id, "line": line}).to_string()
+                                };
+                                let _ = stc.events.send(ev);
+                            }
+                        }
+                    }
                 }
-                let ev = if parsed {
-                    json!({"type": "progress", "run": &*r}).to_string()
-                } else {
-                    json!({"type": "log", "run_id": id, "line": line}).to_string()
-                };
-                let _ = stc.events.send(ev);
             }
-        }
-        // child stdout closed -> reap
-        let status = {
-            let mut ch = stc.child.lock().await;
-            let s = match ch.as_mut() {
-                Some(c) => c.wait().await.ok(),
-                None => None,
+            // child exited AND log drained -> finalize
+            let exited = {
+                let mut ch = stc.child.lock().await;
+                match ch.as_mut() {
+                    Some(c) => match c.try_wait() {
+                        Ok(Some(status)) => {
+                            *ch = None;
+                            Some(status.success())
+                        }
+                        _ => None,
+                    },
+                    None => Some(false), // stopped externally
+                }
             };
-            *ch = None;
-            s
-        };
-        let mut runs = stc.runs.lock().await;
-        if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
-            if r.status == "running" {
-                r.status = match status {
-                    Some(s) if s.success() => "exited".into(),
-                    _ => "failed".into(),
-                };
+            if let Some(success) = exited {
+                // one final drain pass for the tail of the log
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                if let Ok(mut f) = std::fs::File::open(&log_path) {
+                    use std::io::{Read, Seek, SeekFrom};
+                    let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                    if len > offset {
+                        let _ = f.seek(SeekFrom::Start(offset));
+                        let mut buf = String::new();
+                        let _ = f.read_to_string(&mut buf);
+                        for line in buf.lines().filter(|l| !l.trim().is_empty()) {
+                            let mut runs = stc.runs.lock().await;
+                            if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
+                                if parse_progress(line, r) {
+                                    board::ingest(&r.workspace_dir, r.step, r.epoch, r.loss, r.grad_norm, r.s_per_step, r.total_steps);
+                                }
+                                let _ = stc.events.send(json!({"type": "log", "run_id": id, "line": line}).to_string());
+                            }
+                        }
+                    }
+                }
+                let mut runs = stc.runs.lock().await;
+                if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
+                    if r.status == "running" {
+                        r.status = if success { "exited".into() } else { "failed".into() };
+                    }
+                    append_history(r);
+                    board::run_ended(&r.workspace_dir, &r.status);
+                    let _ = stc.events.send(json!({"type": "status", "run": &*r}).to_string());
+                }
+                break;
             }
-            append_history(r);
-            board::run_ended(&r.workspace_dir, &r.status);
-            let _ = stc.events.send(json!({"type": "status", "run": &*r}).to_string());
+            tokio::time::sleep(Duration::from_millis(400)).await;
         }
     });
     (StatusCode::OK, Json(json!({"run_id": id, "workspace": workspace, "log": info.log_path, "tail": format!("tail -f {}", info.log_path)})))
