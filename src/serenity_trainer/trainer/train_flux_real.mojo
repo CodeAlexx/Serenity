@@ -64,6 +64,8 @@ from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin
 from std.time import perf_counter_ns
 from std.os import listdir
+from std.ffi import external_call
+from std.memory import alloc, UnsafePointer
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -77,6 +79,7 @@ from serenitymojo.models.flux.flux_stack_lora import (
     build_flux_stack_lora_set, empty_flux_stack_lora_set, total_stack_adapters,
     flux_stack_lora_forward_offload, flux_stack_lora_backward_offload,
     flux_stack_lora_forward_offload_full, flux_stack_lora_backward_offload_full,
+    flux_stack_lora_forward_device_offload_full, flux_stack_lora_backward_device_offload_full,
     flux_stack_lora_forward_offload_full_b2, flux_stack_lora_backward_offload_full_b2,
     build_flux_direct_dora_set_from_offload, build_flux_direct_oft_set_for_stack,
     flux_stack_direct_dora_forward_offload, flux_stack_direct_dora_backward_offload,
@@ -477,6 +480,26 @@ def _list_cache(dir: String) raises -> List[String]:
             fs[j] = tmp
             j -= 1
     return fs^
+
+
+comptime _EnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
+
+
+def _env_is_set(name: String) -> Bool:
+    # FLUX_HOST_STACK=1 selects the proven HOST stack (parity oracle); unset/other
+    # = the DEVICE-resident recompute stack (default, ~orders faster + fits fp8).
+    var n = name.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = name.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cname = _EnvPtr(unsafe_from_address=Int(buf))
+    var ret = external_call["getenv", _EnvPtr](cname)
+    buf.free()
+    if Int(ret) == 0:
+        return False
+    return ret[0] == UInt8(49) and ret[1] == UInt8(0)
 
 
 def _cache_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
@@ -1259,25 +1282,53 @@ def main() raises:
         else:
             # _full path applies BOTH block-projection LoRA (`lora`) and stack-level
             # LoRA (`stack_lora`) — the complete OneTrainer default surface.
-            var fwd = flux_stack_lora_forward_offload_full[H, Dh, N_IMG, N_TXT, S](
-                noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
-                base, loader, lora, stack_lora, cos.copy(), sin.copy(),
-                D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
-            )
-            var nout = len(fwd.out)
-            var d_loss = List[Float32]()
-            var sse = 0.0
-            var inv_n = Float32(2.0) / Float32(nout)
-            for i in range(nout):
-                var diff = fwd.out[i] - target[i]
-                sse += Float64(diff) * Float64(diff)
-                d_loss.append(inv_n * diff)
-            loss = Float32(sse / Float64(nout))
-            grads = flux_stack_lora_backward_offload_full[H, Dh, N_IMG, N_TXT, S](
-                d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
-                stack_lora, clip_pool.copy(), cos.copy(), sin.copy(), fwd,
-                D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
-            )
+            # DEFAULT = device-resident recompute stack (activations stay on-GPU,
+            # recompute-in-backward): the forward keeps only per-block INPUT
+            # snapshots (not the ~10 GiB host offload activation tape that OOMed
+            # the fp8 arm), so with fp8-resident blocks it FITS 24 GiB, and it is
+            # BIT-IDENTICAL to the host arm (gated by flux_stack_device_parity +
+            # flux_block_device_parity). FLUX_HOST_STACK=1 selects the proven host
+            # stack (the streamed parity oracle) unchanged.
+            if not _env_is_set(String("FLUX_HOST_STACK")):
+                var fwd = flux_stack_lora_forward_device_offload_full[H, Dh, N_IMG, N_TXT, S](
+                    noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
+                    base, loader, lora, stack_lora, cos.copy(), sin.copy(),
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+                )
+                var nout = len(fwd.out)
+                var d_loss = List[Float32]()
+                var sse = 0.0
+                var inv_n = Float32(2.0) / Float32(nout)
+                for i in range(nout):
+                    var diff = fwd.out[i] - target[i]
+                    sse += Float64(diff) * Float64(diff)
+                    d_loss.append(inv_n * diff)
+                loss = Float32(sse / Float64(nout))
+                grads = flux_stack_lora_backward_device_offload_full[H, Dh, N_IMG, N_TXT, S](
+                    d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
+                    stack_lora, clip_pool.copy(), cos.copy(), sin.copy(), fwd,
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
+                )
+            else:
+                var fwd = flux_stack_lora_forward_offload_full[H, Dh, N_IMG, N_TXT, S](
+                    noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
+                    base, loader, lora, stack_lora, cos.copy(), sin.copy(),
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+                )
+                var nout = len(fwd.out)
+                var d_loss = List[Float32]()
+                var sse = 0.0
+                var inv_n = Float32(2.0) / Float32(nout)
+                for i in range(nout):
+                    var diff = fwd.out[i] - target[i]
+                    sse += Float64(diff) * Float64(diff)
+                    d_loss.append(inv_n * diff)
+                loss = Float32(sse / Float64(nout))
+                grads = flux_stack_lora_backward_offload_full[H, Dh, N_IMG, N_TXT, S](
+                    d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
+                    stack_lora, clip_pool.copy(), cos.copy(), sin.copy(), fwd,
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, MAX_PERIOD, EPS, ctx,
+                )
         if k == 1:
             first_loss = loss
         last_loss = loss
