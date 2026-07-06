@@ -71,11 +71,17 @@ from serenitymojo.models.qwenimage.qwenimage_stack import (
     QwenStackBase, _t as _qstack_t,
 )
 from serenitymojo.models.qwenimage.weights import load_qwen_stack_base, load_qwen_host_bf16
+# DEVICE-RESIDENT stack (MJ-1084): activations stay on GPU across the 60
+# blocks (block gate 28/28 max_abs=0.0). False = the host oracle conductors.
+comptime QWEN_DEVICE_STACK = True
+
 from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
     QwenLoraSet, QwenLoraGradSet, QwenOffloadBase, QwenOffloadForward,
     build_qwen_lora_set, save_qwen_lora, save_qwen_lora_state,
     qwenimage_stack_lora_forward_offload,
     qwenimage_stack_lora_backward_offload,
+    qwenimage_stack_lora_forward_offload_device,
+    qwenimage_stack_lora_backward_offload_device,
     build_qwen_direct_dora_set_from_offload,
     qwenimage_stack_direct_dora_forward_offload,
     qwenimage_stack_direct_dora_backward_offload,
@@ -1285,39 +1291,65 @@ def main() raises:
                       " modules=", nmods, " path=", ckpt_path)
             continue
 
-        # ── forward (offload, full 60-block depth) -> pred [N_IMG, OUT_CH] ──
-        var fwd = qwenimage_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
-            noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
-            base, loader, lora,
-            cos_h.copy(), sin_h.copy(),
-            norm_out_w, norm_out_b,
-            Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
-        )
-
-        # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
-        var nout = len(fwd.out)
-        var d_loss = List[Float32]()
-        var sse = 0.0
-        var inv_n = Float32(2.0) / Float32(nout)
-        for i in range(nout):
-            var diff = fwd.out[i] - target[i]
-            sse += Float64(diff) * Float64(diff)
-            d_loss.append(inv_n * diff)
-        var loss = Float32(sse / Float64(nout))
+        # ── forward + loss + backward (device arm DEFAULT, MJ-1084; host arm
+        # = the byte-untouched oracle, QWEN_DEVICE_STACK=False to re-run it) ──
+        var loss: Float32
+        var grads: QwenLoraGradSet
+        comptime if QWEN_DEVICE_STACK:
+            var fwd = qwenimage_stack_lora_forward_offload_device[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                base, loader, lora,
+                cos_h.copy(), sin_h.copy(),
+                norm_out_w, norm_out_b,
+                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+            )
+            var nout = len(fwd.out)
+            var d_loss = List[Float32]()
+            var sse = 0.0
+            var inv_n = Float32(2.0) / Float32(nout)
+            for i in range(nout):
+                var diff = fwd.out[i] - target[i]
+                sse += Float64(diff) * Float64(diff)
+                d_loss.append(inv_n * diff)
+            loss = Float32(sse / Float64(nout))
+            grads = qwenimage_stack_lora_backward_offload_device[H, Dh, N_IMG, N_TXT, S](
+                d_loss,
+                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                base, loader, lora,
+                cos_h.copy(), sin_h.copy(),
+                norm_out_w, norm_out_b,
+                fwd,
+                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+            )
+        else:
+            var fwd = qwenimage_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                base, loader, lora,
+                cos_h.copy(), sin_h.copy(),
+                norm_out_w, norm_out_b,
+                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+            )
+            var nout = len(fwd.out)
+            var d_loss = List[Float32]()
+            var sse = 0.0
+            var inv_n = Float32(2.0) / Float32(nout)
+            for i in range(nout):
+                var diff = fwd.out[i] - target[i]
+                sse += Float64(diff) * Float64(diff)
+                d_loss.append(inv_n * diff)
+            loss = Float32(sse / Float64(nout))
+            grads = qwenimage_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss,
+                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                base, loader, lora,
+                cos_h.copy(), sin_h.copy(),
+                norm_out_w, norm_out_b,
+                fwd,
+                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+            )
         if k == 1:
             first_loss = loss
         last_loss = loss
-
-        # ── backward (offload, full 60-block depth) ──
-        var grads = qwenimage_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
-            d_loss,
-            noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
-            base, loader, lora,
-            cos_h.copy(), sin_h.copy(),
-            norm_out_w, norm_out_b,
-            fwd,
-            Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
-        )
 
         # ── gradient accumulation (item 2h; default-off when N==1) ────────────
         # SUM this micro-step's grads into the window; on the boundary MEAN (÷N)
