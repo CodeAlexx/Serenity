@@ -194,7 +194,7 @@ comptime KLEIN_V2_GRAPH_PATH = KLEIN_V2_ENGINE and KLEIN_V2_GRAPH
 # (step-1 0.7737 vs 0.7740) but the batched BACKWARD is slower (43.3 vs 37.6
 # s/12) -> 5.34 vs 4.96 s/pair total. Default stays on the interleaved oracle
 # until the backward attribution (flash-bwd-vs-math at B=2, nsys) lands.
-comptime KLEIN_B2_ROWSTACK = False
+comptime KLEIN_B2_ROWSTACK = True
 
 from serenitymojo.training.lora_adamw_ot_fused import (
     LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
