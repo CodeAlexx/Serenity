@@ -1030,7 +1030,26 @@ function routeHash() {
 window.addEventListener("hashchange", routeHash);
 
 initThemes();
-loadPresets().then(async () => { await persistLoad(); $("g_runname").value = $("runname_top").value; routeHash(); })
+async function reattachRun() {
+  // Re-attach to an already-running trainer after a reload/new tab —
+  // without this, the rail shows IDLE while training is live ("looks dead").
+  try {
+    const j = await (await fetch("/api/runs")).json();
+    const live = j.runs.find(r => r.status === "running");
+    if (!live) return;
+    RUN = live.id;
+    $("statuspill").textContent = "RUNNING"; $("statuspill").style.color = "var(--ok)";
+    $("s_status").textContent = "Training (re-attached)";
+    $("stopbtn").style.display = "inline-block";
+    $("msg").textContent = "▶ re-attached: tail -f " + live.log_path;
+    $("s_step").textContent = `${live.step} / ${live.total_steps}`;
+    $("s_loss").textContent = (live.loss || 0).toFixed(4);
+    $("s_speed").textContent = (live.s_per_step || 0).toFixed(1) + " s/step";
+    $("barfill").style.width = (100 * live.step / Math.max(1, live.total_steps)) + "%";
+    refreshGallery();
+  } catch (e) {}
+}
+loadPresets().then(async () => { await persistLoad(); $("g_runname").value = $("runname_top").value; await reattachRun(); routeHash(); })
              .catch(e => { $("valid").textContent = "PRESETS FAIL: " + (e.message || e); });
 connectSSE(); pollSystem(); setInterval(pollSystem, 5000);
 </script>
