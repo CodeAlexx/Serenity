@@ -1001,6 +1001,8 @@ function connectSSE() {
       $("s_speed").textContent = r.s_per_step.toFixed(1) + " s/step";
       $("s_eta").textContent = r.eta || "—";
       $("barfill").style.width = (100 * r.step / Math.max(1, r.total_steps)) + "%";
+      // echo the step into the log pane too — terminal parity ("did NOT show steps" report)
+      logline(`[step ${r.step}/${r.total_steps}] loss ${r.loss.toFixed(4)} | grad ${r.grad_norm.toFixed(4)} | ${r.s_per_step.toFixed(1)}s/step | ETA ${r.eta || "-"}`);
     } else if (m.type === "log" && m.run_id === RUN) {
       logline(m.line);
       if (m.line.includes(".png")) refreshGallery();
