@@ -477,7 +477,7 @@
         </div></div>
         <div class="sub" style="margin-top:6px">Resume states: every save writes <code>&lt;ckpt&gt;.state</code> — full resume via the Resume tab.</div>
       </div>
-<div class="panel"><h3>BACKUP CADENCE <span class="nwtag">[census — saves are Training→Save every]</span></h3><div class="sub">Mojo Backup tab fields (UI_MAP §3)</div><div class="grid2"><div><div class="row"><label>Backup after <span class="nwtag">[not wired]</span></label><input id="backup_after" type="number" class="nw" value="500"></div><div class="row"><label>Rolling backup <span class="nwtag">[not wired]</span></label><input id="rolling_backup" type="checkbox" class="nw"></div><div class="row"><label>Rolling count <span class="nwtag">[not wired]</span></label><input id="rolling_backup_count" type="number" class="nw" value="5"></div></div><div><div class="row"><label>Backup before save <span class="nwtag">[not wired]</span></label><input id="backup_before_save" type="checkbox" class="nw"></div><div class="row"><label>Save skip first <span class="nwtag">[not wired]</span></label><input id="save_skip_first" type="number" class="nw" value="0"></div><div class="row"><label>Save max keep <span class="nwtag">[not wired]</span></label><input id="save_max_keep" type="number" class="nw" value="4"></div></div></div></div>
+<div class="panel"><h3>BACKUP CADENCE <span class="nwtag">[census — saves are Training→Save every]</span></h3><div class="sub">Mojo Backup tab fields (UI_MAP §3)</div><div class="grid2"><div><div class="row"><label>Backup after <span class="nwtag">[not wired]</span></label><input id="backup_after" type="number" class="nw" value="500"></div><div class="row"><label>Rolling backup <span class="nwtag">[not wired]</span></label><input id="rolling_backup" type="checkbox" class="nw"></div><div class="row"><label>Rolling count <span class="nwtag">[not wired]</span></label><input id="rolling_backup_count" type="number" class="nw" value="5"></div></div><div><div class="row"><label>Backup before save <span class="nwtag">[not wired]</span></label><input id="backup_before_save" type="checkbox" class="nw"></div><div class="row"><label>Save skip first <span class="nwtag">[not wired]</span></label><input id="save_skip_first" type="number" class="nw" value="0"></div><div class="row"><label>Save max keep <span class="wtag">wired</span></label><input id="save_max_keep" type="number" value="4"></div></div></div></div>
       <div class="panel"><h3>PRESET SNAPSHOT</h3><div class="sub">The EXACT config + argv the server will launch — a live dry-run, stronger than the Mojo static panel</div>
         <button class="btnp" onclick="dryRun()">Preview launch (dry run)</button>
         <pre id="dry_out" style="background:#0b0e12;border:1px solid var(--line);border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;margin-top:10px"></pre>
@@ -596,7 +596,7 @@ const EXTRA_FIELDS = ["network_algorithm","caption_dropout","batch_size","gradie
                       "optimizer_warmup_steps","validation_prompts_file","vae_override",
                       // config-passthrough additions (trainers that read these keys use them)
                       "lora_dropout","oft_block_size","oft_coft","resolution","frames",
-                      "text_encoder_sequence_length"];
+                      "text_encoder_sequence_length","save_max_keep"];
 
 // nav
 document.querySelectorAll("nav a[data-sec]").forEach(a => a.onclick = () => {
