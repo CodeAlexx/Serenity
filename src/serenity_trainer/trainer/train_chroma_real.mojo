@@ -108,6 +108,10 @@ from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.lora_ema import (
+    LoraEmaState, lora_ema_track, ema_update,
+    lora_ema_adapters, ema_path_for_lora,
+)
 from serenitymojo.training.sample_prompt_config import (
     SampleCadence, read_sample_cadence_config,
     validate_step_sample_cadence, should_sample_completed_step,
@@ -453,6 +457,24 @@ def _load_chroma_cache_tensor(st: SafeTensors, name: String, ctx: DeviceContext)
     var bytes = st.tensor_bytes(name)
     var tv = from_parts(info.dtype, info.shape.copy(), bytes)
     return Tensor.from_view(tv, ctx)
+
+
+# T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a plain-LoRA
+# checkpoint (SimpleTuner copy_to analog — lora_ema.mojo lora_ema_adapters
+# returns bf16-rounded shadows; keep the live set's shapes/scale/prefix). Only
+# reached when cfg.ema_enabled; flag-off leaves this uncalled (baseline bytes
+# unchanged).
+def _save_chroma_lora_ema(
+    ema: LoraEmaState, lora: FluxLoraSet, lora_path: String,
+    n_adapters: Int, ctx: DeviceContext
+) raises:
+    var ema_set = lora.copy()
+    var shadow_ads = lora_ema_adapters(ema, lora.ad, 0, n_adapters, 0)
+    for i in range(len(shadow_ads)):
+        ema_set.ad[i] = shadow_ads[i].copy()
+    var ema_path = ema_path_for_lora(lora_path)
+    _ = save_chroma_lora(ema_set, ema_path, ctx)
+    print("[Chroma-lora] save_ema path=", ema_path)
 
 
 def _host_f32_for_step_math(t: Tensor, ctx: DeviceContext) raises -> List[Float32]:
@@ -953,6 +975,24 @@ def main() raises:
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
     var adamw_state_ready = False
 
+    # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
+    # F32 shadows over the plain-LoRA adapters, tracked AFTER build/resume
+    # (shadow init = clone of current a/b). ema_enabled False => no shadows, and
+    # the per-step update + *_ema save below are no-ops (baseline byte-identical).
+    # Plain-LoRA arm only: LyCORIS/DoRA/OFT trains carriers, not lora.ad. ───────
+    var ema = LoraEmaState(
+        train_cfg.ema_decay, train_cfg.ema_min_decay,
+        train_cfg.ema_update_after_step, train_cfg.ema_update_step_interval,
+    )
+    if train_cfg.ema_enabled and not lycoris_active:
+        var ema_base = lora_ema_track(ema, lora.ad, 0, n_adapters)
+        if ema_base != 0:
+            raise Error("train_chroma_real: ema shadow base must be 0")
+        print("[ema] tracking", n_adapters, "adapters decay=", train_cfg.ema_decay,
+              " min_decay=", train_cfg.ema_min_decay,
+              " update_after_step=", train_cfg.ema_update_after_step,
+              " interval=", train_cfg.ema_update_step_interval)
+
     # ── gradient accumulation buffers (OneTrainer micro-batch; default-off == 1) ─
     # Each loop iteration is one MICRO-step. SUM the two AdamW-fed LoRA grad
     # groups (d_a/d_b) across `accum_steps` micro-steps, then MEAN (÷N) and run
@@ -1278,6 +1318,10 @@ def main() raises:
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay,
             )
+            # T1.B: EMA shadow update post-AdamW (plain arm; once per OPTIMIZER
+            # step — this branch runs only at grad-accum boundaries). Off => skip.
+            if train_cfg.ema_enabled:
+                ema_update(ema, lora.ad, optimizer_step)
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -1300,6 +1344,8 @@ def main() raises:
                 _ = save_flux_loha(loha_masters, save_path, ctx)
             else:
                 _ = save_chroma_lora(lora, save_path, ctx)
+                if train_cfg.ema_enabled:  # T1.B EMA sibling next to every save
+                    _save_chroma_lora_ema(ema, lora, save_path, n_adapters, ctx)
                 var state_path = save_path + String(".state.safetensors")
                 _ = save_chroma_lora_state(lora, state_path, ctx)
                 print("[Chroma-lora] save_state step=", k, " path=", state_path)
@@ -1315,6 +1361,8 @@ def main() raises:
                     _ = save_flux_loha(loha_masters, sample_path, ctx)
                 else:
                     _ = save_chroma_lora(lora, sample_path, ctx)
+                    if train_cfg.ema_enabled:  # T1.B EMA sibling
+                        _save_chroma_lora_ema(ema, lora, sample_path, n_adapters, ctx)
                     var sample_state = sample_path + String(".state.safetensors")
                     _ = save_chroma_lora_state(lora, sample_state, ctx)
                     print("[Chroma-lora] save_before_sample step=", k, " path=", sample_state)
@@ -1390,6 +1438,8 @@ def main() raises:
             print("[Chroma-oft] save final modules=", nmods, " path=", lora_out)
         else:
             _ = save_chroma_lora(lora, lora_out, ctx)
+            if train_cfg.ema_enabled:  # T1.B EMA sibling
+                _save_chroma_lora_ema(ema, lora, lora_out, n_adapters, ctx)
             var state_out = lora_out + String(".state.safetensors")
             _ = save_chroma_lora_state(lora, state_out, ctx)
             print("[Chroma-lora] save_state step=", run_steps, " path=", state_out)

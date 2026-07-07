@@ -116,6 +116,10 @@ from serenitymojo.models.dit.anima_contract import (
 
 from serenitymojo.training.schedule import sample_timestep_sigmoid
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.lora_ema import (
+    LoraEmaState, lora_ema_track, ema_update,
+    lora_ema_adapters, ema_path_for_lora,
+)
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
     TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
@@ -331,6 +335,22 @@ def anima_cache_dir_from_train_config(cfg: TrainConfig) -> String:
 
 def anima_output_lora_path_from_train_config(cfg: TrainConfig) -> String:
     return ot_fixed_output_lora_path_from_train_config(cfg, String(LORA_OUT))
+
+
+# T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a plain-LoRA
+# checkpoint (SimpleTuner copy_to analog — lora_ema.mojo lora_ema_adapters
+# returns bf16-rounded shadows over the LIVE set's shapes). Only reached when
+# cfg.ema_enabled on the plain arm; flag-off / LyCORIS leaves this uncalled.
+def _save_anima_lora_ema(
+    ema: LoraEmaState, lora: AnimaLoraSet, lora_path: String, ctx: DeviceContext
+) raises:
+    var ema_set = lora.copy()
+    var shadow_ads = lora_ema_adapters(ema, lora.ad, 0, len(lora.ad), 0)
+    for i in range(len(shadow_ads)):
+        ema_set.ad[i] = shadow_ads[i].copy()
+    var ema_path = ema_path_for_lora(lora_path)
+    _ = save_anima_lora(ema_set, ema_path, ctx)
+    print("[Anima-lora] save_ema path=", ema_path)
 
 
 def anima_state_path_for_lora(lora_path: String) -> String:
@@ -1081,6 +1101,24 @@ def main() raises:
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
     var adamw_state_ready = False
 
+    # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
+    # F32 shadows over the plain-LoRA adapters (lora.ad), tracked AFTER
+    # build/resume. ema_enabled False => no shadows; the per-step update + *_ema
+    # save below are no-ops (baseline byte-identical). Plain-LoRA arm only:
+    # LyCORIS/DoRA/OFT trains carriers, not lora.ad. ──────────────────────────
+    var ema = LoraEmaState(
+        cfg.ema_decay, cfg.ema_min_decay,
+        cfg.ema_update_after_step, cfg.ema_update_step_interval,
+    )
+    if cfg.ema_enabled and not carrier_active:
+        var ema_base = lora_ema_track(ema, lora.ad, 0, len(lora.ad))
+        if ema_base != 0:
+            raise Error("train_anima_real: ema shadow base must be 0")
+        print("[ema] tracking", len(lora.ad), "adapters decay=", cfg.ema_decay,
+              " min_decay=", cfg.ema_min_decay,
+              " update_after_step=", cfg.ema_update_after_step,
+              " interval=", cfg.ema_update_step_interval)
+
     # ── gradient accumulation (OneTrainer; default-off when N==1) ─────────────
     # Each loop iteration is one MICRO-step. SUM the plain-LoRA host grad groups
     # (grads.d_a/d_b) across `accum_steps` micro-steps, MEAN (÷window) on the
@@ -1361,6 +1399,10 @@ def main() raises:
                 adamw_dev_state.value(), lora, grads, optimizer_step, step_lr, ctx,
                 cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
             )
+            # T1.B: EMA shadow update post-AdamW (plain arm; once per OPTIMIZER
+            # step — this branch runs only at grad-accum boundaries). Off => skip.
+            if cfg.ema_enabled:
+                ema_update(ema, lora.ad, optimizer_step)
 
         # diagnostics
         var b_after = Float32(0.0)
@@ -1399,6 +1441,8 @@ def main() raises:
                 _ = save_anima_oft(oft_masters, ckpt_path, ctx)
             else:
                 _ = save_anima_lora(lora, ckpt_path, ctx)
+                if cfg.ema_enabled:  # T1.B EMA sibling next to every save
+                    _save_anima_lora_ema(ema, lora, ckpt_path, ctx)
                 var ckpt_state = anima_state_path_for_lora(ckpt_path)
                 _ = save_anima_lora_state(lora, ckpt_state, ctx)
                 print("[checkpoint] saved step=", completed_step, " state=", ckpt_state)
@@ -1416,6 +1460,8 @@ def main() raises:
                     _ = save_anima_oft(oft_masters, pre_sample_path, ctx)
                 else:
                     _ = save_anima_lora(lora, pre_sample_path, ctx)
+                    if cfg.ema_enabled:  # T1.B EMA sibling
+                        _save_anima_lora_ema(ema, lora, pre_sample_path, ctx)
                     var pre_sample_state = anima_state_path_for_lora(pre_sample_path)
                     _ = save_anima_lora_state(lora, pre_sample_state, ctx)
                     print("[checkpoint] saved before sample step=", completed_step, " state=", pre_sample_state)
@@ -1484,6 +1530,8 @@ def main() raises:
     else:
         var npairs = save_anima_lora(lora, lora_out, ctx)
         print("saved", npairs, "LoRA adapter pairs to", lora_out)
+        if cfg.ema_enabled:  # T1.B EMA sibling
+            _save_anima_lora_ema(ema, lora, lora_out, ctx)
         var nstate = save_anima_lora_state(lora, anima_state_path_for_lora(lora_out), ctx)
         print("saved", nstate, "LoRA adapter state pairs to", anima_state_path_for_lora(lora_out))
 

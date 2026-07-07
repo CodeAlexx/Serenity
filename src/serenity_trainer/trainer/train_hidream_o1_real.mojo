@@ -172,6 +172,15 @@ from serenitymojo.training.lora_adamw_plain_fused import (
     LoraAdamWPlainDeviceState,
     lora_adamw_plain_device_state_init,
     fused_lora_adamw_plain_step_resident,
+    lora_adamw_plain_device_state_sync_params,
+    lora_adamw_plain_device_state_sync_moments,
+)
+from serenitymojo.training.lora_save import (
+    NamedLora as LoraSaveNamed,
+    save_lora_train_state,
+    load_lora_train_state,
+    load_lora_for_resume,
+    lora_train_state_has_moments,
 )
 from serenitymojo.training.lora_ema import (
     LoraEmaState, lora_ema_track, ema_update,
@@ -420,6 +429,55 @@ def _hidream_head_prefixes() raises -> List[String]:
     var out = List[String]()
     for h in range(N_HEADS):
         out.append(_head_save_name(h))
+    return out^
+
+
+# ── FULL-state save / resume (A/B + AdamW moments) — MJ-1088 ──────────────────
+# HiDream's PEFT save (main-loop tail) writes A/B for the 252 block + 5 head
+# adapters as raw safetensors. This adds the moment-carrying `.state` sidecar via
+# the shared training/lora_save.mojo plumbing so a resume does NOT zero AdamW
+# momentum (the MJ-1077 / MJ-1088 warm-restart class). Block/head adapters live in
+# the host mirrors host_ads/head_ads (params synced every resident step); we pull
+# their m/v back on demand for the save and re-seed them on resume — the device
+# adapter views (ZImageLoraAdapterDevice sub-buffers of opt_state.dev_p) are
+# untouched. Scale is 1.0 (the HiDream LoraAdapter build scale).
+def _hidream_resolve_resume_path(path: String) raises -> String:
+    var probe = _hidream_block_prefixes()[0]
+    if lora_train_state_has_moments(path, probe):
+        return path
+    var sib = path + String(".state")
+    if lora_train_state_has_moments(sib, probe):
+        return sib
+    return path
+
+
+def _hidream_warn_warm_resume(path: String):
+    print("")
+    print("  ============================================================")
+    print("  [hidream-resume] !! WARM RESUME — AdamW moments RESTART at zero !!")
+    print("  path:", path)
+    print("  No FULL `.state` (A/B + adam_m/adam_v) was found for this checkpoint.")
+    print("  The optimizer's first/second moments reset to zero, so training does")
+    print("  NOT continue on the same trajectory as an uninterrupted run — the")
+    print("  first resumed steps take large, under-damped AdamW updates.")
+    print("  To FULL-resume, pass the `<ckpt>.safetensors.state` sidecar instead.")
+    print("  ============================================================")
+    print("")
+
+
+def _hidream_load_state_into(
+    prefixes: List[String], is_full: Bool, path: String, ctx: DeviceContext,
+) raises -> List[LoraAdapter]:
+    """Reload adapters for `prefixes` from `path`. is_full => A/B + AdamW moments
+    (byte-continuation); else A/B only (moments zeroed, WARM). Scale = 1.0."""
+    var loaded: List[LoraSaveNamed]
+    if is_full:
+        loaded = load_lora_train_state(prefixes, Float32(1.0), path, ctx)
+    else:
+        loaded = load_lora_for_resume(prefixes, Float32(1.0), path, ctx)
+    var out = List[LoraAdapter]()
+    for ref nl in loaded:
+        out.append(nl.adapter.copy())
     return out^
 
 
@@ -1237,7 +1295,7 @@ def main() raises:
     if len(args) < 3:
         raise Error(
             "usage: train_hidream_o1_real <stage_dir> <steps> [lr] [rank]"
-            " [out_dir] [ema_decay] [config.json] [grad_dump.safetensors]"
+            " [out_dir] [ema_decay] [config.json] [grad_dump.safetensors] [resume_ckpt]"
         )
     var stage_dir = String(args[1])
     # Optional argv[8]: dump the step-1 adapter grads (g_a.<k>/g_b.<k>, F32)
@@ -1246,6 +1304,12 @@ def main() raises:
     var grad_dump = String("")
     if len(args) > 8 and String(args[8]) != "-":
         grad_dump = String(args[8])
+    # Optional argv[9]: resume checkpoint (plain-LoRA arm). Pass the
+    # `<ckpt>.safetensors.state` sidecar (FULL moment resume) or the plain PEFT
+    # `.safetensors` (WARM start — the .state sibling is auto-probed first). MJ-1088.
+    var resume_path = String("")
+    if len(args) > 9 and String(args[9]) != "-":
+        resume_path = String(args[9])
 
     # ── T1 runtime config (optional trailing argv; precedence in header) ─────
     var train_cfg = TrainConfig.default()
@@ -1419,6 +1483,25 @@ def main() raises:
                     a_h^, b_h^, rank, in_f, out_f, Float32(1.0),
                     z1^, z2^, z3^, z4^,
                 ))
+    # ── MJ-1088 resume (plain-LoRA arm): resolve the FULL `.state` path once and
+    # reload the BLOCK moments into host_ads BEFORE the device AdamW init below, so
+    # that init seeds dev_m/dev_v from the restored moments. head_ads is loaded at
+    # its own init point further down (it is built after this block init).
+    var resume_resolved = String("")
+    var resume_is_full = False
+    if resume_path != String("") and not carrier_active and not direct_active:
+        resume_resolved = _hidream_resolve_resume_path(resume_path)
+        resume_is_full = lora_train_state_has_moments(
+            resume_resolved, _hidream_block_prefixes()[0]
+        )
+        if resume_is_full:
+            print("[hidream-resume] FULL resume (A/B + AdamW moments) from", resume_resolved)
+        else:
+            _hidream_warn_warm_resume(resume_resolved)
+        host_ads = _hidream_load_state_into(
+            _hidream_block_prefixes(), resume_is_full, resume_resolved, ctx
+        )
+
     var dummy_block_ads = _dummy_lora_adapters()
     var opt_state = lora_adamw_plain_device_state_init(
         dummy_block_ads, 0, len(dummy_block_ads), ctx,
@@ -1469,6 +1552,15 @@ def main() raises:
                 a_h^, b_h^, rank, in_f, out_f, Float32(1.0),
                 hz1^, hz2^, hz3^, hz4^,
             ))
+    # ── MJ-1088 resume (plain-LoRA arm): reload the HEAD moments into head_ads
+    # BEFORE the head device AdamW init below (same resolved `.state` as the block
+    # load above). resume_resolved/resume_is_full were computed at the block point.
+    if resume_path != String("") and not carrier_active and not direct_active:
+        head_ads = _hidream_load_state_into(
+            _hidream_head_prefixes(), resume_is_full, resume_resolved, ctx
+        )
+        print("[hidream-resume] reloaded", len(host_ads) + len(head_ads), "adapters")
+
     var dummy_head_ads = _dummy_lora_adapters()
     var head_opt = lora_adamw_plain_device_state_init(
         dummy_head_ads, 0, len(dummy_head_ads), ctx,
@@ -2745,6 +2837,27 @@ def main() raises:
             head_ads[h].b.copy(), [hd[1], rank], ctx)))
     save_safetensors(all_names, all_tensors, out_path, ctx)
     print("[save] ", out_path, " (", len(all_names) // 2, " adapters)")
+    # MJ-1088: also write the moment-carrying `.state` sidecar (block 252 + head 5)
+    # so a resume does NOT zero AdamW momentum. Pull the resident device m/v back to
+    # the host mirrors first (the resident step syncs params each step, not moments);
+    # the ZImageLoraAdapterDevice views (sub-buffers of dev_p) are untouched.
+    lora_adamw_plain_device_state_sync_params(opt_state, host_ads, ctx)
+    lora_adamw_plain_device_state_sync_moments(opt_state, host_ads, ctx)
+    lora_adamw_plain_device_state_sync_params(head_opt, head_ads, ctx)
+    lora_adamw_plain_device_state_sync_moments(head_opt, head_ads, ctx)
+    var state_named = List[LoraSaveNamed]()
+    var block_pfx = _hidream_block_prefixes()
+    for i in range(len(host_ads)):
+        state_named.append(LoraSaveNamed(block_pfx[i], host_ads[i].copy()))
+    var head_pfx = _hidream_head_prefixes()
+    for h in range(len(head_ads)):
+        state_named.append(LoraSaveNamed(head_pfx[h], head_ads[h].copy()))
+    var state_meta = List[Float32]()
+    state_meta.append(Float32(steps))
+    state_meta.append(Float32(Int(train_cfg.seed)))
+    var state_out = out_path + String(".state")
+    _ = save_lora_train_state(state_named, state_out, ctx, state_meta^)
+    print("[save] ", state_out, " (", len(state_named), " adapters, A/B + AdamW moments)")
     if ema_on:
         # T1.B: EMA sibling — same DiffSynth key shape over the bf16-rounded
         # shadows (lora_ema.mojo copy_to cast, SimpleTuner ema.py:454).

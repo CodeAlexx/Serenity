@@ -56,6 +56,7 @@ from serenitymojo.models.wan22.wan22_stack_lora import (
     Wan22LoraSet, Wan22LoraGradSet, Wan22StackForward,
     build_wan22_lora_set, wan22_lora_adamw_step, save_wan22_lora,
     wan22_lora_adamw_state_init, wan22_lora_adamw_step_resident,
+    save_wan22_lora_state, load_wan22_lora_state, load_wan22_lora_resume,
     wan22_total_adapters, WAN_SLOTS,
     wan22_stack_lora_forward_offload, wan22_stack_lora_backward_offload,
     build_wan22_direct_dora_set_from_offload,
@@ -69,7 +70,12 @@ from serenitymojo.offload.wan22_plan import build_wan22_14b_block_plan
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
-from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState,
+    lora_adamw_plain_device_state_sync_params,
+    lora_adamw_plain_device_state_sync_moments,
+)
+from serenitymojo.training.lora_save import lora_train_state_has_moments
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import (
     TrainConfig,
@@ -383,6 +389,34 @@ def _rope_placeholder(S: Int, half: Int) -> List[Float32]:
     return out^
 
 
+# ── FULL-state resume resolution + loud warm-resume guard (MJ-1088 / MJ-1077) ──
+# Probe the `<ckpt>.state` sidecar so a user who passes the PEFT weights still gets
+# a FULL (moment-preserving) resume; only warm-restart (loud warning) when there is
+# genuinely no moment state. The probe prefix matches _wan22_lora_prefixes[0].
+def _wan22_resolve_resume_path(path: String) raises -> String:
+    var probe = String("blocks.0.self_attn.q")
+    if lora_train_state_has_moments(path, probe):
+        return path
+    var sib = path + String(".state")
+    if lora_train_state_has_moments(sib, probe):
+        return sib
+    return path
+
+
+def _wan22_warn_warm_resume(path: String):
+    print("")
+    print("  ============================================================")
+    print("  [wan22-resume] !! WARM RESUME — AdamW moments RESTART at zero !!")
+    print("  path:", path)
+    print("  No FULL `.state` (A/B + adam_m/adam_v) was found for this checkpoint.")
+    print("  The optimizer's first/second moments reset to zero, so training does")
+    print("  NOT continue on the same trajectory as an uninterrupted run — the")
+    print("  first resumed steps take large, under-damped AdamW updates.")
+    print("  To FULL-resume, pass the `<ckpt>.safetensors.state` sidecar instead.")
+    print("  ============================================================")
+    print("")
+
+
 def main() raises:
     var ctx = DeviceContext()
     var sampled_peak_vram = _record_vram_sample(
@@ -411,6 +445,12 @@ def main() raises:
         for i in range(String(a[arg_base]).byte_length()):
             v = v * 10 + Int(bs[i] - 0x30)
         run_steps = v
+    # Optional argv[arg_base+1]: resume checkpoint (plain-LoRA arm). Pass either the
+    # `<ckpt>.safetensors.state` sidecar (FULL moment resume) or the plain PEFT
+    # `.safetensors` (WARM start — the .state sibling is auto-probed first).
+    var resume_path = String("")
+    if len(a) > arg_base + 1:
+        resume_path = String(a[arg_base + 1])
     var ckpt_path = String(CKPT)
     var cache_dir = String(CACHE_DIR)
     if has_config:
@@ -569,6 +609,27 @@ def main() raises:
     # and can hit the MJ-1070 unmapped-buffer segfault under pinned pressure.
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
     var adamw_state_ready = False
+
+    # ── optional resume (plain-LoRA arm only): reload A/B (+ AdamW moments if a
+    # FULL `.state` exists) BEFORE the loop so the lazy resident-AdamW init
+    # (wan22_lora_adamw_state_init) seeds dev_m/dev_v from the restored moments —
+    # full-moment fidelity (MJ-1088).
+    if resume_path != String("") and not carrier_active and not direct_active:
+        var resolved = _wan22_resolve_resume_path(resume_path)
+        var is_full = lora_train_state_has_moments(
+            resolved, String("blocks.0.self_attn.q")
+        )
+        if is_full:
+            lora = load_wan22_lora_state(
+                NUM_BLOCKS, DIM, train_cfg.lora_rank, train_cfg.lora_alpha, resolved, ctx
+            )
+            print("[wan22-resume] FULL resume (A/B + AdamW moments) from", resolved)
+        else:
+            _wan22_warn_warm_resume(resolved)
+            lora = load_wan22_lora_resume(
+                NUM_BLOCKS, DIM, train_cfg.lora_rank, train_cfg.lora_alpha, resolved, ctx
+            )
+        print("[wan22-resume] reloaded", wan22_total_adapters(lora), "adapters")
 
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
@@ -811,6 +872,22 @@ def main() raises:
             _ = save_wan22_direct_oft(oft_masters, save_path, ctx)
         else:
             _ = save_wan22_lora(lora, save_path, ctx)
+            # MJ-1088: also write the moment-carrying `.state` sidecar so a resume
+            # does NOT zero AdamW momentum. Pull resident device m/v back to host
+            # first (the resident step syncs params each step, not moments).
+            if adamw_state_ready:
+                lora_adamw_plain_device_state_sync_params(
+                    adamw_dev_state.value(), lora.ad, ctx
+                )
+                lora_adamw_plain_device_state_sync_moments(
+                    adamw_dev_state.value(), lora.ad, ctx
+                )
+            var meta = List[Float32]()
+            meta.append(Float32(run_steps))
+            meta.append(Float32(Int(train_cfg.seed)))
+            var state_path = save_path + String(".state")
+            _ = save_wan22_lora_state(lora, state_path, ctx, meta^)
+            print("[wan22-lora] save_state (A/B + AdamW moments) path=", state_path)
         sampled_peak_vram = _record_vram_sample(
             String("after_save"), ctx, sampled_peak_vram,
             WAN22_DIRECT_VRAM_BUDGET_BYTES,

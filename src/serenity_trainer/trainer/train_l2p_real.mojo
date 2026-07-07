@@ -125,6 +125,10 @@ from serenitymojo.models.l2p.local_decoder_train import (
 from serenitymojo.models.dit.zimage_l2p_local_decoder import ZImageL2PLocalDecoderGate
 from serenitymojo.training.klein_dataset import L2PCache
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.lora_ema import (
+    LoraEmaState, lora_ema_track, ema_begin_step, ema_apply,
+    lora_ema_adapters, ema_path_for_lora,
+)
 from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import (
@@ -1125,6 +1129,23 @@ def _train_one_step_l2p_b2(
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
+# T1.B: save the EMA shadow set as the *_ema.safetensors sibling of the plain-LoRA
+# checkpoint. l2p trains only the MAIN adapters [TRAIN_ADAPTER_START, N), so the
+# shadows carry that segment; the NR/CR prefix rows are copied straight from the
+# live set (untrained). SimpleTuner copy_to analog (lora_ema.mojo). Only reached
+# when train_cfg.ema_enabled on the plain arm.
+def _save_l2p_lora_ema(
+    ema: LoraEmaState, lora: ZImageLoraSet, lora_path: String, ctx: DeviceContext
+) raises:
+    var ema_set = lora.copy()
+    var shadow_ads = lora_ema_adapters(ema, lora.ad, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL, 0)
+    for i in range(len(shadow_ads)):
+        ema_set.ad[TRAIN_ADAPTER_START + i] = shadow_ads[i].copy()
+    var ema_path = ema_path_for_lora(lora_path)
+    _ = save_zimage_lora_main_only(ema_set, ema_path, ctx)
+    print("[L2P-lora] save_ema path=", ema_path)
+
+
 def main() raises:
     var ctx = DeviceContext()
     var a = argv()
@@ -1398,6 +1419,25 @@ def main() raises:
     if accum_steps > 1:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
+    # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
+    # F32 shadows over the MAIN plain-LoRA adapters [TRAIN_ADAPTER_START, N),
+    # tracked AFTER resume. ema_enabled False => no shadows; the per-step update
+    # + *_ema save below are no-ops (baseline byte-identical). Plain-LoRA arm
+    # only: LyCORIS/DoRA/OFT trains carriers, not lora.ad. ─────────────────────
+    var ema = LoraEmaState(
+        train_cfg.ema_decay, train_cfg.ema_min_decay,
+        train_cfg.ema_update_after_step, train_cfg.ema_update_step_interval,
+    )
+    if train_cfg.ema_enabled and not carrier_active and not direct_active:
+        var ema_base = lora_ema_track(ema, lora.ad, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
+        if ema_base != 0:
+            raise Error("train_l2p_real: ema shadow base must be 0")
+        print("[ema] tracking", N_ADAPTERS_TOTAL - TRAIN_ADAPTER_START,
+              "main adapters decay=", train_cfg.ema_decay,
+              " min_decay=", train_cfg.ema_min_decay,
+              " update_after_step=", train_cfg.ema_update_after_step,
+              " interval=", train_cfg.ema_update_step_interval)
+
     for k in range(start_step + 1, run_steps + 1):
         var r: L2PStepResult
         if use_b2:
@@ -1433,6 +1473,18 @@ def main() raises:
         if k == start_step + 1:
             first_loss = r.loss
         last_loss = r.loss
+        # T1.B: EMA shadow update post-AdamW. l2p buries the optimizer in the
+        # step helper (which mutates `lora` in place + syncs host mirrors), so
+        # reconstruct the helper's grad-accum boundary here and update the shadow
+        # once per OPTIMIZER step over the MAIN adapters. Off / carrier => skip.
+        if train_cfg.ema_enabled and not carrier_active and not direct_active:
+            var did_opt = True
+            var opt_num = k
+            if (not use_b2) and accum_steps > 1:
+                did_opt = (k % accum_steps == 0) or (k == run_steps)
+                opt_num = ((k - 1) // accum_steps) + 1
+            if did_opt and ema_begin_step(ema, opt_num):
+                ema_apply(ema, lora.ad, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL, 0)
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
@@ -1470,6 +1522,8 @@ def main() raises:
             print("[L2P-oft] saved:", lora_out, " modules=", nmods)
         else:
             _ = save_zimage_lora_main_only(lora, lora_out, ctx)
+            if train_cfg.ema_enabled:  # T1.B EMA sibling
+                _save_l2p_lora_ema(ema, lora, lora_out, ctx)
             var state_out = lora_out + String(".state.safetensors")
             _ = save_zimage_lora_main_only_state(lora, state_out, ctx)
             print("[L2P-lora] saved:", lora_out)

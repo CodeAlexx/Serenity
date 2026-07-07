@@ -129,6 +129,10 @@ from serenitymojo.training.schedule import (
     sample_timestep_discrete_qwen, DiscreteTimestep,
 )
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.lora_ema import (
+    LoraEmaState, lora_ema_track, ema_update,
+    lora_ema_adapters, ema_path_for_lora,
+)
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
     TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
@@ -355,6 +359,22 @@ def qwen_state_path_for_lora(lora_path: String) -> String:
 
 def _step_lora_path(base_path: String, step: Int) -> String:
     return ot_step_lora_path(base_path, step)
+
+
+# T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a plain-LoRA
+# checkpoint (SimpleTuner copy_to analog — lora_ema.mojo lora_ema_adapters
+# returns bf16-rounded shadows over the LIVE set's shapes). Only reached when
+# cfg.ema_enabled; flag-off leaves this uncalled (baseline bytes unchanged).
+def _save_qwen_lora_ema(
+    ema: LoraEmaState, lora: QwenLoraSet, lora_path: String, ctx: DeviceContext
+) raises:
+    var ema_set = lora.copy()
+    var shadow_ads = lora_ema_adapters(ema, lora.dbl, 0, len(lora.dbl), 0)
+    for i in range(len(shadow_ads)):
+        ema_set.dbl[i] = shadow_ads[i].copy()
+    var ema_path = ema_path_for_lora(lora_path)
+    _ = save_qwen_lora(ema_set, ema_path, ctx)
+    print("[QwenImage-lora] save_ema path=", ema_path)
 
 
 def _substr(s: String, start: Int, end: Int) -> String:
@@ -1093,6 +1113,24 @@ def main() raises:
 
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
     var adamw_state_ready = False
+
+    # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
+    # F32 shadows over the plain-LoRA adapters (lora.dbl), tracked AFTER
+    # build/resume. ema_enabled False => no shadows; the per-step update + *_ema
+    # save below are no-ops (baseline byte-identical). Plain-LoRA arm only:
+    # LyCORIS/DoRA/OFT trains carriers, not lora.dbl. ──────────────────────────
+    var ema = LoraEmaState(
+        train_cfg.ema_decay, train_cfg.ema_min_decay,
+        train_cfg.ema_update_after_step, train_cfg.ema_update_step_interval,
+    )
+    if train_cfg.ema_enabled and not lycoris_active:
+        var ema_base = lora_ema_track(ema, lora.dbl, 0, len(lora.dbl))
+        if ema_base != 0:
+            raise Error("train_qwenimage_real: ema shadow base must be 0")
+        print("[ema] tracking", len(lora.dbl), "adapters decay=", train_cfg.ema_decay,
+              " min_decay=", train_cfg.ema_min_decay,
+              " update_after_step=", train_cfg.ema_update_after_step,
+              " interval=", train_cfg.ema_update_step_interval)
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
@@ -1431,6 +1469,10 @@ def main() raises:
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
             )
             print("[qwen-opt-ms]", Float64(perf_counter_ns() - _ot0) / 1.0e6)
+            # T1.B: EMA shadow update post-AdamW (plain arm; once per OPTIMIZER
+            # step — this branch runs only at grad-accum boundaries). Off => skip.
+            if train_cfg.ema_enabled:
+                ema_update(ema, lora.dbl, optimizer_step)
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -1451,6 +1493,8 @@ def main() raises:
                 _ = save_qwen_loha(loha_masters, ckpt_path, ctx)
             else:
                 _ = save_qwen_lora(lora, ckpt_path, ctx)
+                if train_cfg.ema_enabled:  # T1.B EMA sibling next to every save
+                    _save_qwen_lora_ema(ema, lora, ckpt_path, ctx)
                 var ckpt_state = qwen_state_path_for_lora(ckpt_path)
                 _ = save_qwen_lora_state(lora, ckpt_state, ctx)
             saved_this_step = True
@@ -1464,6 +1508,8 @@ def main() raises:
                     _ = save_qwen_loha(loha_masters, pre_sample_path, ctx)
                 else:
                     _ = save_qwen_lora(lora, pre_sample_path, ctx)
+                    if train_cfg.ema_enabled:  # T1.B EMA sibling
+                        _save_qwen_lora_ema(ema, lora, pre_sample_path, ctx)
                     var pre_sample_state = qwen_state_path_for_lora(pre_sample_path)
                     _ = save_qwen_lora_state(lora, pre_sample_state, ctx)
                 print("[checkpoint] saved before sample step=", k, " path=", pre_sample_path)
@@ -1546,6 +1592,8 @@ def main() raises:
             print("[QwenImage-oft] save final modules=", nmods, " path=", output_lora_path)
         else:
             _ = save_qwen_lora(lora, output_lora_path, ctx)
+            if train_cfg.ema_enabled:  # T1.B EMA sibling
+                _save_qwen_lora_ema(ema, lora, output_lora_path, ctx)
             _ = save_qwen_lora_state(lora, qwen_state_path_for_lora(output_lora_path), ctx)
     else:
         print("RESULT: FAIL trains=", trains)

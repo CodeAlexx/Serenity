@@ -118,6 +118,11 @@ from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.train_step import LoraAdapter
+from serenitymojo.training.lora_ema import (
+    LoraEmaState, lora_ema_track, ema_begin_step, ema_apply,
+    lora_ema_adapters, ema_path_for_lora,
+)
 from serenitymojo.training.sample_prompt_config import (
     SampleCadence, read_sample_cadence_config,
     validate_step_sample_cadence, should_sample_completed_step,
@@ -681,6 +686,76 @@ def _flux_run_sample_caps(
     print("[Flux-lora] caps sample step=", step, " prompt=", prompt.label, " -> ", sample_png)
 
 
+# ── T1.B EMA helpers (flux plain arm) ────────────────────────────────────────
+# Flux's plain arm trains TWO adapter groups: the block-projection LoRA
+# (FluxLoraSet.ad, flat) AND the stack-level modulation LoRA (FluxStackLoraSet,
+# scattered Optional slots). EMA must cover BOTH or the *_ema sibling would be a
+# misleading half-average. Flatten the stack's enabled slots in a FIXED order
+# (level -> dbl_img_mod -> dbl_txt_mod -> sgl_mod — the same order
+# total_stack_adapters / save_flux_lora_combined use) so lora_ema.mojo can treat
+# them as a second flat segment (base = n_block); scatter puts the bf16 shadows
+# back into those slots for the combined save.
+def _flux_stack_collect(sset: FluxStackLoraSet) raises -> List[LoraAdapter]:
+    var out = List[LoraAdapter]()
+    if not sset.enabled:
+        return out^
+    for i in range(len(sset.level)):
+        if sset.level[i]:
+            out.append(sset.level[i].value().copy())
+    for i in range(len(sset.dbl_img_mod)):
+        if sset.dbl_img_mod[i]:
+            out.append(sset.dbl_img_mod[i].value().copy())
+    for i in range(len(sset.dbl_txt_mod)):
+        if sset.dbl_txt_mod[i]:
+            out.append(sset.dbl_txt_mod[i].value().copy())
+    for i in range(len(sset.sgl_mod)):
+        if sset.sgl_mod[i]:
+            out.append(sset.sgl_mod[i].value().copy())
+    return out^
+
+
+def _flux_stack_scatter(
+    sset: FluxStackLoraSet, shadow_ads: List[LoraAdapter]
+) raises -> FluxStackLoraSet:
+    var out = sset.copy()
+    var idx = 0
+    for i in range(len(out.level)):
+        if out.level[i]:
+            out.level[i] = Optional[LoraAdapter](shadow_ads[idx].copy())
+            idx += 1
+    for i in range(len(out.dbl_img_mod)):
+        if out.dbl_img_mod[i]:
+            out.dbl_img_mod[i] = Optional[LoraAdapter](shadow_ads[idx].copy())
+            idx += 1
+    for i in range(len(out.dbl_txt_mod)):
+        if out.dbl_txt_mod[i]:
+            out.dbl_txt_mod[i] = Optional[LoraAdapter](shadow_ads[idx].copy())
+            idx += 1
+    for i in range(len(out.sgl_mod)):
+        if out.sgl_mod[i]:
+            out.sgl_mod[i] = Optional[LoraAdapter](shadow_ads[idx].copy())
+            idx += 1
+    return out^
+
+
+def _save_flux_lora_ema(
+    ema: LoraEmaState, lora: FluxLoraSet, stack_lora: FluxStackLoraSet,
+    n_adapters: Int, lora_path: String, ctx: DeviceContext
+) raises:
+    var ema_lora = lora.copy()
+    var shadow_block = lora_ema_adapters(ema, lora.ad, 0, n_adapters, 0)
+    for i in range(len(shadow_block)):
+        ema_lora.ad[i] = shadow_block[i].copy()
+    var ema_stack = stack_lora.copy()
+    if stack_lora.enabled:
+        var stack_ads = _flux_stack_collect(stack_lora)
+        var shadow_stack = lora_ema_adapters(ema, stack_ads, 0, len(stack_ads), n_adapters)
+        ema_stack = _flux_stack_scatter(stack_lora, shadow_stack)
+    var ema_path = ema_path_for_lora(lora_path)
+    _ = save_flux_lora_combined(ema_lora, ema_stack, ema_path, ctx)
+    print("[Flux-lora] save_ema path=", ema_path)
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -1032,6 +1107,32 @@ def main() raises:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
     var train_start = perf_counter_ns()
+    # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
+    # TWO segments: block-projection LoRA (lora.ad @ base 0) + stack modulation
+    # LoRA (flattened @ base n_adapters). Tracked AFTER build/resume. ema_enabled
+    # False => no shadows; per-step update + *_ema save are no-ops (byte-ident).
+    # Plain-LoRA arm only. ─────────────────────────────────────────────────────
+    var ema = LoraEmaState(
+        train_cfg.ema_decay, train_cfg.ema_min_decay,
+        train_cfg.ema_update_after_step, train_cfg.ema_update_step_interval,
+    )
+    var n_stack_ema = 0
+    if train_cfg.ema_enabled and not lycoris_active:
+        var ema_b0 = lora_ema_track(ema, lora.ad, 0, n_adapters)
+        if ema_b0 != 0:
+            raise Error("train_flux_real: ema block shadow base must be 0")
+        if stack_lora.enabled:
+            var stack_ads0 = _flux_stack_collect(stack_lora)
+            n_stack_ema = len(stack_ads0)
+            var ema_b1 = lora_ema_track(ema, stack_ads0, 0, n_stack_ema)
+            if ema_b1 != n_adapters:
+                raise Error("train_flux_real: ema stack shadow base must equal n_adapters")
+        print("[ema] tracking", n_adapters, "block +", n_stack_ema,
+              "stack adapters decay=", train_cfg.ema_decay,
+              " min_decay=", train_cfg.ema_min_decay,
+              " update_after_step=", train_cfg.ema_update_after_step,
+              " interval=", train_cfg.ema_update_step_interval)
+
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
 
@@ -1421,6 +1522,15 @@ def main() raises:
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay,
             )
+            # T1.B: two-segment EMA update post-AdamW (block lora.ad @ base 0 +
+            # stack modulation @ base n_adapters). Once per OPTIMIZER step — this
+            # branch runs only at grad-accum boundaries. Off => skip.
+            if train_cfg.ema_enabled:
+                if ema_begin_step(ema, optimizer_step):
+                    ema_apply(ema, lora.ad, 0, n_adapters, 0)
+                    if stack_lora.enabled:
+                        var sc = _flux_stack_collect(stack_lora)
+                        ema_apply(ema, sc, 0, len(sc), n_adapters)
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -1450,6 +1560,8 @@ def main() raises:
                 _ = save_flux_loha(loha_masters, save_path, ctx)
             else:
                 _ = save_flux_lora_combined(lora, stack_lora, save_path, ctx)
+                if train_cfg.ema_enabled:  # T1.B EMA sibling next to every save
+                    _save_flux_lora_ema(ema, lora, stack_lora, n_adapters, save_path, ctx)
                 var state_path = save_path + String(".state.safetensors")
                 _ = save_flux_lora_state_combined(lora, stack_lora, state_path, ctx)
                 print("[Flux-lora] save_state step=", k, " path=", state_path)
@@ -1465,6 +1577,8 @@ def main() raises:
                     _ = save_flux_loha(loha_masters, sample_path, ctx)
                 else:
                     _ = save_flux_lora_combined(lora, stack_lora, sample_path, ctx)
+                    if train_cfg.ema_enabled:  # T1.B EMA sibling
+                        _save_flux_lora_ema(ema, lora, stack_lora, n_adapters, sample_path, ctx)
                     var sample_state = sample_path + String(".state.safetensors")
                     _ = save_flux_lora_state_combined(lora, stack_lora, sample_state, ctx)
                     print("[Flux-lora] save_before_sample step=", k, " path=", sample_state)
@@ -1572,6 +1686,8 @@ def main() raises:
             print("[Flux-oft] save final modules=", nmods, " path=", lora_out)
         else:
             _ = save_flux_lora_combined(lora, stack_lora, lora_out, ctx)
+            if train_cfg.ema_enabled:  # T1.B EMA sibling
+                _save_flux_lora_ema(ema, lora, stack_lora, n_adapters, lora_out, ctx)
             var state_out = lora_out + String(".state.safetensors")
             _ = save_flux_lora_state_combined(lora, stack_lora, state_out, ctx)
             print("[Flux-lora] save_state step=", run_steps, " path=", state_out)

@@ -155,6 +155,10 @@ from serenitymojo.training.lora_adamw_plain_fused import (
     fused_lora_adamw_plain_step, LoraAdamWPlainDeviceState,
 )
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.lora_ema import (
+    LoraEmaState, lora_ema_track, ema_update,
+    lora_ema_adapters, ema_path_for_lora,
+)
 from serenitymojo.training.grad_accum import (
     accumulate_grad_group, scale_grad_group, zeros_like_group,
 )
@@ -684,6 +688,22 @@ def _save_lora_and_state(
     print("[Ernie-lora] save_state step=", step, " path=", state_path, " pairs=", nstate)
 
 
+# T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a plain-LoRA
+# checkpoint (SimpleTuner copy_to analog — lora_ema.mojo lora_ema_adapters
+# returns bf16-rounded shadows over the LIVE set's shapes). Only reached when
+# cfg.ema_enabled on the plain arm; flag-off / LyCORIS leaves this uncalled.
+def _save_ernie_lora_ema(
+    ema: LoraEmaState, lora: ErnieLoraSet, lora_path: String, ctx: DeviceContext
+) raises:
+    var ema_set = lora.copy()
+    var shadow_ads = lora_ema_adapters(ema, lora.ad, 0, len(lora.ad), 0)
+    for i in range(len(shadow_ads)):
+        ema_set.ad[i] = shadow_ads[i].copy()
+    var ema_path = ema_path_for_lora(lora_path)
+    _ = save_ernie_lora(ema_set, ema_path, ctx)
+    print("[Ernie-lora] save_ema path=", ema_path)
+
+
 def _require_ernie_carrier_runtime_vram(
     label: String, carrier_bytes: Int, free_after_blocks: UInt,
 ) raises:
@@ -1071,6 +1091,24 @@ def main() raises:
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
     var adamw_state_ready = False
 
+    # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
+    # F32 shadows over the plain-LoRA adapters (lora.ad), tracked AFTER
+    # build/resume. ema_enabled False => no shadows; the per-step update + *_ema
+    # save below are no-ops (baseline byte-identical). Plain-LoRA arm only:
+    # LyCORIS/DoRA/OFT trains carriers, not lora.ad. ──────────────────────────
+    var ema = LoraEmaState(
+        train_cfg.ema_decay, train_cfg.ema_min_decay,
+        train_cfg.ema_update_after_step, train_cfg.ema_update_step_interval,
+    )
+    if train_cfg.ema_enabled and not direct_active and not carrier_active:
+        var ema_base = lora_ema_track(ema, lora.ad, 0, len(lora.ad))
+        if ema_base != 0:
+            raise Error("train_ernie_real: ema shadow base must be 0")
+        print("[ema] tracking", len(lora.ad), "adapters decay=", train_cfg.ema_decay,
+              " min_decay=", train_cfg.ema_min_decay,
+              " update_after_step=", train_cfg.ema_update_after_step,
+              " interval=", train_cfg.ema_update_step_interval)
+
     for step in range(run_steps):
         var step_t0 = perf_counter()
         # TRUE batch-2: each optimizer step consumes a NON-OVERLAPPING pair
@@ -1380,6 +1418,10 @@ def main() raises:
                         lora, grads, optimizer_step, step_lr, ctx,
                         train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
                     )
+                # T1.B: EMA shadow update post-AdamW (plain arm; once per
+                # OPTIMIZER step — this block runs only at grad-accum boundaries).
+                if train_cfg.ema_enabled:
+                    ema_update(ema, lora.ad, optimizer_step)
 
         var now = perf_counter()
         var step_secs = now - step_t0
@@ -1405,6 +1447,8 @@ def main() raises:
                 lokr_active, loha_active, dora_active, oft_active,
                 smoke_lora, done_step, ctx,
             )
+            if train_cfg.ema_enabled and not direct_active and not carrier_active:
+                _save_ernie_lora_ema(ema, lora, smoke_lora, ctx)  # T1.B EMA sibling
             saved_this_step = True
             saved_lora_path = smoke_lora.copy()
             if sample_enabled:
@@ -1422,6 +1466,8 @@ def main() raises:
                 lokr_active, loha_active, dora_active, oft_active,
                 save_cadence_lora, done_step, ctx,
             )
+            if train_cfg.ema_enabled and not direct_active and not carrier_active:
+                _save_ernie_lora_ema(ema, lora, save_cadence_lora, ctx)  # T1.B EMA sibling
             saved_this_step = True
             saved_lora_path = save_cadence_lora.copy()
 
@@ -1434,6 +1480,8 @@ def main() raises:
                     lokr_active, loha_active, dora_active, oft_active,
                     cadence_lora, done_step, ctx,
                 )
+                if train_cfg.ema_enabled and not direct_active and not carrier_active:
+                    _save_ernie_lora_ema(ema, lora, cadence_lora, ctx)  # T1.B EMA sibling
                 saved_lora_path = cadence_lora.copy()
             _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, done_step, ctx)
             last_sample_step = done_step
@@ -1476,5 +1524,7 @@ def main() raises:
         lokr_active, loha_active, dora_active, oft_active,
         save_path, run_steps, ctx,
     )
+    if train_cfg.ema_enabled and not direct_active and not carrier_active:
+        _save_ernie_lora_ema(ema, lora, save_path, ctx)  # T1.B EMA sibling
     if sample_enabled and last_sample_step != run_steps:
         _sample_ernie_prompts(base, blocks, baseline_lora, lora, sample_cfg, run_steps, ctx)

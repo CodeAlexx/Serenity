@@ -72,8 +72,14 @@ from serenitymojo.models.ltx2.ltx2_stack_lora import (
     ltx2_adaln_delta, ltx2_stack_lora_forward_offload,
     ltx2_stack_lora_backward_offload, ltx2_lora_adamw_step, save_ltx2_lora,
     ltx2_lora_adamw_state_init, ltx2_lora_adamw_step_resident,
+    save_ltx2_lora_state, load_ltx2_lora_state, load_ltx2_lora_resume,
 )
-from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState,
+    lora_adamw_plain_device_state_sync_params,
+    lora_adamw_plain_device_state_sync_moments,
+)
+from serenitymojo.training.lora_save import lora_train_state_has_moments
 from serenitymojo.models.dit.ltx2_rope import build_ltx2_rope
 from serenitymojo.offload.ltx2_plan import build_ltx2_block_plan
 from serenitymojo.offload.plan import OffloadConfig
@@ -221,6 +227,34 @@ def _load_host(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List
     return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
 
 
+# ── FULL-state resume resolution + loud warm-resume guard (MJ-1088 / MJ-1077) ──
+# Probe the `<ckpt>.state` sidecar so a user who passes the PEFT weights still gets
+# a FULL (moment-preserving) resume; only warm-restart (loud warning) when there is
+# genuinely no moment state. The probe prefix matches _ltx2_lora_prefixes[0].
+def _ltx2_resolve_resume_path(path: String) raises -> String:
+    var probe = String("transformer_blocks.0.attn1.to_q")
+    if lora_train_state_has_moments(path, probe):
+        return path
+    var sib = path + String(".state")
+    if lora_train_state_has_moments(sib, probe):
+        return sib
+    return path
+
+
+def _ltx2_warn_warm_resume(path: String):
+    print("")
+    print("  ============================================================")
+    print("  [ltx2-resume] !! WARM RESUME — AdamW moments RESTART at zero !!")
+    print("  path:", path)
+    print("  No FULL `.state` (A/B + adam_m/adam_v) was found for this checkpoint.")
+    print("  The optimizer's first/second moments reset to zero, so training does")
+    print("  NOT continue on the same trajectory as an uninterrupted run — the")
+    print("  first resumed steps take large, under-damped AdamW updates.")
+    print("  To FULL-resume, pass the `<ckpt>.safetensors.state` sidecar instead.")
+    print("  ============================================================")
+    print("")
+
+
 def main() raises:
     var ctx = DeviceContext()
     var a = argv()
@@ -243,6 +277,13 @@ def main() raises:
         if v <= 0:
             raise Error("train_ltx2_real: steps must be a positive integer")
         run_steps = v
+
+    # Optional argv[3]: resume checkpoint. Pass either the `<ckpt>.safetensors.state`
+    # sidecar (FULL moment resume) or the plain PEFT `.safetensors` (WARM start —
+    # the .state sibling is auto-probed first so the PEFT path still full-resumes).
+    var resume_path = String("")
+    if len(a) >= 4:
+        resume_path = String(a[3])
 
     print("=== LTX-2 LEGACY video-only LoRA training loop (block-swap offload) ===")
     print("  WARNING: legacy stack; not production full-AV LTX2 training")
@@ -297,6 +338,22 @@ def main() raises:
     # and can hit the MJ-1070 unmapped-buffer segfault under pinned pressure.
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
     var adamw_state_ready = False
+
+    # ── optional resume: reload A/B (+ AdamW moments if a FULL `.state` exists) ──
+    # BEFORE the loop so the lazy resident-AdamW init (ltx2_lora_adamw_state_init)
+    # seeds dev_m/dev_v from the restored moments — full-moment fidelity (MJ-1088).
+    if resume_path != String(""):
+        var resolved = _ltx2_resolve_resume_path(resume_path)
+        var is_full = lora_train_state_has_moments(
+            resolved, String("transformer_blocks.0.attn1.to_q")
+        )
+        if is_full:
+            lora = load_ltx2_lora_state(NUM_LAYERS, D, RANK, ALPHA, resolved, ctx)
+            print("[ltx2-resume] FULL resume (A/B + AdamW moments) from", resolved)
+        else:
+            _ltx2_warn_warm_resume(resolved)
+            lora = load_ltx2_lora_resume(NUM_LAYERS, D, RANK, ALPHA, resolved, ctx)
+        print("[ltx2-resume] reloaded", total_ltx2_adapters(lora), "adapters")
 
     var train_start = perf_counter_ns()
     for k in range(1, run_steps + 1):
@@ -402,6 +459,23 @@ def main() raises:
         print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        _ = save_ltx2_lora(lora, String(LORA_DIR) + String("/ltx2_lora_smoke.safetensors"), ctx)
+        var peft_path = String(LORA_DIR) + String("/ltx2_lora_smoke.safetensors")
+        _ = save_ltx2_lora(lora, peft_path, ctx)
+        # MJ-1088: also write the moment-carrying `.state` sidecar so a resume does
+        # NOT zero AdamW momentum. Pull the resident device m/v back to host first —
+        # the resident step syncs params every step but moments only on demand.
+        if adamw_state_ready:
+            lora_adamw_plain_device_state_sync_params(
+                adamw_dev_state.value(), lora.ad, ctx
+            )
+            lora_adamw_plain_device_state_sync_moments(
+                adamw_dev_state.value(), lora.ad, ctx
+            )
+        var meta = List[Float32]()
+        meta.append(Float32(run_steps))
+        meta.append(Float32(Int(SEED_BASE)))
+        var state_path = peft_path + String(".state")
+        _ = save_ltx2_lora_state(lora, state_path, ctx, meta^)
+        print("[ltx2] save_state (A/B + AdamW moments) path=", state_path)
     else:
         print("RESULT: FAIL trains=", trains)

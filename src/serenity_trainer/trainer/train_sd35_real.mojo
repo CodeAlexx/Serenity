@@ -65,12 +65,18 @@ from serenitymojo.models.sd35.weights import load_sd35_stack_base
 # blocks, recompute-in-backward (input tapes only). False = host oracle.
 comptime SD35_DEVICE_STACK = True
 
-from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState,
+    lora_adamw_plain_device_state_sync_params,
+    lora_adamw_plain_device_state_sync_moments,
+)
+from serenitymojo.training.lora_save import lora_train_state_has_moments
 from serenitymojo.models.sd35.sd35_stack_lora import (
     sd35_lora_adamw_step_resident, sd35_lora_adamw_state_init,
     SD35LoraSet, SD35LoraGradSet, SD35StackBase,
     build_sd35_lora_set, sd35_lora_adamw_step,
     save_sd35_lora, save_sd35_lora_state, total_adapters,
+    save_sd35_lora_state_with_meta, load_sd35_lora_state, load_sd35_lora_resume,
     sd35_stack_lora_forward_offload, sd35_stack_lora_backward_offload,
     sd35_stack_lora_forward_offload_device, sd35_stack_lora_backward_offload_device,
     SD35_DIRECT_24_GIB,
@@ -745,6 +751,35 @@ def _sd35_run_sample(
     print("[SD35-lora] sample step=", step, " -> ", out_path)
 
 
+# ── FULL-state resume resolution + loud warm-resume guard (MJ-1088 / MJ-1077) ──
+# Probe the `<ckpt>.state.safetensors` sidecar (the naming save_sd35_lora_state
+# writes) so a user who passes the PEFT weights still gets a FULL (moment-
+# preserving) resume; only warm-restart (loud warning) when there is genuinely no
+# moment state. The probe prefix matches _sd35_lora_prefixes[0].
+def _sd35_resolve_resume_path(path: String) raises -> String:
+    var probe = String("transformer.joint_blocks.0.context_block.attn.qkv")
+    if lora_train_state_has_moments(path, probe):
+        return path
+    var sib = path + String(".state.safetensors")
+    if lora_train_state_has_moments(sib, probe):
+        return sib
+    return path
+
+
+def _sd35_warn_warm_resume(path: String):
+    print("")
+    print("  ============================================================")
+    print("  [sd35-resume] !! WARM RESUME — AdamW moments RESTART at zero !!")
+    print("  path:", path)
+    print("  No FULL `.state` (A/B + adam_m/adam_v) was found for this checkpoint.")
+    print("  The optimizer's first/second moments reset to zero, so training does")
+    print("  NOT continue on the same trajectory as an uninterrupted run — the")
+    print("  first resumed steps take large, under-damped AdamW updates.")
+    print("  To FULL-resume, pass the `<ckpt>.state.safetensors` sidecar instead.")
+    print("  ============================================================")
+    print("")
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -766,10 +801,16 @@ def main() raises:
     elif train_cfg.only_cache:
         run_steps = 0
 
+    # Optional argv[arg_base+1]: resume checkpoint (plain-LoRA arm). Pass either the
+    # `<ckpt>.safetensors.state.safetensors` sidecar (FULL moment resume) or the
+    # plain PEFT `.safetensors` (WARM start — the .state sibling is auto-probed
+    # first so the PEFT path still full-resumes). MJ-1088.
+    var resume_path = String("")
     if len(a) > arg_base + 1:
+        resume_path = String(a[arg_base + 1])
+    if len(a) > arg_base + 2:
         raise Error(
-            String("SD3.5 trainer accepts [config.json] [steps] only; ")
-            + String("start_step/state resume args are not wired for this loop")
+            String("SD3.5 trainer accepts [config.json] [steps] [resume_ckpt] only")
         )
 
     var ckpt = sd35_checkpoint_from_train_config(train_cfg)
@@ -1009,6 +1050,23 @@ def main() raises:
     var micro_in_window = 0
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
+
+    # ── optional resume (plain-LoRA arm only): reload A/B (+ AdamW moments if a
+    # FULL `.state` exists) BEFORE the loop so the lazy resident-AdamW init
+    # (sd35_lora_adamw_state_init) seeds dev_m/dev_v from the restored moments —
+    # full-moment fidelity (MJ-1088).
+    if resume_path != String("") and not carrier_active and not direct_active:
+        var resolved = _sd35_resolve_resume_path(resume_path)
+        var is_full = lora_train_state_has_moments(
+            resolved, String("transformer.joint_blocks.0.context_block.attn.qkv")
+        )
+        if is_full:
+            lora = load_sd35_lora_state(NUM_JOINT, D, FMLP, RANK, ALPHA, resolved, ctx)
+            print("[sd35-resume] FULL resume (A/B + AdamW moments) from", resolved)
+        else:
+            _sd35_warn_warm_resume(resolved)
+            lora = load_sd35_lora_resume(NUM_JOINT, D, FMLP, RANK, ALPHA, resolved, ctx)
+        print("[sd35-resume] reloaded", total_adapters(lora), "adapters")
 
     var train_start = perf_counter_ns()
     for k in range(1, run_steps + 1):
@@ -1335,8 +1393,21 @@ def main() raises:
                 _ = save_sd35_loha(loha_masters, save_path, ctx)
             else:
                 _ = save_sd35_lora(lora, save_path, ctx)
+                # MJ-1088: pull the resident device m/v back to host before writing
+                # the `.state` (the resident step syncs params each step, not
+                # moments) so the saved AdamW moments are LIVE, not stale-init.
+                if adamw_state_ready:
+                    lora_adamw_plain_device_state_sync_params(
+                        adamw_dev_state.value(), lora.ad, ctx
+                    )
+                    lora_adamw_plain_device_state_sync_moments(
+                        adamw_dev_state.value(), lora.ad, ctx
+                    )
                 var state_path = save_path + String(".state.safetensors")
-                _ = save_sd35_lora_state(lora, state_path, ctx)
+                var state_meta = List[Float32]()
+                state_meta.append(Float32(k))
+                state_meta.append(Float32(Int(train_cfg.seed)))
+                _ = save_sd35_lora_state_with_meta(lora, state_path, ctx, state_meta^)
             saved_this_step = True
             print("[SD35-lora] save step=", k, " path=", save_path)
         if sample_enabled and should_sample_completed_step(sample_cadence, k):
@@ -1350,8 +1421,20 @@ def main() raises:
                     _ = save_sd35_loha(loha_masters, sample_path, ctx)
                 else:
                     _ = save_sd35_lora(lora, sample_path, ctx)
+                    # MJ-1088: sync resident m/v to host so the `.state` carries LIVE
+                    # AdamW moments (resident step syncs params, not moments).
+                    if adamw_state_ready:
+                        lora_adamw_plain_device_state_sync_params(
+                            adamw_dev_state.value(), lora.ad, ctx
+                        )
+                        lora_adamw_plain_device_state_sync_moments(
+                            adamw_dev_state.value(), lora.ad, ctx
+                        )
                     var sample_state = sample_path + String(".state.safetensors")
-                    _ = save_sd35_lora_state(lora, sample_state, ctx)
+                    var sample_meta = List[Float32]()
+                    sample_meta.append(Float32(k))
+                    sample_meta.append(Float32(Int(train_cfg.seed)))
+                    _ = save_sd35_lora_state_with_meta(lora, sample_state, ctx, sample_meta^)
                 print("[SD35-lora] save_before_sample step=", k, " path=", sample_path)
             # Geometry/contract preflight (fail-loud on bad prompts), then the real
             # v1 sample-during-training run: denoise from the CURRENT frozen base +
@@ -1410,8 +1493,20 @@ def main() raises:
             _ = save_sd35_direct_oft(oft_masters, lora_out, ctx)
         else:
             _ = save_sd35_lora(lora, lora_out, ctx)
+            # MJ-1088: sync resident m/v to host so the final `.state` carries LIVE
+            # AdamW moments (resident step syncs params, not moments).
+            if adamw_state_ready:
+                lora_adamw_plain_device_state_sync_params(
+                    adamw_dev_state.value(), lora.ad, ctx
+                )
+                lora_adamw_plain_device_state_sync_moments(
+                    adamw_dev_state.value(), lora.ad, ctx
+                )
             var state_out = lora_out + String(".state.safetensors")
-            _ = save_sd35_lora_state(lora, state_out, ctx)
+            var final_meta = List[Float32]()
+            final_meta.append(Float32(run_steps))
+            final_meta.append(Float32(Int(train_cfg.seed)))
+            _ = save_sd35_lora_state_with_meta(lora, state_out, ctx, final_meta^)
             print("[SD35-lora] save_state step=", run_steps, " path=", state_out)
     else:
         print("RESULT: FAIL trains=", trains)
