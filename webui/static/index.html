@@ -567,6 +567,9 @@
     <div class="kv">
       <b>Samples</b><span id="s_samples">0</span>
       <b>Backend</b><span id="s_backend">—</span>
+      <b>Resume</b><span id="s_resume">—</span>
+      <b>Last save</b><span id="s_lastsave">—</span>
+      <b>Stage</b><span id="s_stage">—</span>
     </div>
     <hr>
     <div class="kv">
@@ -1006,6 +1009,21 @@ function connectSSE() {
     } else if (m.type === "log" && m.run_id === RUN) {
       logline(m.line);
       if (m.line.includes(".png")) refreshGallery();
+    } else if (m.type === "resume" && m.run_id === RUN) {
+      // structured trainer banner (finding #6): FULL restores AdamW moments,
+      // WARM restarts them at zero — worth flagging distinctly in the rail.
+      const kind = m.kind === "warm" ? "WARM (moments reset)" : "FULL";
+      $("s_resume").textContent = kind;
+      $("s_resume").style.color = m.kind === "warm" ? "var(--orange)" : "var(--ok)";
+      logline("↻ resume: " + kind + (m.path ? " ← " + m.path : ""));
+    } else if (m.type === "save" && m.run_id === RUN) {
+      $("s_lastsave").textContent = (m.final ? "FINAL " : "") + (m.path || "").split("/").pop();
+      $("s_lastsave").title = m.path || "";
+      logline((m.final ? "💾 FINAL LoRA: " : "💾 save: ") + (m.path || ""));
+    } else if (m.type === "prune" && m.run_id === RUN) {
+      logline("🗑 pruned: " + (m.path || ""));
+    } else if (m.type === "stage" && m.run_id === RUN) {
+      $("s_stage").textContent = m.phase || "—";
     } else if (m.type === "status" && m.run.id === RUN) {
       $("statuspill").textContent = m.run.status.toUpperCase();
       $("statuspill").style.color = m.run.status === "failed" ? "var(--bad)" : "var(--dim)";
@@ -1050,6 +1068,15 @@ async function reattachRun() {
     $("s_loss").textContent = (live.loss || 0).toFixed(4);
     $("s_speed").textContent = (live.s_per_step || 0).toFixed(1) + " s/step";
     $("barfill").style.width = (100 * live.step / Math.max(1, live.total_steps)) + "%";
+    if (live.backend) $("s_backend").textContent = live.backend;
+    // structured banner state carried in RunInfo survives reload AND server
+    // re-adopt (finding #5/#6) — show the last save + resume kind + stage.
+    if (live.resume_kind) {
+      $("s_resume").textContent = live.resume_kind === "warm" ? "WARM (moments reset)" : "FULL";
+      $("s_resume").style.color = live.resume_kind === "warm" ? "var(--orange)" : "var(--ok)";
+    }
+    if (live.last_save) { $("s_lastsave").textContent = live.last_save.split("/").pop(); $("s_lastsave").title = live.last_save; }
+    if (live.stage) $("s_stage").textContent = live.stage;
     refreshGallery();
   } catch (e) {}
 }

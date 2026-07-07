@@ -435,6 +435,9 @@ fn fresh_runinfo(workspace: &str) -> crate::RunInfo {
         grad_norm: 0.0,
         s_per_step: 0.0,
         eta: String::new(),
+        resume_kind: String::new(),
+        last_save: String::new(),
+        stage: String::new(),
     }
 }
 

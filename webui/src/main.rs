@@ -27,6 +27,10 @@ use tokio::{
 
 mod captioner;
 mod board;
+// validate_config_enums is exercised by the config_smoke bin (shared file); in
+// the server bin only build_merged_config is called, so allow the rest.
+#[allow(dead_code)]
+mod config_merge;
 
 const REPO_ROOT: &str = "/home/alex/serenity-trainer";
 const CUDA_LD: &str = "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib";
@@ -70,12 +74,24 @@ struct RunInfo {
     grad_norm: f64,
     s_per_step: f64,
     eta: String,
+    // structured trainer banners elevated from log noise (finding #6) — also
+    // carried so a reattach/re-adopt shows the last save + resume kind.
+    #[serde(default)]
+    resume_kind: String, // "" | "full" | "warm"
+    #[serde(default)]
+    last_save: String, // last [save] wrote / FINAL LoRA path
+    #[serde(default)]
+    stage: String, // last klein PROG_STAGE phase
 }
 
 struct AppState {
     presets: Vec<Preset>,
     runs: Mutex<Vec<RunInfo>>,
     child: Mutex<Option<Child>>, // one run at a time (the 24GB rule)
+    // pid of the active run (launched OR re-adopted after a server restart,
+    // finding #5). Distinct from `child`: an adopted run has no tokio Child
+    // handle, only its pid — stop() and liveness polling key on this.
+    active_pid: Mutex<Option<u32>>,
     events: broadcast::Sender<String>,
     next_id: Mutex<u64>,
 }
@@ -173,6 +189,300 @@ pub(crate) fn parse_progress(line: &str, run: &mut RunInfo) -> bool {
     hit
 }
 
+/// Elevate the trainer's own banner prints to typed SSE events (finding #6).
+/// Mutates the RunInfo's carried fields (resume_kind/last_save/stage) and
+/// returns the typed event JSON to broadcast, or None if the line is not a
+/// banner (or a PROG_STAGE whose phase is unchanged — deduped so klein's
+/// ~10 stage lines/step don't flood the stream). Banner strings verified in
+/// train_krea2.mojo, training/trainer_core.mojo, train_klein_real.mojo, and the
+/// train_*_real.mojo resume prints.
+pub(crate) fn parse_banner(line: &str, run: &mut RunInfo) -> Option<Value> {
+    let after = |pat: &str| -> Option<String> {
+        line.find(pat).map(|i| line[i + pat.len()..].trim().to_string())
+    };
+    // resume — WARM (moments restart) vs FULL (moments restored). trainer_core
+    // prints "!! WARM RESUME"; each train_*_real prints "[<m>-resume] FULL resume".
+    if line.contains("WARM RESUME") {
+        run.resume_kind = "warm".into();
+        return Some(json!({"type": "resume", "run_id": run.id, "kind": "warm"}));
+    }
+    if line.contains("-resume]") && line.contains("FULL resume") {
+        let path = after(" from ").unwrap_or_default();
+        run.resume_kind = "full".into();
+        return Some(json!({"type": "resume", "run_id": run.id, "kind": "full", "path": path}));
+    }
+    // prune — rolling-retention delete ("[prune] removed old ... -> <path>")
+    if line.contains("[prune] removed") {
+        let path = after("-> ").unwrap_or_default();
+        return Some(json!({"type": "prune", "run_id": run.id, "path": path}));
+    }
+    // save — periodic ("[save] wrote N LoRA pairs -> <p> (+ .a3state)") + final
+    if line.contains("FINAL LoRA") {
+        let path = after("-> ").unwrap_or_default();
+        run.last_save = path.clone();
+        return Some(json!({"type": "save", "run_id": run.id, "path": path, "final": true}));
+    }
+    if line.contains("[save] wrote") {
+        let mut path = after("-> ").unwrap_or_default();
+        if let Some(i) = path.find(" (+") {
+            path.truncate(i); // drop the " (+ .a3state)" suffix
+        }
+        let path = path.trim().to_string();
+        run.last_save = path.clone();
+        return Some(json!({"type": "save", "run_id": run.id, "path": path}));
+    }
+    // klein PROG_STAGE step=<k> ... phase=<phase> — emit only on phase change
+    if line.contains("PROG_STAGE step=") {
+        let phase = line
+            .find("phase=")
+            .map(|i| line[i + 6..].split_whitespace().next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        if phase.is_empty() || phase == run.stage {
+            run.stage = phase;
+            return None;
+        }
+        run.stage = phase.clone();
+        return Some(json!({"type": "stage", "run_id": run.id, "phase": phase}));
+    }
+    None
+}
+
+// ── finding #5: persist the active run so a server restart re-adopts it ───────
+
+/// One-active-run metadata mirrored to disk (the 24GB rule = at most one). On
+/// boot we read it, and if the pid is still alive we re-adopt the live trainer;
+/// if the pid is gone we finalize it from the log tail. Written at launch,
+/// cleared at finalize/stop.
+#[derive(Serialize, Deserialize, Clone)]
+struct ActiveRun {
+    id: u64,
+    preset_id: String,
+    backend: String,
+    binary: String,
+    workspace_dir: String,
+    log_path: String,
+    config_path: String,
+    pid: u32,
+    start_time: f64,
+    total_steps: u64,
+}
+
+fn active_run_path() -> String {
+    format!("{REPO_ROOT}/webui/active_run.json")
+}
+
+fn write_active_run(a: &ActiveRun) {
+    let _ = std::fs::write(active_run_path(), serde_json::to_string_pretty(a).unwrap_or_default());
+}
+
+fn read_active_run() -> Option<ActiveRun> {
+    std::fs::read_to_string(active_run_path()).ok().and_then(|s| serde_json::from_str(&s).ok())
+}
+
+fn clear_active_run() {
+    let _ = std::fs::remove_file(active_run_path());
+}
+
+/// pid liveness: /proc/<pid> exists AND (if readable) its cmdline still names
+/// the trainer binary — guards against adopting a reused pid after a reboot.
+fn pid_is_trainer(pid: u32, binary: &str) -> bool {
+    if !Path::new(&format!("/proc/{pid}")).exists() {
+        return false;
+    }
+    let base = Path::new(binary).file_name().and_then(|b| b.to_str()).unwrap_or("");
+    match std::fs::read(format!("/proc/{pid}/cmdline")) {
+        Ok(raw) => {
+            let cmd = String::from_utf8_lossy(&raw);
+            base.is_empty() || cmd.contains(base) || cmd.contains("serenity_")
+        }
+        Err(_) => true, // alive but cmdline unreadable — treat as adoptable
+    }
+}
+
+/// Scan the tail of a failed run's log for the last error line (finding #7,
+/// shared by the launch tail loop and the re-adopt loop).
+fn scan_last_error(log_path: &str) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut msg = String::new();
+    if let Ok(mut f) = std::fs::File::open(log_path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(65536)));
+        let mut raw = Vec::new();
+        if f.read_to_end(&mut raw).is_ok() {
+            for line in String::from_utf8_lossy(&raw).lines() {
+                if line.contains("Error") || line.contains("Unhandled exception") {
+                    msg = line.trim().to_string();
+                }
+            }
+        }
+    }
+    msg
+}
+
+/// Reconstruct the latest progress + banner state from an existing log's tail,
+/// so a re-adopted run shows its current step/loss/last-save immediately.
+fn recover_progress(log_path: &str, info: &mut RunInfo) {
+    use std::io::{Read, Seek, SeekFrom};
+    if let Ok(mut f) = std::fs::File::open(log_path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(65536)));
+        let mut raw = Vec::new();
+        if f.read_to_end(&mut raw).is_ok() {
+            for line in String::from_utf8_lossy(&raw).lines() {
+                let l = line.trim();
+                if l.is_empty() {
+                    continue;
+                }
+                let _ = parse_progress(l, info);
+                let _ = parse_banner(l, info);
+            }
+        }
+    }
+}
+
+/// A clean finish for every wired trainer prints the FINAL LoRA banner. Used to
+/// classify a run whose pid is already gone at boot (exited vs failed).
+fn log_indicates_success(log_path: &str) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    if let Ok(mut f) = std::fs::File::open(log_path) {
+        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(131072)));
+        let mut raw = Vec::new();
+        if f.read_to_end(&mut raw).is_ok() {
+            let s = String::from_utf8_lossy(&raw);
+            // krea2-family prints "FINAL LoRA"; the OT-family drivers print
+            // "RESULT: REAL run OK" (measured: chroma run misclassified failed).
+            return s.contains("FINAL LoRA") || s.contains("RESULT: REAL run OK");
+        }
+    }
+    false
+}
+
+/// Terminal bookkeeping shared by the launch tail loop and the re-adopt loop:
+/// clear the active-run file, set status (guarding a prior stop/failed), record
+/// history + board, and broadcast the status event.
+async fn finalize_run(st: &Arc<AppState>, id: u64, log_path: &str, success: bool) {
+    let fail_msg = if success { String::new() } else { scan_last_error(log_path) };
+    clear_active_run();
+    *st.active_pid.lock().await = None;
+    let mut runs = st.runs.lock().await;
+    if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
+        if r.status == "running" {
+            r.status = if success { "exited".into() } else { "failed".into() };
+        }
+        if !fail_msg.is_empty() {
+            r.message = fail_msg;
+        }
+        append_history(r);
+        board::run_ended(&r.workspace_dir, &r.status);
+        let _ = st.events.send(json!({"type": "status", "run": &*r}).to_string());
+    }
+}
+
+/// Re-adopt loop for a run inherited across a server restart: no tokio Child, so
+/// liveness is polled via /proc/<pid>. Tails NEW log lines from `offset` for
+/// parse + SSE, and finalizes when the pid disappears.
+fn spawn_adopt_loop(st: Arc<AppState>, id: u64, log_path: String, pid: u32, mut offset: u64) {
+    tokio::spawn(async move {
+        let mut pending = String::new();
+        loop {
+            if let Ok(mut f) = std::fs::File::open(&log_path) {
+                use std::io::{Read, Seek, SeekFrom};
+                let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                if len > offset {
+                    let _ = f.seek(SeekFrom::Start(offset));
+                    let mut buf = String::new();
+                    if f.read_to_string(&mut buf).is_ok() {
+                        offset = len;
+                        pending.push_str(&buf);
+                        while let Some(nl) = pending.find('\n') {
+                            let line: String = pending.drain(..=nl).collect();
+                            let line = line.trim_end();
+                            if line.is_empty() {
+                                continue;
+                            }
+                            let mut runs = st.runs.lock().await;
+                            if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
+                                let parsed = parse_progress(line, r);
+                                if parsed {
+                                    board::ingest(&r.workspace_dir, r.step, r.epoch, r.loss, r.grad_norm, r.s_per_step, r.total_steps);
+                                    let _ = st.events.send(json!({"type": "progress", "run": &*r}).to_string());
+                                } else {
+                                    let _ = st.events.send(json!({"type": "log", "run_id": id, "line": line}).to_string());
+                                    if let Some(bev) = parse_banner(line, r) {
+                                        let _ = st.events.send(bev.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let success = log_indicates_success(&log_path);
+                finalize_run(&st, id, &log_path, success).await;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    });
+}
+
+/// On boot, re-adopt or finalize the persisted active run (finding #5).
+async fn adopt_persisted_run(st: &Arc<AppState>) {
+    let Some(a) = read_active_run() else { return };
+    let mut info = RunInfo {
+        id: a.id,
+        preset_id: a.preset_id.clone(),
+        backend: a.backend.clone(),
+        workspace_dir: a.workspace_dir.clone(),
+        log_path: a.log_path.clone(),
+        status: "running".into(),
+        message: String::new(),
+        pid: Some(a.pid),
+        step: 0,
+        total_steps: a.total_steps,
+        epoch: 0,
+        total_epochs: 0,
+        loss: 0.0,
+        grad_norm: 0.0,
+        s_per_step: 0.0,
+        eta: String::new(),
+        resume_kind: String::new(),
+        last_save: String::new(),
+        stage: String::new(),
+    };
+    recover_progress(&a.log_path, &mut info);
+    // keep new run ids monotonic past the adopted one
+    {
+        let mut n = st.next_id.lock().await;
+        if a.id > *n {
+            *n = a.id;
+        }
+    }
+    if pid_is_trainer(a.pid, &a.binary) {
+        info.message = format!("▶ re-adopted after restart: tail -f {}", a.log_path);
+        let offset = std::fs::metadata(&a.log_path).map(|m| m.len()).unwrap_or(0);
+        st.runs.lock().await.push(info);
+        *st.active_pid.lock().await = Some(a.pid);
+        eprintln!("[adopt] re-adopted live run {} (pid {}) from {}", a.id, a.pid, a.log_path);
+        spawn_adopt_loop(st.clone(), a.id, a.log_path.clone(), a.pid, offset);
+    } else {
+        // pid gone while we were down — classify from the log and record it
+        let success = log_indicates_success(&a.log_path);
+        info.status = if success { "exited".into() } else { "failed".into() };
+        if !success {
+            info.message = scan_last_error(&a.log_path);
+        }
+        append_history(&info);
+        board::run_ended(&info.workspace_dir, &info.status);
+        st.runs.lock().await.push(info);
+        clear_active_run();
+        eprintln!("[adopt] persisted run {} pid {} gone -> {}", a.id, a.pid, if success { "exited" } else { "failed" });
+    }
+}
+
 async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> (StatusCode, Json<Value>) {
     let Some(p) = st.presets.iter().find(|p| p.id == req.preset_id).cloned() else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown preset {}", req.preset_id)})));
@@ -187,56 +497,18 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         return (StatusCode::CONFLICT, Json(json!({"error": format!("GPU busy: {who}")})));
     }
     // ---- build the runner config: base template + preset recipe + overrides ----
-    let mut cfg: Value = if p.base_config.is_empty() {
-        json!({}) // ideogram4: all-argv contract, no runner config template
-    } else {
-        let base_path = Path::new(REPO_ROOT).join(&p.base_config);
-        match std::fs::read_to_string(&base_path).ok().and_then(|s| serde_json::from_str(&s).ok()) {
-            Some(v) => v,
-            None => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("base config missing/unreadable: {} — run this model once via CLI or add the template", base_path.display())}))),
-        }
-    };
+    // Single source of truth (config_merge::build_merged_config) so the offline
+    // webui-config-smoke merges IDENTICALLY (finding #3). Err = base template
+    // named but missing/unreadable -> 422 (unchanged behavior). The sampling
+    // strip for sd35|hidream|ideogram4 (finding #8) lives inside the shared fn.
     let run_name = req.run_name.clone().unwrap_or_else(|| p.run_name.clone());
     let workspace = format!("/home/alex/mojodiffusion/output/{run_name}");
-    if let Value::Object(m) = &mut cfg {
-        if let Value::Object(r) = &p.recipe {
-            for (k, v) in r {
-                m.insert(k.clone(), v.clone());
-            }
-        }
-        if let Value::Object(o) = &req.overrides {
-            for (k, v) in o {
-                m.insert(k.clone(), v.clone());
-            }
-        }
-        m.insert("workspace_dir".into(), json!(workspace));
-        m.insert("save_filename_prefix".into(), json!(run_name));
-    }
-    // finding #8: inline sampling during training is not wired for these backends —
-    // their trainers FAIL LOUD when a sample cadence / prompt file is set
-    // (train_sd35_real.mojo:413-469, train_hidream_o1_real.mojo:377-381,
-    // ideogram4 sampler). Strip the sampling triggers here and tell the caller,
-    // rather than launching a run that crashes mid-flight.
-    let mut notes: Vec<String> = vec![];
-    if matches!(p.backend.as_str(), "sd35" | "hidream" | "ideogram4") {
-        if let Value::Object(m) = &mut cfg {
-            if m.get("sample_every").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
-                m.insert("sample_every".into(), json!(0));
-                notes.push(format!(
-                    "sampling disabled: inline sampler not wired for backend {} — sample_every forced to 0",
-                    p.backend
-                ));
-            }
-            for k in ["validation_prompts_file", "sample_definition_file_name"] {
-                if m.remove(k).is_some() {
-                    notes.push(format!(
-                        "removed {k}: inline sampling not supported for backend {}",
-                        p.backend
-                    ));
-                }
-            }
-        }
-    }
+    let (cfg, notes) = match config_merge::build_merged_config(
+        REPO_ROOT, &p.base_config, &p.recipe, &p.backend, &run_name, &req.overrides,
+    ) {
+        Ok(v) => v,
+        Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": e}))),
+    };
     let cache = req.cache.clone().unwrap_or_else(|| p.cache.clone());
     if p.argv_shape == "krea2" && !Path::new(&cache).exists() {
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("cache not found: {cache}")})));
@@ -373,11 +645,34 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         grad_norm: 0.0,
         s_per_step: 0.0,
         eta: String::new(),
+        resume_kind: String::new(),
+        last_save: String::new(),
+        stage: String::new(),
     };
     st.runs.lock().await.push(info.clone());
     board::run_started(&workspace, &p.id, steps, &cfg);
     // TAIL the child's log file -> parse + broadcast SSE (no pipe: see spawn note)
     *st.child.lock().await = Some(child);
+    // finding #5: mirror the active run to disk + track its pid so a server
+    // restart re-adopts (adopt_persisted_run) instead of orphaning it.
+    if let Some(pidv) = pid {
+        *st.active_pid.lock().await = Some(pidv);
+        write_active_run(&ActiveRun {
+            id,
+            preset_id: p.id.clone(),
+            backend: p.backend.clone(),
+            binary: p.binary.clone(),
+            workspace_dir: workspace.clone(),
+            log_path: log_path.clone(),
+            config_path: cfg_path.clone(),
+            pid: pidv,
+            start_time: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+            total_steps: steps,
+        });
+    }
     let stc = st.clone();
     tokio::spawn(async move {
         let mut offset: u64 = 0;
@@ -402,13 +697,15 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
                                 let parsed = parse_progress(line, r);
                                 if parsed {
                                     board::ingest(&r.workspace_dir, r.step, r.epoch, r.loss, r.grad_norm, r.s_per_step, r.total_steps);
-                                }
-                                let ev = if parsed {
-                                    json!({"type": "progress", "run": &*r}).to_string()
+                                    let _ = stc.events.send(json!({"type": "progress", "run": &*r}).to_string());
                                 } else {
-                                    json!({"type": "log", "run_id": id, "line": line}).to_string()
-                                };
-                                let _ = stc.events.send(ev);
+                                    // keep the raw line in the log pane, THEN elevate
+                                    // recognized banners to a typed event (finding #6).
+                                    let _ = stc.events.send(json!({"type": "log", "run_id": id, "line": line}).to_string());
+                                    if let Some(bev) = parse_banner(line, r) {
+                                        let _ = stc.events.send(bev.to_string());
+                                    }
+                                }
                             }
                         }
                     }
@@ -445,41 +742,17 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
                                     board::ingest(&r.workspace_dir, r.step, r.epoch, r.loss, r.grad_norm, r.s_per_step, r.total_steps);
                                 }
                                 let _ = stc.events.send(json!({"type": "log", "run_id": id, "line": line}).to_string());
-                            }
-                        }
-                    }
-                }
-                // finding #7: on non-zero exit, surface the actual error line
-                // (not just "FAILED"). Scan the log tail for the LAST line naming
-                // an error / unhandled exception so the UI pill/#msg shows it.
-                let mut fail_msg = String::new();
-                if !success {
-                    if let Ok(mut f) = std::fs::File::open(&log_path) {
-                        use std::io::{Read, Seek, SeekFrom};
-                        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
-                        let _ = f.seek(SeekFrom::Start(len.saturating_sub(65536)));
-                        let mut raw = Vec::new();
-                        if f.read_to_end(&mut raw).is_ok() {
-                            for line in String::from_utf8_lossy(&raw).lines() {
-                                if line.contains("Error") || line.contains("Unhandled exception") {
-                                    fail_msg = line.trim().to_string();
+                                // elevate the end-of-run banners (FINAL LoRA / prune)
+                                if let Some(bev) = parse_banner(line, r) {
+                                    let _ = stc.events.send(bev.to_string());
                                 }
                             }
                         }
                     }
                 }
-                let mut runs = stc.runs.lock().await;
-                if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
-                    if r.status == "running" {
-                        r.status = if success { "exited".into() } else { "failed".into() };
-                    }
-                    if !fail_msg.is_empty() {
-                        r.message = fail_msg;
-                    }
-                    append_history(r);
-                    board::run_ended(&r.workspace_dir, &r.status);
-                    let _ = stc.events.send(json!({"type": "status", "run": &*r}).to_string());
-                }
+                // finding #7: on non-zero exit, surface the actual error line
+                // (finalize_run scans the tail); clears active_run + active_pid.
+                finalize_run(&stc, id, &log_path, success).await;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(400)).await;
@@ -489,15 +762,32 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
 }
 
 async fn stop(State(st): State<Arc<AppState>>, AxPath(id): AxPath<u64>) -> (StatusCode, Json<Value>) {
-    let mut ch = st.child.lock().await;
-    if let Some(c) = ch.as_mut() {
-        if let Some(pid) = c.id() {
-            unsafe { libc_kill(pid as i32, 15) };
+    // Kill by pid (covers BOTH a launched child and a re-adopted run that has no
+    // tokio Child handle, finding #5). SIGTERM, grace, then reap the child.
+    let target = *st.active_pid.lock().await;
+    if let Some(pid) = target {
+        unsafe { libc_kill(pid as i32, 15) };
+    }
+    {
+        let mut ch = st.child.lock().await;
+        if let Some(c) = ch.as_mut() {
+            if let Some(pid) = c.id() {
+                unsafe { libc_kill(pid as i32, 15) };
+            }
+        }
+        if target.is_some() || ch.is_some() {
             tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        if let Some(c) = ch.as_mut() {
             let _ = c.start_kill();
         }
+        *ch = None;
     }
-    *ch = None;
+    if let Some(pid) = target {
+        unsafe { libc_kill(pid as i32, 9) }; // adopted run: SIGKILL fallback
+    }
+    *st.active_pid.lock().await = None;
+    clear_active_run();
     let mut runs = st.runs.lock().await;
     if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
         r.status = "stopped".into();
@@ -795,10 +1085,14 @@ async fn main() {
         presets,
         runs: Mutex::new(vec![]),
         child: Mutex::new(None),
+        active_pid: Mutex::new(None),
         events: tx,
         next_id: Mutex::new(0),
     });
     board::init();
+    // finding #5: re-adopt (or finalize) a run inherited across a server restart
+    // BEFORE serving, so /api/runs reflects reality the moment the UI reconnects.
+    adopt_persisted_run(&st).await;
     let static_dir = PathBuf::from(REPO_ROOT).join("webui/static");
     let app = Router::new()
         .merge(board::router())
@@ -823,4 +1117,167 @@ async fn main() {
     println!("serenity web trainer on http://{addr}");
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
+}
+
+#[cfg(test)]
+mod tests {
+    // Offline coverage for the wave-2 pure logic: the banner parser (finding #6)
+    // and the re-adopt predicates (finding #5). No server, GPU, or board.db.
+    use super::*;
+
+    fn blank_run() -> RunInfo {
+        RunInfo {
+            id: 7,
+            preset_id: String::new(),
+            backend: String::new(),
+            workspace_dir: String::new(),
+            log_path: String::new(),
+            status: "running".into(),
+            message: String::new(),
+            pid: None,
+            step: 0,
+            total_steps: 0,
+            epoch: 0,
+            total_epochs: 0,
+            loss: 0.0,
+            grad_norm: 0.0,
+            s_per_step: 0.0,
+            eta: String::new(),
+            resume_kind: String::new(),
+            last_save: String::new(),
+            stage: String::new(),
+        }
+    }
+
+    #[test]
+    fn banner_full_resume() {
+        // train_krea2.mojo:2264 exact print shape
+        let mut r = blank_run();
+        let ev = parse_banner(
+            "[krea2-resume] FULL resume (A/B + AdamW moments) from /out/krea2/ckpt_1500.state",
+            &mut r,
+        )
+        .expect("full resume is a banner");
+        assert_eq!(ev["type"], "resume");
+        assert_eq!(ev["kind"], "full");
+        assert_eq!(ev["path"], "/out/krea2/ckpt_1500.state");
+        assert_eq!(r.resume_kind, "full");
+    }
+
+    #[test]
+    fn banner_warm_resume_not_misread_as_full() {
+        // trainer_core.mojo:187 — also contains "-resume]" but must be WARM.
+        let mut r = blank_run();
+        let ev = parse_banner(
+            "  [krea2-resume] !! WARM RESUME — AdamW moments RESTART at zero !!",
+            &mut r,
+        )
+        .expect("warm resume is a banner");
+        assert_eq!(ev["kind"], "warm");
+        assert_eq!(r.resume_kind, "warm");
+    }
+
+    #[test]
+    fn banner_save_strips_a3state_suffix() {
+        // train_krea2.mojo:3869 "[save] wrote N LoRA pairs -> <p> (+ .a3state)"
+        let mut r = blank_run();
+        let ev = parse_banner(
+            "  [save] wrote 128 LoRA pairs -> /out/krea2/krea2_step1500.safetensors (+ .a3state)",
+            &mut r,
+        )
+        .expect("save is a banner");
+        assert_eq!(ev["type"], "save");
+        assert_eq!(ev["path"], "/out/krea2/krea2_step1500.safetensors");
+        assert_eq!(r.last_save, "/out/krea2/krea2_step1500.safetensors");
+    }
+
+    #[test]
+    fn banner_final_lora() {
+        // train_krea2.mojo:4526 "[save] FINAL LoRA: N pairs ( M tensors) -> <p>"
+        let mut r = blank_run();
+        let ev = parse_banner(
+            "[save] FINAL LoRA: 128 pairs ( 256 tensors) -> /out/krea2/krea2_final.safetensors",
+            &mut r,
+        )
+        .expect("final is a banner");
+        assert_eq!(ev["type"], "save");
+        assert_eq!(ev["final"], true);
+        assert_eq!(ev["path"], "/out/krea2/krea2_final.safetensors");
+    }
+
+    #[test]
+    fn banner_prune() {
+        // trainer_core.mojo:130
+        let mut r = blank_run();
+        let ev = parse_banner("  [prune] removed old checkpoint -> /out/krea2/ckpt_1000.safetensors", &mut r)
+            .expect("prune is a banner");
+        assert_eq!(ev["type"], "prune");
+        assert_eq!(ev["path"], "/out/krea2/ckpt_1000.safetensors");
+    }
+
+    #[test]
+    fn banner_stage_dedupes_on_unchanged_phase() {
+        // train_klein_real.mojo PROG_STAGE — emit once per phase change only.
+        let mut r = blank_run();
+        let first = parse_banner("PROG_STAGE step= 12  total= 2000  phase=optim", &mut r);
+        assert!(first.is_some());
+        assert_eq!(first.unwrap()["phase"], "optim");
+        // same phase next line -> no event (dedupe), state unchanged
+        let second = parse_banner("PROG_STAGE step= 13  total= 2000  phase=optim", &mut r);
+        assert!(second.is_none());
+        assert_eq!(r.stage, "optim");
+        // phase change -> event again
+        let third = parse_banner("PROG_STAGE step= 13  total= 2000  phase=backward", &mut r);
+        assert_eq!(third.unwrap()["phase"], "backward");
+    }
+
+    #[test]
+    fn banner_ignores_ordinary_and_progress_lines() {
+        let mut r = blank_run();
+        assert!(parse_banner("loading base weights ...", &mut r).is_none());
+        assert!(parse_banner("[X] step 12/2000 | loss 0.5 | 2.1s/step", &mut r).is_none());
+    }
+
+    #[test]
+    fn recover_progress_from_log_tail() {
+        let dir = std::env::temp_dir();
+        let log = dir.join(format!("cs_recover_{}.log", std::process::id()));
+        std::fs::write(
+            &log,
+            "boot\n[X] step 1500/2000 | epoch 3/4 | loss 0.4211 | grad_norm 0.12 | 2.0s/step | ETA 0:10:00\n  [save] wrote 64 LoRA pairs -> /out/x_step1500.safetensors\n",
+        )
+        .unwrap();
+        let mut r = blank_run();
+        recover_progress(log.to_str().unwrap(), &mut r);
+        assert_eq!(r.step, 1500);
+        assert_eq!(r.total_steps, 2000);
+        assert!((r.loss - 0.4211).abs() < 1e-6);
+        assert_eq!(r.last_save, "/out/x_step1500.safetensors");
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn log_success_marker() {
+        let dir = std::env::temp_dir();
+        let ok = dir.join(format!("cs_ok_{}.log", std::process::id()));
+        let bad = dir.join(format!("cs_bad_{}.log", std::process::id()));
+        std::fs::write(&ok, "step 2000/2000\n[save] FINAL LoRA: 64 pairs ( 128 tensors) -> /out/f.safetensors\n").unwrap();
+        std::fs::write(&bad, "step 812/2000\nUnhandled exception: CUDA OOM\n").unwrap();
+        assert!(log_indicates_success(ok.to_str().unwrap()));
+        assert!(!log_indicates_success(bad.to_str().unwrap()));
+        let _ = std::fs::remove_file(&ok);
+        let _ = std::fs::remove_file(&bad);
+    }
+
+    #[test]
+    fn pid_liveness_predicate() {
+        // a pid that cannot be alive
+        assert!(!pid_is_trainer(4_000_000_000, "serenity_krea2_live_trainer"));
+        // a real live child whose cmdline names the "binary" basename
+        let child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = child.id();
+        std::thread::sleep(Duration::from_millis(150)); // let fork->exec populate /proc/<pid>/cmdline
+        assert!(pid_is_trainer(pid, "/usr/bin/sleep"));
+        unsafe { libc_kill(pid as i32, 9) };
+    }
 }
