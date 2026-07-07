@@ -61,11 +61,16 @@ from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.tensor_view import from_parts
 
 from serenitymojo.models.sd35.weights import load_sd35_stack_base
+# DEVICE-RESIDENT stack (MJ-1069 rung 3): activations on GPU across the 38
+# blocks, recompute-in-backward (input tapes only). False = host oracle.
+comptime SD35_DEVICE_STACK = True
+
 from serenitymojo.models.sd35.sd35_stack_lora import (
     SD35LoraSet, SD35LoraGradSet, SD35StackBase,
     build_sd35_lora_set, sd35_lora_adamw_step,
     save_sd35_lora, save_sd35_lora_state, total_adapters,
     sd35_stack_lora_forward_offload, sd35_stack_lora_backward_offload,
+    sd35_stack_lora_forward_offload_device, sd35_stack_lora_backward_offload_device,
     SD35_DIRECT_24_GIB,
     empty_sd35_direct_dora_set, empty_sd35_direct_oft_set,
     sd35_direct_dense_carrier_bytes,
@@ -1163,39 +1168,63 @@ def main() raises:
                 print("[SD35-oft] save step=", k, " path=", save_path_o)
             continue
 
-        # ── forward (offload, full depth) -> velocity [N_IMG, OUT_CH] ──
+        # ── forward+loss+backward (DEVICE arm default, MJ-1069 rung 3; host
+        # arm retained as the small-scale oracle — SD35_DEVICE_STACK=False) ──
         # sd3.5-large block 37 context stream is pre_only IN THE FILE (qkv only,
         # no proj/mlp — verified from the safetensors header 2026-07-04).
-        var fwd = sd35_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
-            noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
-            base, loader, lora,
-            D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
-            EPS, QK_EPS, ctx,
-            last_ctx_preonly=True,
-        )
-
-        # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
-        var nout = len(fwd.out)
-        var d_loss = List[Float32]()
-        var sse = 0.0
-        var inv_n = Float32(2.0) / Float32(nout)
-        for i in range(nout):
-            var diff = fwd.out[i] - target[i]
-            sse += Float64(diff) * Float64(diff)
-            d_loss.append(inv_n * diff)
-        var loss = Float32(sse / Float64(nout))
+        var loss: Float32
+        var grads: SD35LoraGradSet
+        comptime if SD35_DEVICE_STACK:
+            var fwd = sd35_stack_lora_forward_offload_device[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
+                base, loader, lora,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                EPS, QK_EPS, ctx,
+                last_ctx_preonly=True,
+            )
+            var nout = len(fwd.out)
+            var d_loss = List[Float32]()
+            var sse = 0.0
+            var inv_n = Float32(2.0) / Float32(nout)
+            for i in range(nout):
+                var diff = fwd.out[i] - target[i]
+                sse += Float64(diff) * Float64(diff)
+                d_loss.append(inv_n * diff)
+            loss = Float32(sse / Float64(nout))
+            grads = sd35_stack_lora_backward_offload_device[H, Dh, N_IMG, N_TXT, S](
+                d_loss, noisy.copy(), txt_tokens.copy(),
+                base, loader, lora, fwd,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                EPS, QK_EPS, ctx,
+                last_ctx_preonly=True,
+            )
+        else:
+            var fwd = sd35_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
+                noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
+                base, loader, lora,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                EPS, QK_EPS, ctx,
+                last_ctx_preonly=True,
+            )
+            var nout = len(fwd.out)
+            var d_loss = List[Float32]()
+            var sse = 0.0
+            var inv_n = Float32(2.0) / Float32(nout)
+            for i in range(nout):
+                var diff = fwd.out[i] - target[i]
+                sse += Float64(diff) * Float64(diff)
+                d_loss.append(inv_n * diff)
+            loss = Float32(sse / Float64(nout))
+            grads = sd35_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
+                d_loss, noisy.copy(), txt_tokens.copy(),
+                base, loader, lora, fwd,
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                EPS, QK_EPS, ctx,
+                last_ctx_preonly=True,
+            )
         if k == 1:
             first_loss = loss
         last_loss = loss
-
-        # ── backward (offload, full depth) ──
-        var grads = sd35_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
-            d_loss, noisy.copy(), txt_tokens.copy(),
-            base, loader, lora, fwd,
-            D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
-            EPS, QK_EPS, ctx,
-            last_ctx_preonly=True,
-        )
 
         # ── gradient accumulation (OneTrainer semantics; default-off when N==1) ─
         # Fast path: accum_steps==1 uses `grads` directly (no zero-clone/copy).
