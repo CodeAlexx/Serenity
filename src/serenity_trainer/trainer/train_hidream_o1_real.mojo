@@ -189,6 +189,9 @@ from serenitymojo.training.lora_ema import (
 from serenitymojo.training.grad_accum import (
     accumulate_grad_group, scale_grad_group, zeros_like_group,
 )
+from serenitymojo.training.trainer_core import (
+    trainer_resolve_resume_path, trainer_warn_warm_resume,
+)
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.flat_lycoris_stack import (
     FlatLoKrSet, empty_flat_lokr_set, build_flat_lokr_set,
@@ -442,27 +445,18 @@ def _hidream_head_prefixes() raises -> List[String]:
 # adapter views (ZImageLoraAdapterDevice sub-buffers of opt_state.dev_p) are
 # untouched. Scale is 1.0 (the HiDream LoraAdapter build scale).
 def _hidream_resolve_resume_path(path: String) raises -> String:
+    # Thin wrapper → shared trainer_core (binds hidream's first-adapter probe
+    # prefix; keeps krea2's default `.state` sidecar naming). Probe order + return
+    # logic are the trainer_core skeleton, byte-identical to the pre-extraction path.
     var probe = _hidream_block_prefixes()[0]
-    if lora_train_state_has_moments(path, probe):
-        return path
-    var sib = path + String(".state")
-    if lora_train_state_has_moments(sib, probe):
-        return sib
-    return path
+    return trainer_resolve_resume_path(path, probe)
 
 
 def _hidream_warn_warm_resume(path: String):
-    print("")
-    print("  ============================================================")
-    print("  [hidream-resume] !! WARM RESUME — AdamW moments RESTART at zero !!")
-    print("  path:", path)
-    print("  No FULL `.state` (A/B + adam_m/adam_v) was found for this checkpoint.")
-    print("  The optimizer's first/second moments reset to zero, so training does")
-    print("  NOT continue on the same trajectory as an uninterrupted run — the")
-    print("  first resumed steps take large, under-damped AdamW updates.")
-    print("  To FULL-resume, pass the `<ckpt>.safetensors.state` sidecar instead.")
-    print("  ============================================================")
-    print("")
+    # Thin wrapper → shared trainer_core (binds the hidream log tag; keeps krea2's
+    # default `.safetensors.state` FULL-resume sidecar hint). Every banner line is
+    # byte-identical to the pre-extraction hidream output.
+    trainer_warn_warm_resume(String("hidream"), path)
 
 
 def _hidream_load_state_into(

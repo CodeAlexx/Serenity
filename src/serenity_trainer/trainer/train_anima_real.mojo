@@ -129,9 +129,7 @@ from serenitymojo.training.train_config import (
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
-from serenitymojo.training.grad_accum import (
-    accumulate_grad_group, scale_grad_group, zeros_like_group,
-)
+from serenitymojo.training.trainer_core import GradAccumWindow
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -1136,9 +1134,10 @@ def main() raises:
             "train_anima_real: batch_size=2 (TRUE batch-2) with grad_accum_steps>1"
             " is not wired — use one or the other (batch_size=1 for accumulation)"
         )
-    var acc_da = List[List[Float32]]()
-    var acc_db = List[List[Float32]]()
-    var micro_in_window = 0
+    # window buffers + micro counter live in the shared trainer_core struct (wraps
+    # the grad_accum.mojo SUM/MEAN primitives). accum_steps==1 => every step is a
+    # boundary => byte-identical to the per-step path.
+    var accum_window = GradAccumWindow(accum_steps)
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
@@ -1299,13 +1298,14 @@ def main() raises:
             # boundary MEAN (÷window) into `grads` and fall through to the UNCHANGED
             # clip+AdamW path below. N==1 => every step is a boundary (byte-identical).
             if use_grad_accum:
-                if micro_in_window == 0:
-                    acc_da = zeros_like_group(grads.d_a)
-                    acc_db = zeros_like_group(grads.d_b)
-                accumulate_grad_group(acc_da, grads.d_a)
-                accumulate_grad_group(acc_db, grads.d_b)
-                micro_in_window += 1
-                var is_boundary = micro_in_window >= accum_steps or step == run_steps - 1
+                # Treat this loop iteration as one micro-step: SUM its LoRA grad
+                # groups into the shared trainer_core window; on a non-boundary
+                # micro-step print progress and skip clip/AdamW/save; on the boundary
+                # MEAN (÷N) back into `grads` before clip+AdamW. The window math lives
+                # in trainer_core.GradAccumWindow (byte-op-identical to the prior
+                # inline block); the boundary control flow (progress print + continue)
+                # stays here. step == run_steps - 1 force-flushes the tail window.
+                var is_boundary = accum_window.accumulate(grads.d_a, grads.d_b, step == run_steps - 1)
                 if not is_boundary:
                     var mid_now = perf_counter_ns()
                     print_trainer_progress(
@@ -1315,13 +1315,10 @@ def main() raises:
                         Float64(mid_now - t0) / 1.0e9,
                     )
                     continue
-                var inv_micro = Float32(1.0) / Float32(micro_in_window)
-                scale_grad_group(acc_da, inv_micro)
-                scale_grad_group(acc_db, inv_micro)
-                for i in range(len(grads.d_a)):
-                    grads.d_a[i] = acc_da[i].copy()
-                    grads.d_b[i] = acc_db[i].copy()
-                micro_in_window = 0
+                # boundary: MEAN the window back into grads' groups. The norm is
+                # recomputed by _global_norm below from the meaned grads, so
+                # finalize_mean's returned norm is discarded (behavior-identical).
+                _ = accum_window.finalize_mean(grads.d_a, grads.d_b)
 
         # ── global-norm clip (1.0) then AdamW over all adapters ──
         var gn_before = _global_norm(grads)
