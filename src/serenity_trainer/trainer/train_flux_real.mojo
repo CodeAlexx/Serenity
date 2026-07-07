@@ -154,9 +154,7 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
-from serenitymojo.training.grad_accum import (
-    accumulate_grad_group, scale_grad_group, zeros_like_group,
-)
+from serenitymojo.training.trainer_core import GradAccumWindow
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
@@ -1105,11 +1103,12 @@ def main() raises:
             "Flux trainer: batch_size==2 and grad_accum_steps>1 are mutually "
             + "exclusive (both are the same 2× mean); pick one."
         )
-    var acc_d_a = List[List[Float32]]()
-    var acc_d_b = List[List[Float32]]()
-    var acc_st_d_a = List[List[Float32]]()
-    var acc_st_d_b = List[List[Float32]]()
-    var micro_in_window = 0
+    # window buffers + micro counter live in the shared trainer_core struct (wraps
+    # the grad_accum.mojo SUM/MEAN primitives). Flux uses the two-pair variant: the
+    # first pair carries the block d_a/d_b groups, the second the stack st_d_a/st_d_b
+    # groups. accum_steps==1 => every step is a boundary => byte-identical to the
+    # per-step path.
+    var accum_window = GradAccumWindow(accum_steps)
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
@@ -1445,21 +1444,17 @@ def main() raises:
         # Fast path: accum_steps==1 uses `grads` directly (no zero-clone/copy).
         if use_grad_accum:
             # Treat this loop iteration as one micro-step: SUM its four LoRA grad
-            # groups (block d_a/d_b + stack st_d_a/st_d_b) into the window buffers;
-            # on the boundary MEAN (÷N) and copy back into `grads` before
-            # clip+AdamW. Empty stack groups (stack LoRA disabled) accumulate as
-            # no-ops.
-            if micro_in_window == 0:
-                acc_d_a = zeros_like_group(grads.d_a)
-                acc_d_b = zeros_like_group(grads.d_b)
-                acc_st_d_a = zeros_like_group(grads.st_d_a)
-                acc_st_d_b = zeros_like_group(grads.st_d_b)
-            accumulate_grad_group(acc_d_a, grads.d_a)
-            accumulate_grad_group(acc_d_b, grads.d_b)
-            accumulate_grad_group(acc_st_d_a, grads.st_d_a)
-            accumulate_grad_group(acc_st_d_b, grads.st_d_b)
-            micro_in_window += 1
-            var is_boundary = micro_in_window >= accum_steps or k == run_steps
+            # groups (block d_a/d_b + stack st_d_a/st_d_b) into the shared trainer_core
+            # window (two-pair variant); on a non-boundary micro-step print progress
+            # and skip clip/AdamW/save/sample; on the boundary MEAN (÷N) back into
+            # `grads` before clip+AdamW. The window math lives in
+            # trainer_core.GradAccumWindow (byte-op-identical to the prior inline
+            # block); the boundary control flow (progress print + continue) stays
+            # here. Empty stack groups (stack LoRA disabled) accumulate as no-ops.
+            # k==run_steps force-flushes the tail partial window.
+            var is_boundary = accum_window.accumulate_two_pairs(
+                grads.d_a, grads.d_b, grads.st_d_a, grads.st_d_b, k == run_steps
+            )
             if not is_boundary:
                 # mid-window: skip clip/AdamW/save/sample, keep accumulating.
                 var t1m = perf_counter_ns()
@@ -1470,19 +1465,12 @@ def main() raises:
                     Float64(t1m - train_start) / 1.0e9,
                 )
                 continue
-            # boundary: MEAN the window, then overwrite grads' groups with it.
-            var inv_micro = Float32(1.0) / Float32(micro_in_window)
-            scale_grad_group(acc_d_a, inv_micro)
-            scale_grad_group(acc_d_b, inv_micro)
-            scale_grad_group(acc_st_d_a, inv_micro)
-            scale_grad_group(acc_st_d_b, inv_micro)
-            for i in range(len(grads.d_a)):
-                grads.d_a[i] = acc_d_a[i].copy()
-                grads.d_b[i] = acc_d_b[i].copy()
-            for i in range(len(grads.st_d_a)):
-                grads.st_d_a[i] = acc_st_d_a[i].copy()
-                grads.st_d_b[i] = acc_st_d_b[i].copy()
-            micro_in_window = 0
+            # boundary: MEAN the window (all four groups) back into `grads`. The norm
+            # is recomputed by _clip below from the meaned grads (block+stack global
+            # norm), so this returns none — behavior-identical to the inline block.
+            accum_window.finalize_mean_two_pairs(
+                grads.d_a, grads.d_b, grads.st_d_a, grads.st_d_b
+            )
 
         # ── grad norm + configured clip (block + stack grads, one global norm) ──
         var gn_before = _clip(grads, train_cfg.max_grad_norm)
