@@ -75,7 +75,9 @@ from serenitymojo.models.qwenimage.weights import load_qwen_stack_base, load_qwe
 # blocks (block gate 28/28 max_abs=0.0). False = the host oracle conductors.
 comptime QWEN_DEVICE_STACK = True
 
+from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
 from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
+    qwen_offload_lora_adamw_step_resident, qwen_lora_adamw_state_init,
     QwenLoraSet, QwenLoraGradSet, QwenOffloadBase, QwenOffloadForward,
     build_qwen_lora_set, save_qwen_lora, save_qwen_lora_state,
     qwenimage_stack_lora_forward_offload,
@@ -1089,6 +1091,8 @@ def main() raises:
         print("[cadence] sample-during-training WIRED (legacy cached-caption) -> ", samples_dir,
               " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG, " vae=", sample_vae_dir, ")")
 
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
@@ -1411,8 +1415,18 @@ def main() raises:
             print("[QwenImage-loha] step=", k, " master_grad_norm=", Float32(mnorm),
                   " zero_leg_l1=", qwen_loha_zero_leg_l1(loha_masters))
         else:
-            qwen_offload_lora_adamw_step(
-                lora, grads, optimizer_step, step_lr, ctx,
+            # MJ-1070 close-out: resident fused AdamW (persistent device
+            # P/M/V, ONE-TIME pinned staging) replaces the host scalar loop
+            # the per-step-staging segfault forced us onto.
+            if not adamw_state_ready:
+                adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+                    qwen_lora_adamw_state_init(lora, ctx)
+                )
+                adamw_state_ready = True
+                print("[qwen-adamw] resident fused state initialized (",
+                      len(lora.dbl), "adapters )")
+            qwen_offload_lora_adamw_step_resident(
+                adamw_dev_state.value(), lora, grads, optimizer_step, step_lr, ctx,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
             )
 

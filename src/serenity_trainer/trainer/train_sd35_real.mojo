@@ -65,7 +65,9 @@ from serenitymojo.models.sd35.weights import load_sd35_stack_base
 # blocks, recompute-in-backward (input tapes only). False = host oracle.
 comptime SD35_DEVICE_STACK = True
 
+from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
 from serenitymojo.models.sd35.sd35_stack_lora import (
+    sd35_lora_adamw_step_resident, sd35_lora_adamw_state_init,
     SD35LoraSet, SD35LoraGradSet, SD35StackBase,
     build_sd35_lora_set, sd35_lora_adamw_step,
     save_sd35_lora, save_sd35_lora_state, total_adapters,
@@ -979,6 +981,8 @@ def main() raises:
     var output_lora_path = sd35_output_lora_path_from_train_config(train_cfg, run_steps)
     _mkdir_parent(output_lora_path)
 
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
@@ -1293,8 +1297,19 @@ def main() raises:
             print("[SD35-loha] step=", k, " master_grad_norm=", Float32(mnorm),
                   " zero_leg_l1=", sd35_loha_zero_leg_l1(loha_masters))
         else:
-            sd35_lora_adamw_step(
-                lora, grads, optimizer_step, step_lr, ctx,
+            # MJ-1085: resident fused AdamW — persistent device P/M/V with
+            # ONE-TIME pinned staging (init lazily after resume load); the
+            # per-step fused arm segfaulted here (MJ-1070 unmapped-staging
+            # mechanism) and stays retired.
+            if not adamw_state_ready:
+                adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+                    sd35_lora_adamw_state_init(lora, ctx)
+                )
+                adamw_state_ready = True
+                print("[sd35-adamw] resident fused state initialized (",
+                      len(lora.ad), "adapters )")
+            sd35_lora_adamw_step_resident(
+                adamw_dev_state.value(), lora, grads, optimizer_step, step_lr, ctx,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay,
             )
