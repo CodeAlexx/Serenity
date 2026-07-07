@@ -916,7 +916,14 @@ def main() raises:
         lora = build_flux_lora_set(NUM_DOUBLE, NUM_SINGLE, D, FMLP, RANK, ALPHA)
         n_adapters = total_adapters(lora)
     var stack_lora = empty_flux_stack_lora_set(NUM_DOUBLE, NUM_SINGLE, RANK)
-    if not lycoris_active:
+    # FLUX_B2_BLOCK_ONLY=1 (gate arm): skip the stack-level adapters so the
+    # b2 path (block-projection LoRA only this wave) can run its MJ-1073
+    # loss-parity gate. Production b2 + stack LoRA = recorded follow-up.
+    var b2_block_only = _env_is_set(String("FLUX_B2_BLOCK_ONLY"))
+    if b2_block_only:
+        print("[flux-b2-gate] FLUX_B2_BLOCK_ONLY=1: stack-level LoRA DISABLED",
+              "(block-projection adapters only; gate arm)")
+    if not lycoris_active and not b2_block_only:
         stack_lora = build_flux_stack_lora_set(
             NUM_DOUBLE, NUM_SINGLE, D, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, True, RANK, ALPHA
         )
