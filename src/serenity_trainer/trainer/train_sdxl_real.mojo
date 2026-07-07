@@ -151,6 +151,10 @@ comptime TE2_CTX = 1280         # TE2 (CLIP-G) feature channels [768:2048)
 comptime POOLED_DIM = 1280      # pooled (TE2) -> y[0:1280)
 
 # ── resolution knob (latent spatial; 64 = 512px). Default small for the smoke. ──
+# 2026-07-06 audit item 5 ATTEMPTED: LATENT_HW=128 (1024px inline samples)
+# builds clean but the binary dies SIGILL at load (21s, before step 1) —
+# comptime-instantiation class, needs its own investigation. Reverted to the
+# working 128px smoke sampler; webui preset ships sample_every=0 meanwhile.
 comptime LATENT_HW = 16
 
 # ── recipe (train_sdxl.rs preset) ─────────────────────────────────────────────

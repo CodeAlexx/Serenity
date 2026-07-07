@@ -252,17 +252,22 @@
       "id": "sd35",
       "label": "SD 3.5",
       "backend": "sd35",
-      "wired": false,
-      "argv_shape": "none",
-      "binary": "",
-      "base_config": "",
+      "wired": true,
+      "argv_shape": "config_runner",
+      "binary": "target/serenity_sd35_live_trainer",
+      "base_config": "/home/alex/mojodiffusion/serenitymojo/configs/sd35.json",
       "checkpoint": "",
-      "cache": "",
+      "cache": "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_sd35_512_smoke",
       "run_name": "sd35",
       "workspace_dir": "",
       "save_filename_prefix": "sd35",
-      "recipe": {},
-      "_unwired_note": "FROZEN by user mandate \u2014 fail-loud route, matches Mojo UI behavior (UI_MAP \u00a78.7)"
+      "recipe": {
+        "quantized_resident": "fp8_e4m3",
+        "cache_dir": "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_sd35_512_smoke",
+        "sample_every": 0
+      },
+      "_unwired_note": "FROZEN by user mandate \u2014 fail-loud route, matches Mojo UI behavior (UI_MAP \u00a78.7)",
+      "_note": "sd3.5-LARGE device stack (MJ-1069 closed 2026-07-06): fp8-resident, ~7.8s/step at 1024^2, flash attention; inline sampler not yet wired for Large -> sample_every=0"
     },
     {
       "id": "ltx2",

@@ -1425,10 +1425,12 @@ def main() raises:
                 adamw_state_ready = True
                 print("[qwen-adamw] resident fused state initialized (",
                       len(lora.dbl), "adapters )")
+            var _ot0 = perf_counter_ns()
             qwen_offload_lora_adamw_step_resident(
                 adamw_dev_state.value(), lora, grads, optimizer_step, step_lr, ctx,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
             )
+            print("[qwen-opt-ms]", Float64(perf_counter_ns() - _ot0) / 1.0e6)
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
