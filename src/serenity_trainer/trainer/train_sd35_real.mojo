@@ -79,6 +79,7 @@ from serenitymojo.models.sd35.sd35_stack_lora import (
     save_sd35_lora_state_with_meta, load_sd35_lora_state, load_sd35_lora_resume,
     sd35_stack_lora_forward_offload, sd35_stack_lora_backward_offload,
     sd35_stack_lora_forward_offload_device, sd35_stack_lora_backward_offload_device,
+    sd35_stack_lora_forward_offload_device_b2, sd35_stack_lora_backward_offload_device_b2,
     SD35_DIRECT_24_GIB,
     empty_sd35_direct_dora_set, empty_sd35_direct_oft_set,
     sd35_direct_dense_carrier_bytes,
@@ -1044,6 +1045,30 @@ def main() raises:
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
+    # ── TRUE batch-2 (row-stacked device stack): 2 samples/step -> mean gradient.
+    #    Fenced to PLAIN LoRA + device stack + accum=1 (mirrors the fleet pattern,
+    #    chroma/qwen). Each per-sample d_out is 0.5-scaled so the b2 backward's
+    #    in-GEMM LoRA sum = mean(g0, g1) = the 2-sample batch grad; loss=0.5*(L0+L1).
+    var use_b2 = train_cfg.batch_size == 2
+    if train_cfg.batch_size < 1 or train_cfg.batch_size > 2:
+        raise Error(
+            "SD3.5 trainer: only batch_size 1 or 2 supported (TRUE batch-2 max); got "
+            + String(train_cfg.batch_size)
+        )
+    if use_b2:
+        if lokr_active or loha_active or dora_active or oft_active:
+            raise Error(
+                "SD3.5 trainer: batch_size=2 (TRUE batch-2) is wired for PLAIN LoRA "
+                "only — not the LyCORIS/DoRA/OFT arms. Use adapter_algo=0."
+            )
+        if use_grad_accum:
+            raise Error(
+                "SD3.5 trainer: batch_size=2 + grad_accum_steps>1 not wired — "
+                "batch_size=2 IS a 2-sample batch; set grad_accum_steps=1."
+            )
+        print("  TRUE batch-2 (row-stacked device stack): 2 samples/step,",
+              "0.5-scaled per-sample d_out -> mean gradient")
+
     # ── optional resume (plain-LoRA arm only): reload A/B (+ AdamW moments if a
     # FULL `.state` exists) BEFORE the loop so the lazy resident-AdamW init
     # (sd35_lora_adamw_state_init) seeds dev_m/dev_v from the restored moments —
@@ -1230,30 +1255,102 @@ def main() raises:
         var loss: Float32
         var grads: SD35LoraGradSet
         comptime if SD35_DEVICE_STACK:
-            var fwd = sd35_stack_lora_forward_offload_device[H, Dh, N_IMG, N_TXT, S](
-                noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
-                base, loader, lora,
-                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
-                EPS, QK_EPS, ctx,
-                last_ctx_preonly=True,
-            )
-            var nout = len(fwd.out)
-            var d_loss = List[Float32]()
-            var sse = 0.0
-            var inv_n = Float32(2.0) / Float32(nout)
-            for i in range(nout):
-                var diff = fwd.out[i] - target[i]
-                sse += Float64(diff) * Float64(diff)
-                d_loss.append(inv_n * diff)
-            loss = Float32(sse / Float64(nout))
-            grads = sd35_stack_lora_backward_offload_device[H, Dh, N_IMG, N_TXT, S](
-                d_loss, noisy.copy(), txt_tokens.copy(),
-                base, loader, lora, fwd,
-                D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
-                EPS, QK_EPS, ctx,
-                last_ctx_preonly=True,
-            )
+            if use_b2:
+                # ── TRUE batch-2: sample-0 is prepped above; prep sample-1 (its
+                #    own cache slot + noise/sigma stream), then run the row-stacked
+                #    b2 device stack. Each per-sample d_out is 0.5-scaled so the b2
+                #    backward's in-GEMM LoRA sum = mean(g0, g1) = the 2-sample
+                #    batch grad; loss = 0.5*(L0 + L1). ──
+                var slot1 = 0 if FIXED_SIGMA_SMOKE else (k % len(files))
+                var step_seed1 = UInt64(2) if FIXED_SIGMA_SMOKE else (UInt64(k) + UInt64(7000003))
+                var st1 = SafeTensors.open(files[slot1])
+                var latent_tensor1 = _load_cache_preferred(
+                    st1, String("latent_image"), String("latent"), ctx
+                )
+                var latent_raw1 = _cache_tensor_to_stack_f32(latent_tensor1, ctx)
+                var txt_tokens1 = _stage_sd35_context_for_stack(st1, ctx)
+                var pooled_h1 = _stage_sd35_pooled_for_stack(st1, ctx)
+                var latent_scaled_chw1 = List[Float32]()
+                for i in range(LAT_C * LAT_H * LAT_W):
+                    latent_scaled_chw1.append((latent_raw1[i] - VAE_SHIFT) * VAE_SCALE)
+                var latent_packed1 = _pack_latents(latent_scaled_chw1)
+                var sigma_idx1: Int
+                if FIXED_SIGMA_SMOKE:
+                    sigma_idx1 = FIXED_SIGMA_IDX
+                else:
+                    var sigma_s1 = sample_timestep_logit_normal(SEED_BASE + step_seed1, TIMESTEP_SHIFT)
+                    sigma_idx1 = Int(sigma_s1 * Float32(NUM_TRAIN_TIMESTEPS))
+                    if sigma_idx1 > NUM_TRAIN_TIMESTEPS - 1:
+                        sigma_idx1 = NUM_TRAIN_TIMESTEPS - 1
+                var sig1 = Float32(sigma_idx1 + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+                var sigma_cont1 = sig1
+                var noise1 = _host_noise(N_IMG * IN_CH, SEED_BASE * UInt64(7919) + step_seed1)
+                var noisy1 = List[Float32]()
+                var target1 = List[Float32]()
+                for i in range(len(latent_packed1)):
+                    noisy1.append(noise1[i] * sig1 + latent_packed1[i] * (Float32(1.0) - sig1))
+                    target1.append(noise1[i] - latent_packed1[i])
+
+                var fwd = sd35_stack_lora_forward_offload_device_b2[H, Dh, N_IMG, N_TXT, S](
+                    noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
+                    noisy1.copy(), txt_tokens1.copy(), pooled_h1.copy(), sigma_cont1,
+                    base, loader, lora,
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                    EPS, QK_EPS, ctx,
+                    last_ctx_preonly=True,
+                )
+                var nout = len(fwd.out0)
+                var inv_n = Float32(2.0) / Float32(nout)
+                var sse0 = 0.0
+                var sse1 = 0.0
+                var d_out0 = List[Float32]()
+                var d_out1 = List[Float32]()
+                for i in range(nout):
+                    var diff0 = fwd.out0[i] - target[i]
+                    var diff1 = fwd.out1[i] - target1[i]
+                    sse0 += Float64(diff0) * Float64(diff0)
+                    sse1 += Float64(diff1) * Float64(diff1)
+                    d_out0.append(Float32(0.5) * inv_n * diff0)
+                    d_out1.append(Float32(0.5) * inv_n * diff1)
+                loss = Float32(0.5) * (Float32(sse0 / Float64(nout)) + Float32(sse1 / Float64(nout)))
+                grads = sd35_stack_lora_backward_offload_device_b2[H, Dh, N_IMG, N_TXT, S](
+                    d_out0, d_out1,
+                    noisy.copy(), txt_tokens.copy(), noisy1.copy(), txt_tokens1.copy(),
+                    base, loader, lora, fwd,
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                    EPS, QK_EPS, ctx,
+                    last_ctx_preonly=True,
+                )
+            else:
+                var fwd = sd35_stack_lora_forward_offload_device[H, Dh, N_IMG, N_TXT, S](
+                    noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
+                    base, loader, lora,
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                    EPS, QK_EPS, ctx,
+                    last_ctx_preonly=True,
+                )
+                var nout = len(fwd.out)
+                var d_loss = List[Float32]()
+                var sse = 0.0
+                var inv_n = Float32(2.0) / Float32(nout)
+                for i in range(nout):
+                    var diff = fwd.out[i] - target[i]
+                    sse += Float64(diff) * Float64(diff)
+                    d_loss.append(inv_n * diff)
+                loss = Float32(sse / Float64(nout))
+                grads = sd35_stack_lora_backward_offload_device[H, Dh, N_IMG, N_TXT, S](
+                    d_loss, noisy.copy(), txt_tokens.copy(),
+                    base, loader, lora, fwd,
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, TIMESTEP_DIM, POOLED_DIM,
+                    EPS, QK_EPS, ctx,
+                    last_ctx_preonly=True,
+                )
         else:
+            if use_b2:
+                raise Error(
+                    "SD3.5 trainer: batch_size=2 (TRUE batch-2) requires the DEVICE"
+                    " stack — compile with SD35_DEVICE_STACK=True."
+                )
             var fwd = sd35_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
                 noisy.copy(), txt_tokens.copy(), pooled_h.copy(), sigma_cont,
                 base, loader, lora,
