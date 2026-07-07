@@ -143,8 +143,8 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
-from serenitymojo.training.grad_accum import (
-    accumulate_grad_group, scale_grad_group, zeros_like_group,
+from serenitymojo.training.trainer_core import (
+    GradAccumWindow, trainer_resolve_resume_path, trainer_warn_warm_resume,
 )
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
@@ -756,28 +756,20 @@ def _sd35_run_sample(
 # writes) so a user who passes the PEFT weights still gets a FULL (moment-
 # preserving) resume; only warm-restart (loud warning) when there is genuinely no
 # moment state. The probe prefix matches _sd35_lora_prefixes[0].
+# Thin wrapper → shared trainer_core (binds sd35's first-adapter probe prefix +
+# sd35's `.state.safetensors` sidecar naming). Probe order + return logic are the
+# trainer_core skeleton; the sidecar-suffix param keeps sd35's sibling name byte-
+# exact while krea2 keeps its default `.state`.
 def _sd35_resolve_resume_path(path: String) raises -> String:
     var probe = String("transformer.joint_blocks.0.context_block.attn.qkv")
-    if lora_train_state_has_moments(path, probe):
-        return path
-    var sib = path + String(".state.safetensors")
-    if lora_train_state_has_moments(sib, probe):
-        return sib
-    return path
+    return trainer_resolve_resume_path(path, probe, String(".state.safetensors"))
 
 
+# Thin wrapper → shared trainer_core (binds the sd35 log tag + sd35's
+# `.state.safetensors` FULL-resume sidecar hint). Every banner line is byte-
+# identical to the pre-extraction sd35 output.
 def _sd35_warn_warm_resume(path: String):
-    print("")
-    print("  ============================================================")
-    print("  [sd35-resume] !! WARM RESUME — AdamW moments RESTART at zero !!")
-    print("  path:", path)
-    print("  No FULL `.state` (A/B + adam_m/adam_v) was found for this checkpoint.")
-    print("  The optimizer's first/second moments reset to zero, so training does")
-    print("  NOT continue on the same trajectory as an uninterrupted run — the")
-    print("  first resumed steps take large, under-damped AdamW updates.")
-    print("  To FULL-resume, pass the `<ckpt>.state.safetensors` sidecar instead.")
-    print("  ============================================================")
-    print("")
+    trainer_warn_warm_resume(String("sd35"), path, String(".state.safetensors"))
 
 
 def main() raises:
@@ -1027,13 +1019,13 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
-    # ── gradient accumulation buffers (OneTrainer micro-batch; default-off == 1) ─
+    # ── gradient accumulation (OneTrainer micro-batch; default-off == 1) ─────────
     # Each loop iteration is one MICRO-step. SUM the two AdamW-fed LoRA grad
     # groups (d_a/d_b) across `accum_steps` micro-steps, then MEAN (÷N) and run
     # clip+AdamW once on accumulation boundaries. accum_steps=1 => every step is a
-    # boundary, mean=÷1 => byte-identical to the per-step path. Buffers lazily
-    # sized per window. (The 3 pre_only dead context slots on block 37 carry zero
-    # grads; accumulating zeros is a no-op — no special-casing.)
+    # boundary, mean=÷1 => byte-identical to the per-step path. (The 3 pre_only
+    # dead context slots on block 37 carry zero grads; accumulating zeros is a
+    # no-op — no special-casing.)
     # Wired for PLAIN LoRA only this wave; LyCORIS arms fail loud (mirrors Klein).
     var accum_steps = train_cfg.grad_accum_steps
     if accum_steps < 1:
@@ -1045,9 +1037,10 @@ def main() raises:
             + "wave; LoKr/LoHa/DoRA/OFT fail loud (mirrors Klein's honest scope). "
             + "Use adapter_algo=0 (plain LoRA) with gradient accumulation."
         )
-    var acc_d_a = List[List[Float32]]()
-    var acc_d_b = List[List[Float32]]()
-    var micro_in_window = 0
+    # window buffers + micro counter live in the shared trainer_core struct (wraps
+    # the grad_accum.mojo SUM/MEAN primitives). accum_steps==1 => every step is a
+    # boundary => byte-identical to the per-step path.
+    var accum_window = GradAccumWindow(accum_steps)
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
@@ -1292,15 +1285,13 @@ def main() raises:
         # Fast path: accum_steps==1 uses `grads` directly (no zero-clone/copy).
         if use_grad_accum:
             # Treat this loop iteration as one micro-step: SUM its LoRA grad groups
-            # into the window buffers; on the boundary MEAN (÷N) and copy back into
-            # `grads` before clip+AdamW.
-            if micro_in_window == 0:
-                acc_d_a = zeros_like_group(grads.d_a)
-                acc_d_b = zeros_like_group(grads.d_b)
-            accumulate_grad_group(acc_d_a, grads.d_a)
-            accumulate_grad_group(acc_d_b, grads.d_b)
-            micro_in_window += 1
-            var is_boundary = micro_in_window >= accum_steps or k == run_steps
+            # into the shared trainer_core window; on a non-boundary micro-step print
+            # progress and skip clip/AdamW/save/sample; on the boundary MEAN (÷N)
+            # back into `grads` before clip+AdamW. The window math lives in
+            # trainer_core.GradAccumWindow (byte-op-identical to the prior inline
+            # block); the boundary control flow (progress print + continue) stays
+            # here. k==run_steps force-flushes the tail partial window.
+            var is_boundary = accum_window.accumulate(grads.d_a, grads.d_b, k == run_steps)
             if not is_boundary:
                 # mid-window: skip clip/AdamW/save/sample, keep accumulating.
                 var t1m = perf_counter_ns()
@@ -1311,14 +1302,10 @@ def main() raises:
                     Float64(t1m - train_start) / 1.0e9,
                 )
                 continue
-            # boundary: MEAN the window, then overwrite grads' groups with it.
-            var inv_micro = Float32(1.0) / Float32(micro_in_window)
-            scale_grad_group(acc_d_a, inv_micro)
-            scale_grad_group(acc_d_b, inv_micro)
-            for i in range(len(grads.d_a)):
-                grads.d_a[i] = acc_d_a[i].copy()
-                grads.d_b[i] = acc_d_b[i].copy()
-            micro_in_window = 0
+            # boundary: MEAN the window back into grads' groups. The norm is
+            # recomputed by _clip below from the meaned grads, so finalize_mean's
+            # returned norm is discarded (behavior-identical to the inline block).
+            _ = accum_window.finalize_mean(grads.d_a, grads.d_b)
 
         # ── grad norm + clip(1.0) ──
         var gn_before = _clip(grads, CLIP_GRAD_NORM)
