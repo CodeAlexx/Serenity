@@ -231,6 +231,18 @@ pub(crate) fn parse_banner(line: &str, run: &mut RunInfo) -> Option<Value> {
         run.last_save = path.clone();
         return Some(json!({"type": "save", "run_id": run.id, "path": path}));
     }
+    // save — OT-family periodic shape: "[<M>-lora] save_state step= N  path= <p>"
+    // (chroma/sd35/anima/... use ot_step_lora_path; measured: chroma emits no
+    // "[save] wrote" — this shape is their only per-save line.)
+    if line.contains("save_state step=") && line.contains("path=") {
+        let mut path = after("path=").unwrap_or_default();
+        if let Some(i) = path.find(".state.safetensors") {
+            path.truncate(i); // badge shows the checkpoint, not the sidecar
+        }
+        let path = path.trim().to_string();
+        run.last_save = path.clone();
+        return Some(json!({"type": "save", "run_id": run.id, "path": path}));
+    }
     // klein PROG_STAGE step=<k> ... phase=<phase> — emit only on phase change
     if line.contains("PROG_STAGE step=") {
         let phase = line
