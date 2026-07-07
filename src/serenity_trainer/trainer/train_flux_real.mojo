@@ -81,6 +81,7 @@ from serenitymojo.models.flux.flux_stack_lora import (
     flux_stack_lora_forward_offload_full, flux_stack_lora_backward_offload_full,
     flux_stack_lora_forward_device_offload_full, flux_stack_lora_backward_device_offload_full,
     flux_stack_lora_forward_offload_full_b2, flux_stack_lora_backward_offload_full_b2,
+    flux_stack_lora_forward_device_offload_full_b2, flux_stack_lora_backward_device_offload_full_b2,
     build_flux_direct_dora_set_from_offload, build_flux_direct_oft_set_for_stack,
     flux_stack_direct_dora_forward_offload, flux_stack_direct_dora_backward_offload,
     flux_stack_direct_oft_forward_offload, flux_stack_direct_oft_backward_offload,
@@ -932,14 +933,17 @@ def main() raises:
         lora = build_flux_lora_set(NUM_DOUBLE, NUM_SINGLE, D, FMLP, RANK, ALPHA)
         n_adapters = total_adapters(lora)
     var stack_lora = empty_flux_stack_lora_set(NUM_DOUBLE, NUM_SINGLE, RANK)
-    # FLUX_B2_BLOCK_ONLY=1 (gate arm): skip the stack-level adapters so the
-    # b2 path (block-projection LoRA only this wave) can run its MJ-1073
-    # loss-parity gate. Production b2 + stack LoRA = recorded follow-up.
+    # TRUE batch-2 (batch_size==2) is BLOCK-PROJECTION LoRA ONLY this wave (the
+    # [2,D] adaLN param/gate grads are unsupported for B>1) — so stack-level LoRA
+    # is disabled for it regardless of FLUX_B2_BLOCK_ONLY. FLUX_B2_BLOCK_ONLY is
+    # now the DEPRECATED escape hatch that ALSO routes the legacy HOST b2 arm
+    # (~252s/step) instead of the device b2 arm (see the loop body).
     var b2_block_only = _env_is_set(String("FLUX_B2_BLOCK_ONLY"))
+    var want_b2 = train_cfg.batch_size == 2
     if b2_block_only:
-        print("[flux-b2-gate] FLUX_B2_BLOCK_ONLY=1: stack-level LoRA DISABLED",
-              "(block-projection adapters only; gate arm)")
-    if not lycoris_active and not b2_block_only:
+        print("[flux-b2] FLUX_B2_BLOCK_ONLY=1: stack-level LoRA DISABLED",
+              "+ legacy HOST b2 arm selected (deprecated escape hatch)")
+    if not lycoris_active and not b2_block_only and not want_b2:
         stack_lora = build_flux_stack_lora_set(
             NUM_DOUBLE, NUM_SINGLE, D, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, True, RANK, ALPHA
         )
@@ -1120,6 +1124,11 @@ def main() raises:
         raise Error(
             "Flux trainer: batch_size==2 and grad_accum_steps>1 are mutually "
             + "exclusive (both are the same 2× mean); pick one."
+        )
+    if use_b2 and train_cfg.ema_enabled:
+        raise Error(
+            "Flux trainer: batch_size==2 (row-stacked b2) + EMA not wired "
+            + "this wave; disable ema (ema_enabled=false)."
         )
     # window buffers + micro counter live in the shared trainer_core struct (wraps
     # the grad_accum.mojo SUM/MEAN primitives). Flux uses the two-pair variant: the
@@ -1381,31 +1390,68 @@ def main() raises:
                 noisy1.append(noise1[i] * sig1 + latent_packed1[i] * (Float32(1.0) - sig1))
                 target1.append(noise1[i] - latent_packed1[i])
 
-            var fwd2 = flux_stack_lora_forward_offload_full_b2[H, Dh, N_IMG, N_TXT, S](
-                noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
-                noisy1.copy(), txt_tokens1.copy(), timestep1.copy(), guidance, clip_pool1.copy(),
-                base, loader, lora, cos.copy(), sin.copy(),
-                D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
-            )
-            # JOINT 2N-mean MSE over the stacked [target0 | target1].
-            var target_st = List[Float32]()
-            for i in range(len(target)):
-                target_st.append(target[i])
-            for i in range(len(target1)):
-                target_st.append(target1[i])
-            var nout2 = len(fwd2.out)
-            var d_loss2 = List[Float32]()
-            var sse2 = 0.0
-            var inv_n2 = Float32(2.0) / Float32(nout2)
-            for i in range(nout2):
-                var diff = fwd2.out[i] - target_st[i]
-                sse2 += Float64(diff) * Float64(diff)
-                d_loss2.append(inv_n2 * diff)
-            loss = Float32(sse2 / Float64(nout2))
-            grads = flux_stack_lora_backward_offload_full_b2[H, Dh, N_IMG, N_TXT, S](
-                d_loss2, base, loader, lora, cos.copy(), sin.copy(), fwd2,
-                D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
-            )
+            # DEFAULT = DEVICE row-stacked b2 (recompute-in-backward; activations
+            # stay on-GPU): per-sample out0/out1, each d_out 0.5-scaled so the b2
+            # backward's in-GEMM sum = mean(g0,g1) = the grad-accum=2 gradient;
+            # loss = 0.5*(L0+L1). FLUX_B2_BLOCK_ONLY=1 selects the DEPRECATED HOST
+            # b2 arm (joint 2N-mean; ~252s/step) as an escape hatch — both are
+            # block-projection LoRA only, so grads exit the SAME FluxLoraGradSet.
+            if not b2_block_only:
+                if k == 1:
+                    print("  [flux-b2] DEVICE row-stacked b2 arm (recompute-in-backward)")
+                var fwd2d = flux_stack_lora_forward_device_offload_full_b2[H, Dh, N_IMG, N_TXT, S](
+                    noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
+                    noisy1.copy(), txt_tokens1.copy(), timestep1.copy(), guidance, clip_pool1.copy(),
+                    base, loader, lora, cos.copy(), sin.copy(),
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+                )
+                var nout = len(fwd2d.out0)
+                var inv_n = Float32(2.0) / Float32(nout)
+                var sse0 = 0.0
+                var sse1 = 0.0
+                var d_out0 = List[Float32]()
+                var d_out1 = List[Float32]()
+                for i in range(nout):
+                    var diff0 = fwd2d.out0[i] - target[i]
+                    var diff1 = fwd2d.out1[i] - target1[i]
+                    sse0 += Float64(diff0) * Float64(diff0)
+                    sse1 += Float64(diff1) * Float64(diff1)
+                    d_out0.append(Float32(0.5) * inv_n * diff0)
+                    d_out1.append(Float32(0.5) * inv_n * diff1)
+                loss = Float32(0.5) * (Float32(sse0 / Float64(nout)) + Float32(sse1 / Float64(nout)))
+                grads = flux_stack_lora_backward_device_offload_full_b2[H, Dh, N_IMG, N_TXT, S](
+                    d_out0, d_out1, base, loader, lora, cos.copy(), sin.copy(), fwd2d,
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+                )
+            else:
+                if k == 1:
+                    print("  [flux-b2] DEPRECATED HOST b2 arm (FLUX_B2_BLOCK_ONLY; ~252s/step)")
+                var fwd2 = flux_stack_lora_forward_offload_full_b2[H, Dh, N_IMG, N_TXT, S](
+                    noisy.copy(), txt_tokens.copy(), timestep.copy(), guidance, clip_pool.copy(),
+                    noisy1.copy(), txt_tokens1.copy(), timestep1.copy(), guidance, clip_pool1.copy(),
+                    base, loader, lora, cos.copy(), sin.copy(),
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+                )
+                # JOINT 2N-mean MSE over the stacked [target0 | target1]
+                # (== per-sample 0.5-scaled: d_loss = (2/2N)*diff = 0.5*(2/N)*diff).
+                var target_st = List[Float32]()
+                for i in range(len(target)):
+                    target_st.append(target[i])
+                for i in range(len(target1)):
+                    target_st.append(target1[i])
+                var nout2 = len(fwd2.out)
+                var d_loss2 = List[Float32]()
+                var sse2 = 0.0
+                var inv_n2 = Float32(2.0) / Float32(nout2)
+                for i in range(nout2):
+                    var diff = fwd2.out[i] - target_st[i]
+                    sse2 += Float64(diff) * Float64(diff)
+                    d_loss2.append(inv_n2 * diff)
+                loss = Float32(sse2 / Float64(nout2))
+                grads = flux_stack_lora_backward_offload_full_b2[H, Dh, N_IMG, N_TXT, S](
+                    d_loss2, base, loader, lora, cos.copy(), sin.copy(), fwd2,
+                    D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+                )
         else:
             # _full path applies BOTH block-projection LoRA (`lora`) and stack-level
             # LoRA (`stack_lora`) — the complete OneTrainer default surface.
@@ -1665,7 +1711,11 @@ def main() raises:
     else:
         print("[lora] stack LoRA-B |.|_1 final =", stack_b_final, " (expect > 0 — trained)")
     var carrier_zero_final = Float64(0.0)
-    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0) and (stack_b_final > 0.0)
+    # b2 trains BLOCK projections only (stack set empty by design — [B,D]
+    # param-grad wall); the stack term applies only when stack adapters exist.
+    var trains = (b_absum_init == 0.0) and (b_absum_final > 0.0) and (
+        stack_b_final > 0.0 or want_b2
+    )
     if lokr_active:
         carrier_zero_final = flux_lokr_zero_leg_l1(lokr_masters)
         trains = carrier_zero_final > carrier_zero_init
