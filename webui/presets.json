@@ -95,7 +95,7 @@
         "max_steps": 2000,
         "save_every": 500,
         "sample_every": 0,
-        "quantized_resident": "off"
+        "quantized_resident": "OFF"
       }
     },
     {
@@ -119,7 +119,7 @@
         "max_steps": 2000,
         "save_every": 500,
         "sample_every": 500,
-        "quantized_resident": "off"
+        "quantized_resident": "OFF"
       }
     },
     {
@@ -144,7 +144,7 @@
         "max_steps": 2000,
         "save_every": 500,
         "sample_every": 0,
-        "quantized_resident": "off"
+        "quantized_resident": "OFF"
       }
     },
     {
@@ -169,7 +169,7 @@
         "max_steps": 2000,
         "save_every": 500,
         "sample_every": 0,
-        "quantized_resident": "off"
+        "quantized_resident": "OFF"
       }
     },
     {
@@ -193,7 +193,7 @@
         "max_steps": 2000,
         "save_every": 500,
         "sample_every": 0,
-        "quantized_resident": "off"
+        "quantized_resident": "OFF"
       },
       "_unwired_note": "WIRED (shape 3) \u2014 dry-run verified; not yet run-gated on GPU"
     },
@@ -243,7 +243,7 @@
         "max_steps": 2000,
         "save_every": 500,
         "sample_every": 0,
-        "quantized_resident": "off"
+        "quantized_resident": "OFF"
       },
       "_unwired_note": "FROZEN by user mandate 2026-07-04 (no sdxl work) \u2014 row kept for completeness",
       "_sampling_note": "inline sampler is a 128x128 comptime binary; 1024 validation renders FAIL LOUD \u2014 sample_every=0 until the sampler arm is rebuilt (unfreeze 2026-07-06)"

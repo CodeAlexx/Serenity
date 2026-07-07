@@ -187,7 +187,7 @@
             <div class="row"><label>Base Model</label><input id="checkpoint"></div>
             <div class="row"><label>VAE (override) <span class="wtag">wired</span></label><input id="vae_override" placeholder="preset default"></div>
             <div class="row"><label>Quantized base <span class="wtag">wired</span></label>
-              <select id="quantized_resident"><option value="off">off (bf16)</option><option value="fp8_e4m3">fp8_e4m3 (device)</option><option value="fp8_e4m3_host">fp8_e4m3_host</option><option value="streamed_base_opt_in">streamed_base_opt_in</option></select></div>
+              <select id="quantized_resident"><option value="OFF">off (bf16)</option><option value="fp8_e4m3">fp8_e4m3 (device)</option><option value="fp8_e4m3_host">fp8_e4m3_host</option><option value="streamed_base_opt_in">streamed_base_opt_in</option></select></div>
           </div>
           <div>
             <div class="row"><label>Destination</label><input id="workspace_dir" disabled></div>
@@ -508,7 +508,7 @@
 
     <!-- RESUME -->
     <div class="sec" id="sec-resume">
-      <div class="panel"><h3>RESUME</h3><div class="sub">FULL resume needs the .state file path — the PEFT path silently warm-resumes (MJ-1077). Wired for krea2 + config-runner shapes.</div>
+      <div class="panel"><h3>RESUME</h3><div class="sub">FULL resume needs the .state file path — the PEFT path silently warm-resumes (MJ-1077). Wired for krea2, klein, zimage, sd35 only; other backends refuse resume with a 400. (sd35 has no start-step slot — its start step is auto-probed from the checkpoint.)</div>
         <div class="row"><label>.state file <span class="wtag">wired</span></label><input id="resume_state" placeholder="/path/to/ckpt.safetensors.state"></div>
         <div class="row"><label>Start step <span class="wtag">wired</span></label><input id="start_step" type="number" placeholder="0"></div>
       </div>
@@ -638,7 +638,7 @@ function buildLaunchBody() {
     if (v !== "" && v !== false) overrides[f] = (el.type === "number") ? parseFloat(v) : v;
   }
   if ($("seed").value !== "") overrides.seed = parseInt($("seed").value);
-  if ($("ema_enabled").checked) { overrides.ema = true; overrides.ema_decay = parseFloat($("ema_decay").value); }
+  if ($("ema_enabled").checked) { overrides.ema_enabled = true; overrides.ema_decay = parseFloat($("ema_decay").value); }
   overrides.optimizer = { optimizer: $("optimizer_name").value, weight_decay: parseFloat($("optimizer_weight_decay").value) };
   const body = { preset_id: $("preset").value, overrides,
                  cache: $("cache").value || null, run_name: $("runname_top").value || null };
@@ -651,7 +651,7 @@ $("startbtn").onclick = async () => {
   const r = await fetch("/api/runs", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
   const j = await r.json();
   if (!r.ok) { $("msg").textContent = "✗ " + j.error; $("valid").textContent = "VALIDATION — " + j.error; return; }
-  RUN = j.run_id; $("msg").textContent = "▶ " + j.tail;
+  RUN = j.run_id; $("msg").textContent = "▶ " + j.tail + ((j.notes && j.notes.length) ? "  ⚠ " + j.notes.join("; ") : "");
   $("statuspill").textContent = "RUNNING"; $("statuspill").style.color = "var(--ok)";
   $("s_status").textContent = "Training"; $("stopbtn").style.display = "inline-block";
   $("log").textContent = "";
@@ -1010,6 +1010,8 @@ function connectSSE() {
       $("statuspill").textContent = m.run.status.toUpperCase();
       $("statuspill").style.color = m.run.status === "failed" ? "var(--bad)" : "var(--dim)";
       $("s_status").textContent = m.run.status;
+      // finding #7: show the actual error line on failure, not just the FAILED pill
+      if (m.run.status === "failed" && m.run.message) $("msg").textContent = "✗ " + m.run.message;
       $("stopbtn").style.display = "none";
       refreshGallery(); refreshRuns();
     }

@@ -425,6 +425,7 @@ fn fresh_runinfo(workspace: &str) -> crate::RunInfo {
         workspace_dir: workspace.to_string(),
         log_path: String::new(),
         status: "running".into(),
+        message: String::new(),
         pid: None,
         step: 0,
         total_steps: 0,

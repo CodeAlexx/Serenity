@@ -58,6 +58,8 @@ struct RunInfo {
     workspace_dir: String,
     log_path: String,
     status: String, // running | exited | stopped | failed
+    #[serde(default)]
+    message: String, // last error line on failure (finding #7) — surfaced in the UI pill/#msg
     pid: Option<u32>,
     // live parsed progress (UI_MAP §5: both line shapes)
     step: u64,
@@ -210,6 +212,31 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         m.insert("workspace_dir".into(), json!(workspace));
         m.insert("save_filename_prefix".into(), json!(run_name));
     }
+    // finding #8: inline sampling during training is not wired for these backends —
+    // their trainers FAIL LOUD when a sample cadence / prompt file is set
+    // (train_sd35_real.mojo:413-469, train_hidream_o1_real.mojo:377-381,
+    // ideogram4 sampler). Strip the sampling triggers here and tell the caller,
+    // rather than launching a run that crashes mid-flight.
+    let mut notes: Vec<String> = vec![];
+    if matches!(p.backend.as_str(), "sd35" | "hidream" | "ideogram4") {
+        if let Value::Object(m) = &mut cfg {
+            if m.get("sample_every").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
+                m.insert("sample_every".into(), json!(0));
+                notes.push(format!(
+                    "sampling disabled: inline sampler not wired for backend {} — sample_every forced to 0",
+                    p.backend
+                ));
+            }
+            for k in ["validation_prompts_file", "sample_definition_file_name"] {
+                if m.remove(k).is_some() {
+                    notes.push(format!(
+                        "removed {k}: inline sampling not supported for backend {}",
+                        p.backend
+                    ));
+                }
+            }
+        }
+    }
     let cache = req.cache.clone().unwrap_or_else(|| p.cache.clone());
     if p.argv_shape == "krea2" && !Path::new(&cache).exists() {
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("cache not found: {cache}")})));
@@ -262,18 +289,41 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         ],
         other => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("argv shape {other} not wired")}))),
     };
+    // finding #1: resume argv order is PER-BACKEND, not per argv-shape. The
+    // config_runner shape is shared by many backends whose trainers parse resume
+    // args in different slots (or not at all), so key the resume append on the
+    // backend and use the verified slot order for each. Backends with NO resume
+    // parse must be REFUSED (a 400) rather than silently launched fresh.
+    //   krea2  train_krea2.mojo:3062-3069     -> [.., resume_path, start_step]
+    //   klein  train_klein_real.mojo:1121-1133 -> [.., start_step, resume_path]
+    //   zimage train_zimage_real.mojo:3161-3168 -> [.., start_step, resume_path]
+    //   sd35   train_sd35_real.mojo:801-807     -> [.., resume_path]  (raises on a
+    //          3rd extra arg; start step is auto-probed from the checkpoint)
     if let Some(state) = &req.resume_state {
-        if p.argv_shape != "krea2" && p.argv_shape != "config_runner" {
-            return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": "resume is wired for krea2/config-runner shapes only"})));
-        }
         if !state.ends_with(".state") && !state.contains(".state.") {
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": "resume_state must be the .state file path (MJ-1077: the PEFT path silently warm-resumes)"})));
         }
-        args.push(state.clone());
-        args.push(req.start_step.unwrap_or(0).to_string());
+        let start_step = req.start_step.unwrap_or(0).to_string();
+        match p.backend.as_str() {
+            "krea2" => {
+                args.push(state.clone());
+                args.push(start_step);
+            }
+            "klein" | "zimage" => {
+                args.push(start_step);
+                args.push(state.clone());
+            }
+            "sd35" => {
+                // sd35 has no start_step slot; a 3rd extra arg makes it fail loud.
+                args.push(state.clone());
+            }
+            other => {
+                return (StatusCode::BAD_REQUEST, Json(json!({"error": format!("backend {other} does not support resume")})));
+            }
+        }
     }
     if req.dry_run {
-        return (StatusCode::OK, Json(json!({"dry_run": true, "binary": p.binary, "args": args, "config_written": cfg_path, "config": cfg})));
+        return (StatusCode::OK, Json(json!({"dry_run": true, "binary": p.binary, "args": args, "config_written": cfg_path, "config": cfg, "notes": notes.clone()})));
     }
     let log_path = format!("{workspace}/train_web.log");
     let log_file = match std::fs::File::create(&log_path) {
@@ -313,6 +363,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         workspace_dir: workspace.clone(),
         log_path: log_path.clone(),
         status: "running".into(),
+        message: String::new(),
         pid,
         step: 0,
         total_steps: steps,
@@ -398,10 +449,32 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
                         }
                     }
                 }
+                // finding #7: on non-zero exit, surface the actual error line
+                // (not just "FAILED"). Scan the log tail for the LAST line naming
+                // an error / unhandled exception so the UI pill/#msg shows it.
+                let mut fail_msg = String::new();
+                if !success {
+                    if let Ok(mut f) = std::fs::File::open(&log_path) {
+                        use std::io::{Read, Seek, SeekFrom};
+                        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+                        let _ = f.seek(SeekFrom::Start(len.saturating_sub(65536)));
+                        let mut raw = Vec::new();
+                        if f.read_to_end(&mut raw).is_ok() {
+                            for line in String::from_utf8_lossy(&raw).lines() {
+                                if line.contains("Error") || line.contains("Unhandled exception") {
+                                    fail_msg = line.trim().to_string();
+                                }
+                            }
+                        }
+                    }
+                }
                 let mut runs = stc.runs.lock().await;
                 if let Some(r) = runs.iter_mut().find(|r| r.id == id) {
                     if r.status == "running" {
                         r.status = if success { "exited".into() } else { "failed".into() };
+                    }
+                    if !fail_msg.is_empty() {
+                        r.message = fail_msg;
                     }
                     append_history(r);
                     board::run_ended(&r.workspace_dir, &r.status);
@@ -412,7 +485,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
     });
-    (StatusCode::OK, Json(json!({"run_id": id, "workspace": workspace, "log": info.log_path, "tail": format!("tail -f {}", info.log_path)})))
+    (StatusCode::OK, Json(json!({"run_id": id, "workspace": workspace, "log": info.log_path, "tail": format!("tail -f {}", info.log_path), "notes": notes})))
 }
 
 async fn stop(State(st): State<Arc<AppState>>, AxPath(id): AxPath<u64>) -> (StatusCode, Json<Value>) {

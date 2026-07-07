@@ -71,7 +71,8 @@ fn gpu_busy() -> Option<String> {
                 .and_then(|m| m.trim().split(' ').next())
                 .and_then(|n| n.parse::<u64>().ok())
                 .map(|mib| mib > 1024)
-                .unwrap_or(false)
+                // match launch()'s guard: unparseable nvidia-smi memory = treat as busy (refuse)
+                .unwrap_or(true)
         })
         .map(|l| l.trim().to_string())
         .collect();
