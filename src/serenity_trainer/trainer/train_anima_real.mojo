@@ -82,7 +82,9 @@ from serenitymojo.models.anima.anima_stack_lora import (
     anima_stack_lora_forward_device_resident_b2, anima_stack_lora_backward_device_resident_b2,
     anima_lora_set_to_device,
     anima_lora_adamw_step, save_anima_lora, save_anima_lora_state,
+    anima_lora_adamw_state_init, anima_lora_adamw_step_resident,
 )
+from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
 from serenitymojo.models.anima.weights import (
     AnimaBlockWeights, load_anima_block_weights_bf16_normf32,
 )
@@ -1073,6 +1075,12 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
+    # ── resident fused-AdamW state (MJ-1070/MJ-1085 crash-class fix). Persistent
+    # device P/M/V + ONE-TIME pinned staging; lazily initialized on first
+    # optimizer use (after any resume load) inside the plain-LoRA arm. ──────────
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
+
     # ── gradient accumulation (OneTrainer; default-off when N==1) ─────────────
     # Each loop iteration is one MICRO-step. SUM the plain-LoRA host grad groups
     # (grads.d_a/d_b) across `accum_steps` micro-steps, MEAN (÷window) on the
@@ -1338,8 +1346,19 @@ def main() raises:
             print("[Anima-oft] step=", completed_step, " master_grad_norm=", Float32(mnorm),
                   " vec_l1=", anima_oft_vec_l1(oft_masters))
         else:
-            anima_lora_adamw_step(
-                lora, grads, optimizer_step, step_lr, ctx,
+            # MJ-1070/MJ-1085: resident fused AdamW — persistent device P/M/V
+            # with ONE-TIME pinned staging (init lazily after resume load); the
+            # per-step fused arm allocated fresh pinned staging every step and
+            # segfaulted on an unmapped buffer under pinned pressure.
+            if not adamw_state_ready:
+                adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+                    anima_lora_adamw_state_init(lora, ctx)
+                )
+                adamw_state_ready = True
+                print("[anima-adamw] resident fused state initialized (",
+                      n_adapters, "adapters )")
+            anima_lora_adamw_step_resident(
+                adamw_dev_state.value(), lora, grads, optimizer_step, step_lr, ctx,
                 cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
             )
 

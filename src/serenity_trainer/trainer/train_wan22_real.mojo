@@ -55,6 +55,7 @@ from serenitymojo.models.wan22.weights import load_wan22_stack_base
 from serenitymojo.models.wan22.wan22_stack_lora import (
     Wan22LoraSet, Wan22LoraGradSet, Wan22StackForward,
     build_wan22_lora_set, wan22_lora_adamw_step, save_wan22_lora,
+    wan22_lora_adamw_state_init, wan22_lora_adamw_step_resident,
     wan22_total_adapters, WAN_SLOTS,
     wan22_stack_lora_forward_offload, wan22_stack_lora_backward_offload,
     build_wan22_direct_dora_set_from_offload,
@@ -68,6 +69,7 @@ from serenitymojo.offload.wan22_plan import build_wan22_14b_block_plan
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import (
     TrainConfig,
@@ -562,6 +564,12 @@ def main() raises:
     var last_loss = Float32(0.0)
     var train_start = perf_counter_ns()
 
+    # MJ-1085: resident fused AdamW (persistent device P/M/V, one-time pinned
+    # staging). The per-step fused arm allocates fresh pinned staging every step
+    # and can hit the MJ-1070 unmapped-buffer segfault under pinned pressure.
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
+
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
         var step_seed = UInt64(1) if FIXED_SIGMA_SMOKE else UInt64(k)
@@ -744,8 +752,15 @@ def main() raises:
                       " zero_leg_l1=", flat_loha_zero_leg_l1(loha_masters))
             else:
                 gn_before = _clip(grads, train_cfg.max_grad_norm)
-                wan22_lora_adamw_step(
-                    lora, grads, k, train_cfg.lr, ctx,
+                if not adamw_state_ready:
+                    adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+                        wan22_lora_adamw_state_init(lora, ctx)
+                    )
+                    adamw_state_ready = True
+                    print("[wan22-adamw] resident fused state initialized (",
+                          wan22_total_adapters(lora), "adapters )")
+                wan22_lora_adamw_step_resident(
+                    adamw_dev_state.value(), lora, grads, k, train_cfg.lr, ctx,
                     train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                     train_cfg.weight_decay,
                 )

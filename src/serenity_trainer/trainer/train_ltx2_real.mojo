@@ -71,7 +71,9 @@ from serenitymojo.models.ltx2.ltx2_stack_lora import (
     LTX2LoraSet, LTX2LoraGradSet, build_ltx2_lora_set, total_ltx2_adapters,
     ltx2_adaln_delta, ltx2_stack_lora_forward_offload,
     ltx2_stack_lora_backward_offload, ltx2_lora_adamw_step, save_ltx2_lora,
+    ltx2_lora_adamw_state_init, ltx2_lora_adamw_step_resident,
 )
+from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
 from serenitymojo.models.dit.ltx2_rope import build_ltx2_rope
 from serenitymojo.offload.ltx2_plan import build_ltx2_block_plan
 from serenitymojo.offload.plan import OffloadConfig
@@ -290,6 +292,12 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
+    # MJ-1085: resident fused AdamW (persistent device P/M/V, one-time pinned
+    # staging). The per-step fused arm allocates fresh pinned staging every step
+    # and can hit the MJ-1070 unmapped-buffer segfault under pinned pressure.
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
+
     var train_start = perf_counter_ns()
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
@@ -362,8 +370,17 @@ def main() raises:
         # ── grad norm + clip(1.0) ──
         var gn_before = _clip(grads, CLIP_GRAD_NORM)
 
-        # ── AdamW ──
-        ltx2_lora_adamw_step(lora, grads, k, LR, ctx)
+        # ── AdamW (resident fused arm; MJ-1085) ──
+        if not adamw_state_ready:
+            adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+                ltx2_lora_adamw_state_init(lora, ctx)
+            )
+            adamw_state_ready = True
+            print("[ltx2-adamw] resident fused state initialized (",
+                  total_ltx2_adapters(lora), "adapters )")
+        ltx2_lora_adamw_step_resident(
+            adamw_dev_state.value(), lora, grads, k, LR, ctx,
+        )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9

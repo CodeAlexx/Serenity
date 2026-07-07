@@ -74,7 +74,9 @@ from serenitymojo.models.chroma.chroma_stack_lora import (
 from serenitymojo.models.flux.flux_stack_lora import (
     FluxLoraSet, FluxLoraGradSet, build_flux_lora_set,
     flux_lora_adamw_step, total_adapters,
+    flux_lora_adamw_state_init, flux_lora_adamw_step_resident,
 )
+from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
 from serenitymojo.models.flux.flux_lycoris_stack import (
     FluxLoKrSet, empty_flux_lokr_set, build_flux_lokr_set,
     flux_lokr_carrier_set, flux_lokr_carrier_total_bytes,
@@ -944,6 +946,13 @@ def main() raises:
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
 
+    # ── resident fused-AdamW state (block adapters; MJ-1070/MJ-1085 crash-class
+    # fix). Reuses flux's block-adapter resident pair (chroma is flux-family).
+    # Persistent device P/M/V + ONE-TIME pinned staging; lazily initialized on
+    # first optimizer use (after any resume load) inside the plain-LoRA arm. ────
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
+
     # ── gradient accumulation buffers (OneTrainer micro-batch; default-off == 1) ─
     # Each loop iteration is one MICRO-step. SUM the two AdamW-fed LoRA grad
     # groups (d_a/d_b) across `accum_steps` micro-steps, then MEAN (÷N) and run
@@ -1253,8 +1262,19 @@ def main() raises:
             print("[Chroma-loha] step=", k, " master_grad_norm=", Float32(mnorm),
                   " zero_leg_l1=", flux_loha_zero_leg_l1(loha_masters))
         else:
-            flux_lora_adamw_step(
-                lora, grads, optimizer_step, step_lr, ctx,
+            # MJ-1070/MJ-1085: resident fused AdamW — persistent device P/M/V
+            # with ONE-TIME pinned staging (init lazily after resume load); the
+            # per-step fused arm segfaulted under the fp8-resident base
+            # (unmapped-staging mechanism) and stays retired.
+            if not adamw_state_ready:
+                adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+                    flux_lora_adamw_state_init(lora, ctx)
+                )
+                adamw_state_ready = True
+                print("[chroma-adamw] resident fused state initialized (",
+                      total_adapters(lora), "adapters )")
+            flux_lora_adamw_step_resident(
+                adamw_dev_state.value(), lora, grads, optimizer_step, step_lr, ctx,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
                 train_cfg.weight_decay,
             )

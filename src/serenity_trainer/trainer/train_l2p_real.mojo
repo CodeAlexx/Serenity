@@ -78,6 +78,8 @@ from serenitymojo.models.zimage.zimage_stack_lora import (
     zimage_stack_lora_forward_main_device_b2_masked,
     zimage_stack_lora_backward_main_device_b2_masked_nofinal,
     zimage_lora_adamw_step_main_only, save_zimage_lora_main_only,
+    zimage_lora_adamw_main_only_state_init,
+    zimage_lora_adamw_step_main_only_resident,
     save_zimage_lora_main_only_state, load_zimage_lora_main_only_state,
     ZIMAGE_DIRECT_24_GIB,
     empty_zimage_direct_dora_set, empty_zimage_direct_oft_set,
@@ -123,6 +125,7 @@ from serenitymojo.models.l2p.local_decoder_train import (
 from serenitymojo.models.dit.zimage_l2p_local_decoder import ZImageL2PLocalDecoderGate
 from serenitymojo.training.klein_dataset import L2PCache
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.training.lora_adamw_plain_fused import LoraAdamWPlainDeviceState
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import (
     TrainConfig,
@@ -391,6 +394,30 @@ struct L2PStepResult(Copyable, Movable):
     var nonfinite: Int
 
 
+def _l2p_step_adamw_resident(
+    mut adamw_dev_state: Optional[LoraAdamWPlainDeviceState],
+    mut adamw_state_ready: Bool,
+    mut lora: ZImageLoraSet, grads: ZImageLoraGrads, t: Int, lr: Float32,
+    beta1: Float32, beta2: Float32, eps: Float32, weight_decay: Float32,
+    ctx: DeviceContext,
+) raises:
+    # MJ-1085: resident fused AdamW (persistent device P/M/V, one-time pinned
+    # staging, lazily initialized on the first optimizer step). Replaces the
+    # per-step fused arm (zimage_lora_adamw_step_main_only, ZIMAGE_FUSED_ADAMW)
+    # whose fresh per-step pinned staging can hit the MJ-1070 unmapped-buffer
+    # segfault under pinned pressure. Params sync back to the host lora.ad mirror
+    # each step, so the next step's zimage_lora_set_to_device upload is correct.
+    if not adamw_state_ready:
+        adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+            zimage_lora_adamw_main_only_state_init(lora, ctx)
+        )
+        adamw_state_ready = True
+    zimage_lora_adamw_step_main_only_resident(
+        adamw_dev_state.value(), lora, grads, t, lr, ctx,
+        beta1, beta2, eps, weight_decay,
+    )
+
+
 def _train_one_step_l2p(
     k: Int,
     run_steps: Int,
@@ -422,6 +449,8 @@ def _train_one_step_l2p(
     mut acc_a: List[List[Float32]],
     mut acc_b: List[List[Float32]],
     mut micro_in_window: Int,
+    mut adamw_dev_state: Optional[LoraAdamWPlainDeviceState],
+    mut adamw_state_ready: Bool,
     train_start_ns: UInt,
     ctx: DeviceContext,
 ) raises -> L2PStepResult:
@@ -747,15 +776,15 @@ def _train_one_step_l2p(
             micro_in_window = 0
             var opt_idx = ((k - 1) // accum_steps) + 1
             gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
-            zimage_lora_adamw_step_main_only(
-                lora, grads, opt_idx, step_lr, ctx, beta1, beta2, optimizer_eps,
-                weight_decay,
+            _l2p_step_adamw_resident(
+                adamw_dev_state, adamw_state_ready, lora, grads, opt_idx, step_lr,
+                beta1, beta2, optimizer_eps, weight_decay, ctx,
             )
         else:
             gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
-            zimage_lora_adamw_step_main_only(
-                lora, grads, k, step_lr, ctx, beta1, beta2, optimizer_eps,
-                weight_decay,
+            _l2p_step_adamw_resident(
+                adamw_dev_state, adamw_state_ready, lora, grads, k, step_lr,
+                beta1, beta2, optimizer_eps, weight_decay, ctx,
             )
     var t_opt = perf_counter_ns()
 
@@ -842,6 +871,8 @@ def _train_one_step_l2p_b2(
     beta2: Float32,
     optimizer_eps: Float32,
     weight_decay: Float32,
+    mut adamw_dev_state: Optional[LoraAdamWPlainDeviceState],
+    mut adamw_state_ready: Bool,
     train_start_ns: UInt,
     ctx: DeviceContext,
 ) raises -> L2PStepResult:
@@ -1060,8 +1091,9 @@ def _train_one_step_l2p_b2(
 
     # ── clip + optimize (main adapters only; one optimizer step per b2 step) ──
     var gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
-    zimage_lora_adamw_step_main_only(
-        lora, grads, k, step_lr, ctx, beta1, beta2, optimizer_eps, weight_decay,
+    _l2p_step_adamw_resident(
+        adamw_dev_state, adamw_state_ready, lora, grads, k, step_lr,
+        beta1, beta2, optimizer_eps, weight_decay, ctx,
     )
     var t_opt = perf_counter_ns()
 
@@ -1314,6 +1346,13 @@ def main() raises:
     var last_loss = Float32(0.0)
     var train_start = perf_counter_ns()
 
+    # MJ-1085: resident fused AdamW state (persistent device P/M/V, one-time
+    # pinned staging). Threaded through both step functions; lazily initialized
+    # on the first optimizer step. The per-step fused arm allocated fresh pinned
+    # staging every step and could hit the MJ-1070 unmapped-buffer segfault.
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
+
     # ── gradient accumulation (OneTrainer; default-off when N==1) ─────────────
     # Each loop iteration is one MICRO-step. The plain-LoRA host arm inside
     # _train_one_step_l2p SUMs grads.d_a/d_b into these caller-owned window buffers
@@ -1374,6 +1413,7 @@ def main() raises:
                 k, run_steps, slot0, slot1, seed0, seed1, cache, aux, dec,
                 nr_blocks, cr_blocks, main_blocks, lora,
                 step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
+                adamw_dev_state, adamw_state_ready,
                 train_start, ctx,
             )
         else:
@@ -1387,6 +1427,7 @@ def main() raises:
                 direct_targets,
                 step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
                 accum_steps, acc_a, acc_b, micro_in_window,
+                adamw_dev_state, adamw_state_ready,
                 train_start, ctx,
             )
         if k == start_step + 1:

@@ -80,6 +80,7 @@ from serenitymojo.models.ernie.ernie_stack_lora import (
     ernie_stack_direct_oft_forward_resident_device,
     ernie_stack_direct_oft_backward_resident_device,
     ernie_lora_adamw_step, save_ernie_lora,
+    ernie_lora_adamw_state_init, ernie_lora_adamw_step_resident,
     save_ernie_lora_state, load_ernie_lora_state,
 )
 from serenitymojo.models.ernie.ernie_lycoris_stack import (
@@ -150,7 +151,9 @@ from serenitymojo.training.onetrainer_train_loop_policy import (
     validate_ot_gradient_checkpointing_policy,
     validate_ot_train_math_policy,
 )
-from serenitymojo.training.lora_adamw_plain_fused import fused_lora_adamw_plain_step
+from serenitymojo.training.lora_adamw_plain_fused import (
+    fused_lora_adamw_plain_step, LoraAdamWPlainDeviceState,
+)
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.grad_accum import (
     accumulate_grad_group, scale_grad_group, zeros_like_group,
@@ -1062,6 +1065,12 @@ def main() raises:
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
+    # ── resident fused-AdamW state (MJ-1070/MJ-1085 crash-class fix). Persistent
+    # device P/M/V + ONE-TIME pinned staging; lazily initialized on first
+    # optimizer use (after any resume load) inside the plain-LoRA GPU arm. ──────
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
+
     for step in range(run_steps):
         var step_t0 = perf_counter()
         # TRUE batch-2: each optimizer step consumes a NON-OVERLAPPING pair
@@ -1343,17 +1352,28 @@ def main() raises:
                       " zero_leg_l1=", ernie_loha_zero_leg_l1(loha_masters))
             else:
                 comptime if ERNIE_GPU_ADAMW:
-                    # GPU fused plain-AdamW over the whole flat adapter list.
+                    # MJ-1070/MJ-1085: RESIDENT fused plain-AdamW over the whole
+                    # flat adapter list — persistent device P/M/V with ONE-TIME
+                    # pinned staging (init lazily after resume load). The retired
+                    # per-step fused arm allocated FRESH pinned staging every step
+                    # and segfaulted on an unmapped buffer under pinned pressure.
                     # grads.d_a/d_b were already global-norm clipped on host by
-                    # _clip_grads above, so clip_scale stays at its 1.0 default.
-                    # Updated params land back in the host lora.ad mirrors —
-                    # the per-step ernie_lora_set_to_device upload (top of this
-                    # branch) is still how the device sees the new weights.
-                    fused_lora_adamw_plain_step(
-                        lora.ad, grads.d_a, grads.d_b, 0, len(lora.ad),
-                        optimizer_step, step_lr,
+                    # _clip_grads above. Updated params land back in the host
+                    # lora.ad mirrors — the per-step ernie_lora_set_to_device
+                    # upload (top of this branch) is still how the device sees
+                    # the new weights.
+                    if not adamw_state_ready:
+                        adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+                            ernie_lora_adamw_state_init(lora, ctx)
+                        )
+                        adamw_state_ready = True
+                        print("[ernie-adamw] resident fused state initialized (",
+                              len(lora.ad), "adapters )")
+                    ernie_lora_adamw_step_resident(
+                        adamw_dev_state.value(), lora, grads,
+                        optimizer_step, step_lr, ctx,
                         train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
-                        train_cfg.weight_decay, ctx,
+                        train_cfg.weight_decay,
                     )
                 else:
                     ernie_lora_adamw_step(
