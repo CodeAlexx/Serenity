@@ -80,6 +80,9 @@ from serenitymojo.training.lora_adamw_plain_fused import (
     lora_adamw_plain_device_state_sync_moments,
 )
 from serenitymojo.training.lora_save import lora_train_state_has_moments
+from serenitymojo.training.trainer_core import (
+    trainer_resolve_resume_path, trainer_warn_warm_resume,
+)
 from serenitymojo.models.dit.ltx2_rope import build_ltx2_rope
 from serenitymojo.offload.ltx2_plan import build_ltx2_block_plan
 from serenitymojo.offload.plan import OffloadConfig
@@ -232,27 +235,18 @@ def _load_host(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List
 # a FULL (moment-preserving) resume; only warm-restart (loud warning) when there is
 # genuinely no moment state. The probe prefix matches _ltx2_lora_prefixes[0].
 def _ltx2_resolve_resume_path(path: String) raises -> String:
+    # Thin wrapper → shared trainer_core (binds ltx2's first-adapter probe prefix;
+    # keeps krea2's default `.state` sidecar naming). Probe order + return logic are
+    # the trainer_core skeleton, byte-identical to the pre-extraction path.
     var probe = String("transformer_blocks.0.attn1.to_q")
-    if lora_train_state_has_moments(path, probe):
-        return path
-    var sib = path + String(".state")
-    if lora_train_state_has_moments(sib, probe):
-        return sib
-    return path
+    return trainer_resolve_resume_path(path, probe)
 
 
 def _ltx2_warn_warm_resume(path: String):
-    print("")
-    print("  ============================================================")
-    print("  [ltx2-resume] !! WARM RESUME — AdamW moments RESTART at zero !!")
-    print("  path:", path)
-    print("  No FULL `.state` (A/B + adam_m/adam_v) was found for this checkpoint.")
-    print("  The optimizer's first/second moments reset to zero, so training does")
-    print("  NOT continue on the same trajectory as an uninterrupted run — the")
-    print("  first resumed steps take large, under-damped AdamW updates.")
-    print("  To FULL-resume, pass the `<ckpt>.safetensors.state` sidecar instead.")
-    print("  ============================================================")
-    print("")
+    # Thin wrapper → shared trainer_core (binds the ltx2 log tag; keeps krea2's
+    # default `.safetensors.state` FULL-resume sidecar hint). Every banner line is
+    # byte-identical to the pre-extraction ltx2 output.
+    trainer_warn_warm_resume(String("ltx2"), path)
 
 
 def main() raises:

@@ -110,9 +110,7 @@ from serenitymojo.training.levers import (
 )
 from serenitymojo.training.noise_modifiers import apply_noise_modifiers_host
 from serenitymojo.training.ema_schedule import ema_decay_at_step, ema_update_host
-from serenitymojo.training.grad_accum import (
-    accumulate_grad_group, scale_grad_group, zeros_like_group,
-)
+from serenitymojo.training.trainer_core import GradAccumWindow
 from serenitymojo.training.validation_sampler import load_caps
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.sample_prompt_config import (
@@ -1734,11 +1732,12 @@ def main() raises:
     if accum_steps < 1:
         accum_steps = 1
     var use_grad_accum = accum_steps > 1
-    var acc_dbl_a = List[List[Float32]]()
-    var acc_dbl_b = List[List[Float32]]()
-    var acc_sgl_a = List[List[Float32]]()
-    var acc_sgl_b = List[List[Float32]]()
-    var micro_in_window = 0
+    # window buffers + micro counter live in the shared trainer_core struct (wraps
+    # the grad_accum.mojo SUM/MEAN primitives). Klein uses the two-pair variant: the
+    # first pair carries the double-stream dbl_d_a/dbl_d_b groups, the second the
+    # single-stream sgl_d_a/sgl_d_b groups. accum_steps==1 => every step is a
+    # boundary => byte-identical to the per-step path.
+    var accum_window = GradAccumWindow(accum_steps)
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
 
@@ -2284,24 +2283,21 @@ def main() raises:
         # Fast path: accum_steps==1 uses `g` directly and avoids zero-cloning,
         # accumulating, scaling by 1, and copying buffers back into `g`.
         if use_grad_accum:
-            # Treat this loop iteration as one micro-step. SUM its four LoRA
-            # grad groups into the window buffers; on the accumulation boundary
-            # MEAN (÷N) and copy the meaned grads back into `g`.
-            if micro_in_window == 0:
-                acc_dbl_a = zeros_like_group(g.dbl_d_a)
-                acc_dbl_b = zeros_like_group(g.dbl_d_b)
-                acc_sgl_a = zeros_like_group(g.sgl_d_a)
-                acc_sgl_b = zeros_like_group(g.sgl_d_b)
-            accumulate_grad_group(acc_dbl_a, g.dbl_d_a)
-            accumulate_grad_group(acc_dbl_b, g.dbl_d_b)
-            accumulate_grad_group(acc_sgl_a, g.sgl_d_a)
-            accumulate_grad_group(acc_sgl_b, g.sgl_d_b)
-            micro_in_window += 1
-            var is_boundary = micro_in_window >= accum_steps or k == run_steps
+            # Treat this loop iteration as one micro-step: SUM its four LoRA grad
+            # groups (double-stream dbl_d_a/dbl_d_b + single-stream sgl_d_a/sgl_d_b)
+            # into the shared trainer_core window (two-pair variant); on a non-boundary
+            # micro-step print progress and skip clip/AdamW; on the boundary MEAN (÷N)
+            # back into `g` before clip+AdamW. The window math lives in
+            # trainer_core.GradAccumWindow (byte-op-identical to the prior inline
+            # block); the boundary control flow (progress print + continue) stays here.
+            # k==run_steps force-flushes the tail partial window.
+            var is_boundary = accum_window.accumulate_two_pairs(
+                g.dbl_d_a, g.dbl_d_b, g.sgl_d_a, g.sgl_d_b, k == run_steps
+            )
             if not is_boundary:
                 # mid-window: skip optimizer this micro-step, keep accumulating.
                 if runtime_profile:
-                    print("PROG_STAGE step=", k, " phase=grad_accum micro=", micro_in_window, "/", accum_steps)
+                    print("PROG_STAGE step=", k, " phase=grad_accum micro=", accum_window.micro, "/", accum_steps)
                 var t1m = perf_counter_ns()
                 var secsm = Float64(t1m - t0) / 1.0e9
                 print_trainer_progress(
@@ -2314,19 +2310,11 @@ def main() raises:
                 board.log_train_step(k, loss, 0.0, pending_lr, secsm, noise_speed)
                 perf_min_free = _klein_update_min_free(ctx, perf_min_free)
                 continue
-            # boundary: MEAN the window then overwrite g's four groups with it.
-            var inv_micro = Float32(1.0) / Float32(micro_in_window)
-            scale_grad_group(acc_dbl_a, inv_micro)
-            scale_grad_group(acc_dbl_b, inv_micro)
-            scale_grad_group(acc_sgl_a, inv_micro)
-            scale_grad_group(acc_sgl_b, inv_micro)
-            for i in range(len(g.dbl_d_a)):
-                g.dbl_d_a[i] = acc_dbl_a[i].copy()
-                g.dbl_d_b[i] = acc_dbl_b[i].copy()
-            for i in range(len(g.sgl_d_a)):
-                g.sgl_d_a[i] = acc_sgl_a[i].copy()
-                g.sgl_d_b[i] = acc_sgl_b[i].copy()
-            micro_in_window = 0
+            # boundary: MEAN the window (all four groups) back into `g`, then run
+            # clip+AdamW below on the meaned grads.
+            accum_window.finalize_mean_two_pairs(
+                g.dbl_d_a, g.dbl_d_b, g.sgl_d_a, g.sgl_d_b
+            )
 
         # grad_norm = L2 of ALL LoRA d_A/d_B
         var t_norm0 = perf_counter_ns()
