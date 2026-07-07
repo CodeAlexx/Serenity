@@ -63,7 +63,7 @@ from std.time import perf_counter_ns
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
-from serenitymojo.io.tensor_view import from_parts
+from serenitymojo.training.klein_dataset import load_cache_tensor
 
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
@@ -428,14 +428,10 @@ def _clamp(x: Float32, lo: Float32, hi: Float32) -> Float32:
 
 
 # ── load a cache tensor preserving its safetensors storage dtype ──────────────
-def _cache_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    var t = Tensor.from_view(tv, ctx)
-    return t^
-
-
+# The single-tensor read is now the SHARED klein_dataset.load_cache_tensor
+# (imported above). ANIMA-specific staging (BF16/F16/F32 -> host F32) and the
+# unsorted basename file list stay below — the ANIMA cache is latent-only
+# per-sample, with the cross-attn context read from a SEPARATE sidecar file.
 def _host_f32_for_step_math(t: Tensor, ctx: DeviceContext) raises -> List[Float32]:
     """Stage cache tensors through their stored dtype before host step math."""
     if t.dtype() == STDtype.BF16:
@@ -708,7 +704,7 @@ def _anima_context_from_caps(path: String, label: String, ctx: DeviceContext) ra
             + String(S_TXT) + String(" tokens); got last-dim ")
             + String(Int(info.shape[len(info.shape) - 1]))
         )
-    var src = _cache_tensor(st, String("context_cond"), ctx)
+    var src = load_cache_tensor(st, String("context_cond"), ctx)
     var src_flat = _host_f32_for_step_math(src, ctx)
     var src_tokens = len(src_flat) // JOINT
     var out = List[Float32]()
@@ -907,7 +903,7 @@ def main() raises:
     print("latent [B,", Cd, full_H, full_W, "] cropped ->", Hd, "x", Wd,
           " -> S_IMG =", S_IMG)
 
-    var latent_cache = _cache_tensor(cache, "latent", ctx)
+    var latent_cache = load_cache_tensor(cache, "latent", ctx)
     var lat_full = _host_f32_for_step_math(latent_cache, ctx)  # BCHW flat
     # channels-last cropped: dst [B,Hd,Wd,C] = src[b,c, h, w] (h,w in crop window)
     var lat_bthwc = List[Float32]()
@@ -937,7 +933,7 @@ def main() raises:
             raise Error("[b2] partner latent shape incompatible with sample 0")
         var full_H1 = lat_sh1[2]
         var full_W1 = lat_sh1[3]
-        var latent_cache1 = _cache_tensor(cache1, "latent", ctx)
+        var latent_cache1 = load_cache_tensor(cache1, "latent", ctx)
         var lat_full1 = _host_f32_for_step_math(latent_cache1, ctx)
         lat_bthwc1.reserve(B * Hd * Wd * Cd)
         for _ in range(B * Hd * Wd * Cd):
@@ -953,7 +949,7 @@ def main() raises:
     # frozen LLM-adapter context [B,256,1024] (captured sidecar context_cond).
     print("context:", CONTEXT_PATH)
     var ctx_st = SafeTensors.open(CONTEXT_PATH)
-    var context_cache = _cache_tensor(ctx_st, "context_cond", ctx)
+    var context_cache = load_cache_tensor(ctx_st, "context_cond", ctx)
     var context = _host_f32_for_step_math(context_cache, ctx)
     var ctx_n = len(context)
     if ctx_n != B * S_TXT * JOINT:

@@ -55,8 +55,10 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.io.ffi import sys_system
-from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.training.klein_dataset import (
+    load_cache_tensor, list_sorted_safetensors, cache_has_key, cache_tensor_dims,
+)
 from serenitymojo.ops.linear import linear
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.embeddings import timestep_embedding_sin_first
@@ -213,49 +215,12 @@ comptime SAMPLE_OUT_DIR = "/home/alex/mojodiffusion/serenitymojo/output"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# cache reading: a single safetensors tensor -> device Tensor in stored dtype.
-# Cache readback stays BF16; existing token math casts locally to F32 compute lists.
+# cache reading: the per-sample single-tensor read, the sorted file list, and the
+# header-only dims/has checks are the SHARED klein_dataset primitives
+# (load_cache_tensor / list_sorted_safetensors / cache_tensor_dims / cache_has_key
+# imported above). ERNIE's cache is BF16 latent + BF16 text_embedding + optional
+# text_real_len; the ERNIE-specific token packing/trim stays below.
 # ─────────────────────────────────────────────────────────────────────────────
-def _read_cache_tensor(st: SafeTensors, name: String, ctx: DeviceContext) raises -> Tensor:
-    var info = st.tensor_info(name)
-    var bytes = st.tensor_bytes(name)
-    var tv = from_parts(info.dtype, info.shape.copy(), bytes)
-    return Tensor.from_view(tv, ctx)
-
-
-def _cache_dims(st: SafeTensors, name: String) raises -> List[Int]:
-    var info = st.tensor_info(name)
-    var out = List[Int]()
-    for i in range(len(info.shape)):
-        out.append(Int(info.shape[i]))
-    return out^
-
-
-def _cache_has(st: SafeTensors, name: String) -> Bool:
-    var ns = st.names()
-    for i in range(len(ns)):
-        if ns[i] == name:
-            return True
-    return False
-
-
-# ── list cache files (sorted, like the Rust trainer cache_files.sort()) ───────
-from std.os import listdir
-def _list_cache(dir: String) raises -> List[String]:
-    var raw = listdir(dir)
-    var out = List[String]()
-    for i in range(len(raw)):
-        if raw[i].endswith(".safetensors"):
-            out.append(dir + String("/") + raw[i])
-    # insertion sort (deterministic order, mirrors cache_files.sort())
-    for i in range(1, len(out)):
-        var key = out[i]
-        var j = i - 1
-        while j >= 0 and out[j] > key:
-            out[j + 1] = out[j]
-            j -= 1
-        out[j + 1] = key
-    return out^
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1065,7 +1030,7 @@ def main() raises:
     # (0, N_TXT]. (Was: built once with N_TXT — a divergence from OneTrainer.)
     print("  RoPE tables: per-sample, cos/sin [S*H, Dh] = [", S * H, ",", Dh, "]")
 
-    var cache_files = _list_cache(cache_dir)
+    var cache_files = list_sorted_safetensors(cache_dir)
     if len(cache_files) == 0:
         raise Error("no cache files found")
     print("  found", len(cache_files), "cached samples")
@@ -1119,11 +1084,11 @@ def main() raises:
         var cache_idx = pair_lead % len(cache_files)
         var cs = SafeTensors.open(cache_files[cache_idx])
 
-        var latent_cache = _read_cache_tensor(cs, String("latent"), ctx)
+        var latent_cache = load_cache_tensor(cs, String("latent"), ctx)
         var latent = latent_cache.to_host_bf16(ctx)                        # [128*32*32]
-        var text_cache = _read_cache_tensor(cs, String("text_embedding"), ctx)
+        var text_cache = load_cache_tensor(cs, String("text_embedding"), ctx)
         var text = text_cache.to_host_bf16(ctx)                            # [512*3072]
-        var tdims = _cache_dims(cs, String("text_embedding"))
+        var tdims = cache_tensor_dims(cs, String("text_embedding"))
         var t_cache = tdims[1]
 
         var img_tokens = _latent_to_img_tokens(latent)                     # [N_IMG, IN_CH]
@@ -1135,8 +1100,8 @@ def main() raises:
         # embeddings that must NOT attend. Drives both the attention text-pad mask
         # AND the image RoPE axis-0 position (transformer_ernie_image.py:388-401).
         var real_len = N_TXT
-        if _cache_has(cs, String("text_real_len")):
-            var rl_t = _read_cache_tensor(cs, String("text_real_len"), ctx)
+        if cache_has_key(cs, String("text_real_len")):
+            var rl_t = load_cache_tensor(cs, String("text_real_len"), ctx)
             var rl_h = rl_t.to_host(ctx)
             real_len = Int(rl_h[0])
         if real_len < 1:
@@ -1257,17 +1222,17 @@ def main() raises:
                 # sigma, noise, rope, AdaLN source) and row-stack both samples ──
                 var idx1 = (pair_lead + 1) % len(cache_files)
                 var cs1 = SafeTensors.open(cache_files[idx1])
-                var latent1 = _read_cache_tensor(cs1, String("latent"), ctx).to_host_bf16(ctx)
-                var text_cache1 = _read_cache_tensor(cs1, String("text_embedding"), ctx)
+                var latent1 = load_cache_tensor(cs1, String("latent"), ctx).to_host_bf16(ctx)
+                var text_cache1 = load_cache_tensor(cs1, String("text_embedding"), ctx)
                 var text1 = text_cache1.to_host_bf16(ctx)
-                var tdims1 = _cache_dims(cs1, String("text_embedding"))
+                var tdims1 = cache_tensor_dims(cs1, String("text_embedding"))
                 var t_cache1 = tdims1[1]
                 var img_tokens1 = _latent_to_img_tokens(latent1)
                 var txt_tokens1 = _text_to_txt_tokens(text1, t_cache1)
 
                 var real_len1 = N_TXT
-                if _cache_has(cs1, String("text_real_len")):
-                    var rl_t1 = _read_cache_tensor(cs1, String("text_real_len"), ctx)
+                if cache_has_key(cs1, String("text_real_len")):
+                    var rl_t1 = load_cache_tensor(cs1, String("text_real_len"), ctx)
                     var rl_h1 = rl_t1.to_host(ctx)
                     real_len1 = Int(rl_h1[0])
                 if real_len1 < 1:
