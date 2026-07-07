@@ -84,6 +84,8 @@ from serenitymojo.models.qwenimage.qwenimage_stack_lora import (
     qwenimage_stack_lora_backward_offload,
     qwenimage_stack_lora_forward_offload_device,
     qwenimage_stack_lora_backward_offload_device,
+    qwenimage_stack_lora_forward_offload_device_b2,
+    qwenimage_stack_lora_backward_offload_device_b2,
     build_qwen_direct_dora_set_from_offload,
     qwenimage_stack_direct_dora_forward_offload,
     qwenimage_stack_direct_dora_backward_offload,
@@ -1140,6 +1142,38 @@ def main() raises:
     var micro_in_window = 0
     if use_grad_accum:
         print("  grad accumulation: accum_steps=", accum_steps, " (mean over micro-steps)")
+
+    # ── TRUE batch-2 (row-stacked device stack): 2 samples/step -> mean gradient.
+    #    Fenced to PLAIN LoRA + device stack + accum=1 (mirrors train_chroma_real's
+    #    use_b2). qwen's device stack is a comptime constant (QWEN_DEVICE_STACK),
+    #    so there is no host-stack env to unset — b2 always has the device path.
+    var use_b2 = train_cfg.batch_size == 2
+    if train_cfg.batch_size < 1 or train_cfg.batch_size > 2:
+        raise Error(
+            "QwenImage trainer: only batch_size 1 or 2 supported (TRUE batch-2 max); got "
+            + String(train_cfg.batch_size)
+        )
+    if use_b2:
+        if lokr_active or loha_active or dora_active or oft_active:
+            raise Error(
+                "QwenImage trainer: batch_size=2 (TRUE batch-2) is wired for PLAIN LoRA "
+                "only — not the LyCORIS/DoRA/OFT arms. Use adapter_algo=0."
+            )
+        if use_grad_accum:
+            raise Error(
+                "QwenImage trainer: batch_size=2 + grad_accum_steps>1 not wired — "
+                "batch_size=2 IS a 2-sample batch; set grad_accum_steps=1."
+            )
+        if train_cfg.ema_enabled:
+            raise Error("QwenImage trainer: batch_size=2 + EMA not wired; disable ema.")
+        comptime if not QWEN_DEVICE_STACK:
+            raise Error(
+                "QwenImage trainer: batch_size=2 requires the DEVICE stack "
+                "(QWEN_DEVICE_STACK=True)."
+            )
+        print("  TRUE batch-2 (row-stacked device stack): 2 samples/step,",
+              "0.5-scaled per-sample d_out -> mean gradient")
+
     var train_start = perf_counter_ns()
     for k in range(1, run_steps + 1):
         var t0 = perf_counter_ns()
@@ -1338,31 +1372,123 @@ def main() raises:
         var loss: Float32
         var grads: QwenLoraGradSet
         comptime if QWEN_DEVICE_STACK:
-            var fwd = qwenimage_stack_lora_forward_offload_device[H, Dh, N_IMG, N_TXT, S](
-                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
-                base, loader, lora,
-                cos_h.copy(), sin_h.copy(),
-                norm_out_w, norm_out_b,
-                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
-            )
-            var nout = len(fwd.out)
-            var d_loss = List[Float32]()
-            var sse = 0.0
-            var inv_n = Float32(2.0) / Float32(nout)
-            for i in range(nout):
-                var diff = fwd.out[i] - target[i]
-                sse += Float64(diff) * Float64(diff)
-                d_loss.append(inv_n * diff)
-            loss = Float32(sse / Float64(nout))
-            grads = qwenimage_stack_lora_backward_offload_device[H, Dh, N_IMG, N_TXT, S](
-                d_loss,
-                noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
-                base, loader, lora,
-                cos_h.copy(), sin_h.copy(),
-                norm_out_w, norm_out_b,
-                fwd,
-                Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
-            )
+            if use_b2:
+                # ── TRUE batch-2: sample-0 is prepped above; prep sample-1 (its own
+                #    cache slot + noise/sigma/temb stream), then run the row-stacked
+                #    b2 device stack. Each per-sample d_out is 0.5-scaled so the b2
+                #    backward's in-GEMM sum = mean(g0, g1) = the 2-sample batch grad;
+                #    loss = 0.5*(L0 + L1). Mirrors train_chroma_real.mojo use_b2. ──
+                var step_seed1 = UInt64(2) if FIXED_SIGMA_SMOKE else (UInt64(k) + UInt64(7000003))
+                var sigma1: Float32
+                var model_t1: Float32
+                if FIXED_SIGMA_SMOKE:
+                    var smoke_idx1 = Int(FIXED_SIGMA_VAL * Float32(1000.0))
+                    if smoke_idx1 >= 1000:
+                        smoke_idx1 = 999
+                    sigma1 = Float32(Float64(smoke_idx1 + 1) / 1000.0)
+                    model_t1 = Float32(Float64(smoke_idx1) / 1000.0)
+                else:
+                    var dts1 = sample_timestep_discrete_qwen(
+                        SEED_BASE + step_seed1, train_cfg.timestep_shift, 1000
+                    )
+                    sigma1 = dts1.sigma
+                    model_t1 = dts1.model_t
+
+                var img_tokens1 = List[Float32]()
+                var txt_tokens1 = List[Float32]()
+                if have_cache and len(files) > 0:
+                    var slot1 = 0 if FIXED_SIGMA_SMOKE else (k % len(files))
+                    var cst1 = SafeTensors.open(files[slot1])
+                    var latent_cache1 = _load_cache_preserving_dtype(cst1, String("latent"), ctx)
+                    var latent_h1 = latent_cache1.to_host_bf16(ctx)
+                    for i in range(len(latent_h1)):
+                        img_tokens1.append(latent_h1[i].cast[DType.float32]())
+                    var txt_cache1 = _load_cache_preserving_dtype(cst1, String("text_embedding"), ctx)
+                    var txt_flat1 = txt_cache1.to_host_bf16(ctx)
+                    var txt_seq1 = len(txt_flat1) // Int(TXT_CH)
+                    for r in range(Int(N_TXT)):
+                        if r < txt_seq1:
+                            for c in range(Int(TXT_CH)):
+                                txt_tokens1.append(txt_flat1[r * Int(TXT_CH) + c].cast[DType.float32]())
+                        else:
+                            for _ in range(Int(TXT_CH)):
+                                txt_tokens1.append(Float32(0.0))
+                else:
+                    for _ in range(Int(N_IMG) * Int(IN_CH)):
+                        img_tokens1.append(Float32(0.0))
+                    for _ in range(Int(N_TXT) * Int(TXT_CH)):
+                        txt_tokens1.append(Float32(0.0))
+
+                var noise1 = _host_noise(Int(N_IMG) * Int(IN_CH), SEED_BASE * UInt64(7919) + step_seed1)
+                var noisy1 = List[Float32]()
+                var target1 = List[Float32]()
+                var one_minus_sigma1 = Float32(1.0) - sigma1
+                for i in range(len(img_tokens1)):
+                    noisy1.append(one_minus_sigma1 * img_tokens1[i] + sigma1 * noise1[i])
+                    target1.append(noise1[i] - img_tokens1[i])
+
+                var silu_temb_h1 = _build_silu_temb(
+                    model_t1, te_lin1_w, te_lin1_b, te_lin2_w, te_lin2_b, ctx,
+                )
+
+                # cos_h/sin_h are position-based -> identical for both samples.
+                var fwd = qwenimage_stack_lora_forward_offload_device_b2[H, Dh, N_IMG, N_TXT, S](
+                    noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                    noisy1.copy(), txt_tokens1.copy(), silu_temb_h1.copy(),
+                    base, loader, lora,
+                    cos_h.copy(), sin_h.copy(),
+                    norm_out_w, norm_out_b,
+                    Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+                )
+                var nout = len(fwd.out0)
+                var inv_n = Float32(2.0) / Float32(nout)
+                var sse0 = 0.0
+                var sse1 = 0.0
+                var d_out0 = List[Float32]()
+                var d_out1 = List[Float32]()
+                for i in range(nout):
+                    var diff0 = fwd.out0[i] - target[i]
+                    var diff1 = fwd.out1[i] - target1[i]
+                    sse0 += Float64(diff0) * Float64(diff0)
+                    sse1 += Float64(diff1) * Float64(diff1)
+                    d_out0.append(Float32(0.5) * inv_n * diff0)
+                    d_out1.append(Float32(0.5) * inv_n * diff1)
+                loss = Float32(0.5) * (Float32(sse0 / Float64(nout)) + Float32(sse1 / Float64(nout)))
+                grads = qwenimage_stack_lora_backward_offload_device_b2[H, Dh, N_IMG, N_TXT, S](
+                    d_out0, d_out1,
+                    silu_temb_h.copy(), silu_temb_h1.copy(),
+                    base, loader, lora,
+                    cos_h.copy(), sin_h.copy(),
+                    norm_out_w, norm_out_b,
+                    fwd,
+                    Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+                )
+            else:
+                var fwd = qwenimage_stack_lora_forward_offload_device[H, Dh, N_IMG, N_TXT, S](
+                    noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                    base, loader, lora,
+                    cos_h.copy(), sin_h.copy(),
+                    norm_out_w, norm_out_b,
+                    Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+                )
+                var nout = len(fwd.out)
+                var d_loss = List[Float32]()
+                var sse = 0.0
+                var inv_n = Float32(2.0) / Float32(nout)
+                for i in range(nout):
+                    var diff = fwd.out[i] - target[i]
+                    sse += Float64(diff) * Float64(diff)
+                    d_loss.append(inv_n * diff)
+                loss = Float32(sse / Float64(nout))
+                grads = qwenimage_stack_lora_backward_offload_device[H, Dh, N_IMG, N_TXT, S](
+                    d_loss,
+                    noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
+                    base, loader, lora,
+                    cos_h.copy(), sin_h.copy(),
+                    norm_out_w, norm_out_b,
+                    fwd,
+                    Int(D), Int(FMLP), Int(IN_CH), Int(TXT_CH), Int(OUT_CH), EPS, ctx,
+                )
         else:
             var fwd = qwenimage_stack_lora_forward_offload[H, Dh, N_IMG, N_TXT, S](
                 noisy.copy(), txt_tokens.copy(), silu_temb_h.copy(),
