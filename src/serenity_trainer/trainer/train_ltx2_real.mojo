@@ -59,6 +59,9 @@ from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 from std.time import perf_counter_ns
 from std.os import listdir
+from std.ffi import external_call
+from std.memory import alloc, UnsafePointer
+from std.builtin.type_aliases import MutExternalOrigin
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -89,6 +92,7 @@ from serenitymojo.offload.plan import OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.io.ffi import sys_mkdirs
 
 
 # ── arch (LTX-2 video DiT; from configs/ltx2.json) ───────────────────────────
@@ -124,9 +128,38 @@ comptime FIXED_SIGMA = Float32(0.5)
 # ── adaln timestep embedding dim (adaln_single.emb.timestep_embedder in_dim) ──
 comptime TEMB_DIM = 256
 
-comptime CKPT = "/home/alex/.serenity/models/checkpoints/ltx2_video_bf16.safetensors"
-comptime CACHE_DIR = "/home/alex/datasets/ltx2_cache_512"
-comptime LORA_DIR = "/home/alex/mojodiffusion/output/ltx2_lora"
+# Runtime-resolvable paths (env override; defaults point at the REAL 13B file so
+# there is NO symlink dependency — the old comptime CKPT pointed at a
+# ltx2_video_bf16.safetensors symlink, that indirection is removed). Override with
+# env vars LTX2_CKPT / LTX2_CACHE / LTX2_LORA_DIR.
+comptime CKPT_DEFAULT = "/home/alex/.serenity/models/checkpoints/ltx-video/ltxv-13b-0.9.8-dev.safetensors"
+comptime CACHE_DEFAULT = "/home/alex/datasets/ltx2_cache_512"
+comptime LORA_DIR_DEFAULT = "/home/alex/mojodiffusion/output/ltx2_lora"
+
+comptime _EnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
+
+
+# Read env var `name` as a string; return `default` when unset or empty.
+def _env_str(name: String, default: String) -> String:
+    var n = name.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = name.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cname = _EnvPtr(unsafe_from_address=Int(buf))
+    var ret = external_call["getenv", _EnvPtr](cname)
+    buf.free()
+    if Int(ret) == 0:
+        return default
+    var out = String("")
+    var i = 0
+    while ret[i] != UInt8(0):
+        out += chr(Int(ret[i]))
+        i += 1
+    if len(out) == 0:
+        return default
+    return out^
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -279,6 +312,14 @@ def main() raises:
     if len(a) >= 4:
         resume_path = String(a[3])
 
+    # ── resolve runtime paths (env override; defaults = real 13B file, no symlink) ─
+    var ckpt_path = _env_str(String("LTX2_CKPT"), String(CKPT_DEFAULT))
+    var cache_dir = _env_str(String("LTX2_CACHE"), String(CACHE_DEFAULT))
+    var lora_dir = _env_str(String("LTX2_LORA_DIR"), String(LORA_DIR_DEFAULT))
+    # Ensure the LoRA output dir exists BEFORE training so the end-of-run save can
+    # never fail with "failed to open for write" (the previous crash).
+    _ = sys_mkdirs(lora_dir)
+
     print("=== LTX-2 LEGACY video-only LoRA training loop (block-swap offload) ===")
     print("  WARNING: legacy stack; not production full-AV LTX2 training")
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " FF=", FF, " in_ch=", IN_CH, " out_ch=", OUT_CH)
@@ -287,19 +328,20 @@ def main() raises:
     print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT)
     print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
     print("  hot loop note: legacy smoke uses host noise/loss; not production AV device-loop training")
-    print("  ckpt:", CKPT)
-    print("  cache:", CACHE_DIR)
+    print("  ckpt:", ckpt_path)
+    print("  cache:", cache_dir)
+    print("  lora_out:", lora_dir)
 
     # ── stack-level base (frozen; patchify_proj/proj_out/adaln_single) ────────
     print("[load] LTX2StackBase (patchify_proj, proj_out, adaln_single)")
-    var base_st = SafeTensors.open(String(CKPT))
+    var base_st = SafeTensors.open(ckpt_path)
     var base = load_ltx2_stack_base(base_st, NUM_LAYERS, D, IN_CH, OUT_CH, ctx)
     print("[load] base resident")
 
     # ── block-swap offload loader ─────────────────────────────────────────────
     var plan = build_ltx2_block_plan(NUM_LAYERS)
     var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
+    var loader = TurboPlannedLoader.open(ckpt_path, plan^, cfg, ctx)
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
 
     # ── split-rope tables [S*H, Dh//2] (built once, BF16 storage) ─────────────
@@ -316,7 +358,7 @@ def main() raises:
     var n_adapters = total_ltx2_adapters(lora)
     print("[lora] adapters:", n_adapters, " (4 x", NUM_LAYERS, "blocks: q,k,v,out)")
 
-    var files = _list_cache(String(CACHE_DIR))
+    var files = _list_cache(cache_dir)
     print("[cache] samples:", len(files))
 
     var b_absum_init = Float32(0.0)
@@ -453,7 +495,7 @@ def main() raises:
         print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        var peft_path = String(LORA_DIR) + String("/ltx2_lora_smoke.safetensors")
+        var peft_path = lora_dir + String("/ltx2_lora_smoke.safetensors")
         _ = save_ltx2_lora(lora, peft_path, ctx)
         # MJ-1088: also write the moment-carrying `.state` sidecar so a resume does
         # NOT zero AdamW momentum. Pull the resident device m/v back to host first —
