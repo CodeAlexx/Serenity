@@ -146,6 +146,7 @@ from serenitymojo.training.train_config import (
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.trainer_core import (
     GradAccumWindow, trainer_resolve_resume_path, trainer_warn_warm_resume,
+    trainer_prune_target_step, trainer_prune_step_checkpoint,
 )
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
@@ -404,6 +405,22 @@ def sd35_should_save_before_sample(
 
 def _step_lora_path(base_path: String, step: Int) -> String:
     return ot_step_lora_path(base_path, step)
+
+
+# Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
+# krea2's discipline, thin wrapper over the shared trainer_core machinery. Reuses
+# the shared keep-count decision (trainer_prune_target_step), but builds the
+# pruned path with sd35's OWN step-path helper (ot-policy naming under LORA_DIR,
+# not krea2's workspace/stem), then removes it + its `.state.safetensors` sidecar.
+# keep_default/milestone=0 ⇒ NO prune until the webui sets save_max_keep, so
+# keep-all stays byte-unchanged when it is unset.
+def _sd35_prune_old_checkpoints(cfg: TrainConfig, run_steps: Int, saved_step: Int) raises:
+    var old = trainer_prune_target_step(cfg, saved_step, 0, 0)
+    if old > 0:
+        trainer_prune_step_checkpoint(
+            _step_lora_path(sd35_output_lora_path_from_train_config(cfg, run_steps), old),
+            String(".state.safetensors"),
+        )
 
 
 def sd35_sample_prompt_config_for_sampler(
@@ -1190,6 +1207,7 @@ def main() raises:
                 )
                 _ = save_sd35_direct_dora(dora_masters, save_path_d, ctx)
                 print("[SD35-dora] save step=", k, " path=", save_path_d)
+                _sd35_prune_old_checkpoints(train_cfg, run_steps, k)
             continue
 
         if oft_active:
@@ -1246,6 +1264,7 @@ def main() raises:
                 )
                 _ = save_sd35_direct_oft(oft_masters, save_path_o, ctx)
                 print("[SD35-oft] save step=", k, " path=", save_path_o)
+                _sd35_prune_old_checkpoints(train_cfg, run_steps, k)
             continue
 
         # ── forward+loss+backward (DEVICE arm default, MJ-1069 rung 3; host
@@ -1494,6 +1513,7 @@ def main() raises:
                 _ = save_sd35_lora_state_with_meta(lora, state_path, ctx, state_meta^)
             saved_this_step = True
             print("[SD35-lora] save step=", k, " path=", save_path)
+            _sd35_prune_old_checkpoints(train_cfg, run_steps, k)
         if sample_enabled and should_sample_completed_step(sample_cadence, k):
             if sd35_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var sample_path = _step_lora_path(

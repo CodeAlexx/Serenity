@@ -110,7 +110,9 @@ from serenitymojo.training.levers import (
 )
 from serenitymojo.training.noise_modifiers import apply_noise_modifiers_host
 from serenitymojo.training.ema_schedule import ema_decay_at_step, ema_update_host
-from serenitymojo.training.trainer_core import GradAccumWindow
+from serenitymojo.training.trainer_core import (
+    GradAccumWindow, trainer_prune_target_step, trainer_prune_step_checkpoint,
+)
 from serenitymojo.training.validation_sampler import load_caps
 from serenitymojo.training.progress_display import print_trainer_progress
 from serenitymojo.training.sample_prompt_config import (
@@ -833,6 +835,24 @@ def _lora_path_for_step(base_path: String, step: Int, max_steps: Int) -> String:
         step,
         max_steps,
     )
+
+
+# Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
+# krea2's discipline, thin wrapper over the shared trainer_core machinery. Reuses
+# the shared keep-count decision (trainer_prune_target_step), but builds the
+# pruned path with klein's OWN `_lora_path_for_step` (its ot-final-or-step naming
+# under LORA_DIR differs from krea2's workspace/stem), then removes it + its
+# `.state.safetensors` sidecar (the LoKr/LoHa/DoRA/OFT arms write no sidecar →
+# no-op). old_step < saved_step ≤ max_steps ⇒ always the STEP name, never the
+# final name. keep_default/milestone=0 ⇒ NO prune until the webui sets
+# save_max_keep, so keep-all stays byte-unchanged when it is unset.
+def _klein_prune_old_checkpoints(cfg: TrainConfig, output_lora_path: String, saved_step: Int) raises:
+    var old = trainer_prune_target_step(cfg, saved_step, 0, 0)
+    if old > 0:
+        trainer_prune_step_checkpoint(
+            _lora_path_for_step(output_lora_path, old, cfg.max_steps),
+            String(".state.safetensors"),
+        )
 
 
 def validate_klein_train_config(cfg: TrainConfig) raises:
@@ -1986,6 +2006,7 @@ def main() raises:
                     var nmods = save_klein_direct_dora(direct_dora_masters, ckpt, ctx)
                     print("[Klein-dora] save step=", k, " path=", ckpt, " modules=", nmods)
                     board.log_text(String("events/save"), k, ckpt)
+                    _klein_prune_old_checkpoints(cfg, output_lora_path, k)
                     var t_save1_direct = perf_counter_ns()
                     perf_save_seconds += Float64(t_save1_direct - t_save0_direct) / 1.0e9
                     perf_visible_sync_count += 1
@@ -2082,6 +2103,7 @@ def main() raises:
                     var nmods = save_klein_direct_oft(direct_oft_masters, ckpt, ctx)
                     print("[Klein-oft] save step=", k, " path=", ckpt, " modules=", nmods)
                     board.log_text(String("events/save"), k, ckpt)
+                    _klein_prune_old_checkpoints(cfg, output_lora_path, k)
                     var t_save1_direct = perf_counter_ns()
                     perf_save_seconds += Float64(t_save1_direct - t_save0_direct) / 1.0e9
                     perf_visible_sync_count += 1
@@ -2626,6 +2648,10 @@ def main() raises:
                 )
                 print("[Klein-lora] save_ema step=", k, " path=", ema_path, " pairs=", nema)
                 board.log_text(String("events/save_ema"), k, ema_path)
+            # Rolling retention only on a real cadence save (this block also runs
+            # for sample-only / chunk-final entries, which must NOT trigger prune).
+            if save_due:
+                _klein_prune_old_checkpoints(cfg, output_lora_path, k)
             var t_save1 = perf_counter_ns()
             perf_save_seconds += Float64(t_save1 - t_save0) / 1.0e9
             perf_visible_sync_count += 1

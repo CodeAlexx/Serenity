@@ -129,7 +129,9 @@ from serenitymojo.training.train_config import (
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
-from serenitymojo.training.trainer_core import GradAccumWindow
+from serenitymojo.training.trainer_core import (
+    GradAccumWindow, trainer_prune_target_step, trainer_prune_step_checkpoint,
+)
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
     validate_onetrainer_cache_preflight_plan,
@@ -357,6 +359,21 @@ def anima_state_path_for_lora(lora_path: String) -> String:
 
 def _step_lora_path(base_path: String, completed_step: Int) -> String:
     return ot_step_lora_path(base_path, completed_step)
+
+
+# Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
+# krea2's discipline, thin wrapper over the shared trainer_core machinery. Reuses
+# the shared keep-count decision (trainer_prune_target_step), but builds the
+# pruned path with anima's OWN step-path helper (ot-policy naming off `lora_out`,
+# not krea2's workspace/stem), then removes it + its `.state.safetensors` sidecar.
+# keep_default/milestone=0 ⇒ NO prune until the webui sets save_max_keep, so
+# keep-all stays byte-unchanged when it is unset.
+def _anima_prune_old_checkpoints(cfg: TrainConfig, lora_out: String, saved_step: Int) raises:
+    var old = trainer_prune_target_step(cfg, saved_step, 0, 0)
+    if old > 0:
+        trainer_prune_step_checkpoint(
+            _step_lora_path(lora_out, old), String(".state.safetensors")
+        )
 
 
 # samples dir = "<parent of lora_out>/samples". lora_out is a .safetensors file
@@ -1440,6 +1457,7 @@ def main() raises:
                 _ = save_anima_lora_state(lora, ckpt_state, ctx)
                 print("[checkpoint] saved step=", completed_step, " state=", ckpt_state)
             saved_this_step = True
+            _anima_prune_old_checkpoints(cfg, lora_out, completed_step)
         if sample_enabled and should_sample_completed_step(sample_cadence, completed_step):
             if anima_should_save_before_sample(sample_cadence, completed_step, saved_this_step):
                 var pre_sample_path = _step_lora_path(lora_out, completed_step)

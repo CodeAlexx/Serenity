@@ -154,7 +154,9 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
-from serenitymojo.training.trainer_core import GradAccumWindow
+from serenitymojo.training.trainer_core import (
+    GradAccumWindow, trainer_prune_target_step, trainer_prune_step_checkpoint,
+)
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
@@ -391,6 +393,22 @@ def flux_should_save_before_sample(
 
 def _step_lora_path(base_path: String, step: Int) -> String:
     return ot_step_lora_path(base_path, step)
+
+
+# Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
+# krea2's discipline, thin wrapper over the shared trainer_core machinery. Reuses
+# the shared keep-count decision (trainer_prune_target_step), but builds the
+# pruned path with flux's OWN step-path helper (ot-policy naming under LORA_DIR,
+# not krea2's workspace/stem), then removes it + its `.state.safetensors` sidecar.
+# keep_default/milestone=0 ⇒ NO prune until the webui sets save_max_keep, so
+# keep-all stays byte-unchanged when it is unset.
+def _flux_prune_old_checkpoints(cfg: TrainConfig, run_steps: Int, saved_step: Int) raises:
+    var old = trainer_prune_target_step(cfg, saved_step, 0, 0)
+    if old > 0:
+        trainer_prune_step_checkpoint(
+            _step_lora_path(flux_output_lora_path_from_train_config(cfg, run_steps), old),
+            String(".state.safetensors"),
+        )
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -1248,6 +1266,7 @@ def main() raises:
                 )
                 var nmods = save_flux_direct_dora(dora_masters, save_path, ctx)
                 print("[Flux-dora] save step=", k, " modules=", nmods, " path=", save_path)
+                _flux_prune_old_checkpoints(train_cfg, run_steps, k)
             continue
 
         if oft_active:
@@ -1304,6 +1323,7 @@ def main() raises:
                 )
                 var nmods = save_flux_direct_oft(oft_masters, save_path, ctx)
                 print("[Flux-oft] save step=", k, " modules=", nmods, " path=", save_path)
+                _flux_prune_old_checkpoints(train_cfg, run_steps, k)
             continue
 
         # ── forward + backward: batch_size==2 dispatches the ROW-STACKED b2
@@ -1561,6 +1581,7 @@ def main() raises:
                 _ = save_flux_lora_state_combined(lora, stack_lora, state_path, ctx)
                 print("[Flux-lora] save_state step=", k, " path=", state_path)
             saved_this_step = True
+            _flux_prune_old_checkpoints(train_cfg, run_steps, k)
         if sample_enabled and should_sample_completed_step(sample_cadence, k):
             if flux_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var sample_path = _step_lora_path(

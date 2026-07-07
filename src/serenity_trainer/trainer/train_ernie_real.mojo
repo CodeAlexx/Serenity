@@ -161,7 +161,9 @@ from serenitymojo.training.lora_ema import (
     LoraEmaState, lora_ema_track, ema_update,
     lora_ema_adapters, ema_path_for_lora,
 )
-from serenitymojo.training.trainer_core import GradAccumWindow
+from serenitymojo.training.trainer_core import (
+    GradAccumWindow, trainer_prune_target_step, trainer_prune_step_checkpoint,
+)
 from serenitymojo.training.ernie_validation_sampler import (
     generate_ernie_lora_shift_pair, load_ernie_sample_text_tokens,
 )
@@ -507,6 +509,21 @@ def _mkdir_parent(path: String):
 
 def _step_lora_path(save_path: String, step: Int) -> String:
     return ot_step_lora_path(save_path, step)
+
+
+# Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
+# krea2's discipline, thin wrapper over the shared trainer_core machinery. Reuses
+# the shared keep-count decision (trainer_prune_target_step), but builds the
+# pruned path with ernie's OWN step-path helper (ot-policy naming off `save_path`,
+# not krea2's workspace/stem), then removes it + its `.state.safetensors` sidecar.
+# keep_default/milestone=0 ⇒ NO prune until the webui sets save_max_keep, so
+# keep-all stays byte-unchanged when it is unset.
+def _ernie_prune_old_checkpoints(cfg: TrainConfig, save_path: String, saved_step: Int) raises:
+    var old = trainer_prune_target_step(cfg, saved_step, 0, 0)
+    if old > 0:
+        trainer_prune_step_checkpoint(
+            _step_lora_path(save_path, old), String(".state.safetensors")
+        )
 
 
 def validate_ernie_train_config(cfg: TrainConfig) raises:
@@ -1427,6 +1444,7 @@ def main() raises:
                 _save_ernie_lora_ema(ema, lora, save_cadence_lora, ctx)  # T1.B EMA sibling
             saved_this_step = True
             saved_lora_path = save_cadence_lora.copy()
+            _ernie_prune_old_checkpoints(train_cfg, save_path, done_step)
 
         if sample_enabled and should_sample_completed_step(sample_cadence, done_step):
             var cadence_lora = _step_lora_path(save_path, done_step)

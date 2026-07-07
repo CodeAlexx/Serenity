@@ -143,7 +143,9 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
-from serenitymojo.training.trainer_core import GradAccumWindow
+from serenitymojo.training.trainer_core import (
+    GradAccumWindow, trainer_prune_target_step, trainer_prune_step_checkpoint,
+)
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.onetrainer_cache_preflight import (
     create_onetrainer_cache_preflight_plan,
@@ -359,6 +361,22 @@ def qwen_state_path_for_lora(lora_path: String) -> String:
 
 def _step_lora_path(base_path: String, step: Int) -> String:
     return ot_step_lora_path(base_path, step)
+
+
+# Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
+# krea2's discipline, thin wrapper over the shared trainer_core machinery. Reuses
+# the shared keep-count decision (trainer_prune_target_step), but builds the
+# pruned path with qwen's OWN step-path helper (ot-policy naming off
+# `output_lora_path`, not krea2's workspace/stem), then removes it + its
+# `.state.safetensors` sidecar (the DoRA/OFT arms write no sidecar → no-op).
+# keep_default/milestone=0 ⇒ NO prune until the webui sets save_max_keep, so
+# keep-all stays byte-unchanged when it is unset.
+def _qwen_prune_old_checkpoints(cfg: TrainConfig, output_lora_path: String, saved_step: Int) raises:
+    var old = trainer_prune_target_step(cfg, saved_step, 0, 0)
+    if old > 0:
+        trainer_prune_step_checkpoint(
+            _step_lora_path(output_lora_path, old), String(".state.safetensors")
+        )
 
 
 # T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a plain-LoRA
@@ -1304,6 +1322,7 @@ def main() raises:
                 var nmods = save_qwen_direct_dora(dora_masters, ckpt_path, ctx)
                 print("[checkpoint] saved QwenImage-dora step=", k,
                       " modules=", nmods, " path=", ckpt_path)
+                _qwen_prune_old_checkpoints(train_cfg, output_lora_path, k)
             continue
 
         if oft_active:
@@ -1363,6 +1382,7 @@ def main() raises:
                 var nmods = save_qwen_direct_oft(oft_masters, ckpt_path, ctx)
                 print("[checkpoint] saved QwenImage-oft step=", k,
                       " modules=", nmods, " path=", ckpt_path)
+                _qwen_prune_old_checkpoints(train_cfg, output_lora_path, k)
             continue
 
         # ── forward + loss + backward (device arm DEFAULT, MJ-1084; host arm
@@ -1617,6 +1637,7 @@ def main() raises:
                 _ = save_qwen_lora_state(lora, ckpt_state, ctx)
             saved_this_step = True
             print("[checkpoint] saved step=", k, " path=", ckpt_path)
+            _qwen_prune_old_checkpoints(train_cfg, output_lora_path, k)
         if should_sample_completed_step(sample_cadence, k):
             if qwen_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var pre_sample_path = _step_lora_path(output_lora_path, k)
