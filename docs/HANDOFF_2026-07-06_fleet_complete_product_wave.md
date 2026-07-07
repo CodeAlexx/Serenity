@@ -22,7 +22,10 @@ SDXL + SD3.5 UNFROZEN 07-06 (gates in flight); lens + BOFT stay dead.
   themes, FULL-form server persistence (/api/ui/state), run re-attach on load,
   step-echo in the log pane.
 - SerenityBoard BUILT IN at /board (rusqlite, live hook + CLI workspace tailer,
-  PK-dedupe). Live-gated with real runs.
+  PK-dedupe). Live-gated with real runs. **TB-PARITY GATED late 07-06
+  (tests/board/, 296be1d): values f32-exact vs OneTrainer tfevents, smoothing
+  BIT-IDENTICAL to TB 2.20's bundled algorithm, cross-trainer overlay (OT runs
+  import via scripts/board_import_tfevents.py and chart beside Mojo runs).**
 - Konva inference canvas: serenity-server (:7811) ComfyUI Tier-A adapters →
   Mojo zimage worker, click-through e2e green, Playwright console-clean.
 - RESILIENCE (MJ-1080): children write their own log files (no pipe),
