@@ -150,11 +150,18 @@ comptime TE1_CTX = 768          # TE1 (CLIP-L) feature channels [0:768)
 comptime TE2_CTX = 1280         # TE2 (CLIP-G) feature channels [768:2048)
 comptime POOLED_DIM = 1280      # pooled (TE2) -> y[0:1280)
 
-# ── resolution knob (latent spatial; 64 = 512px). Default small for the smoke. ──
-# 2026-07-06 audit item 5 ATTEMPTED: LATENT_HW=128 (1024px inline samples)
-# builds clean but the binary dies SIGILL at load (21s, before step 1) —
-# comptime-instantiation class, needs its own investigation. Reverted to the
-# working 128px smoke sampler; webui preset ships sample_every=0 meanwhile.
+# ── TRAINING resolution knob (latent spatial; 64 = 512px). Default small smoke. ──
+# 2026-07-06 audit item 5 RESOLVED: the earlier LATENT_HW=128 attempt died SIGILL
+# ~21s in (before step 1) NOT because of a comptime-instantiation problem in the
+# GPU forward, but because LATENT_HW is ALSO the TRAINING-step resolution and the
+# cache-latent crop (search "crop latent" below) reads the 64x64 (512px) cache at
+# 128x128 top-left indices -> Mojo List.__getitem__ bounds-check (compiled IN even
+# at -O2) fires an out-of-bounds assert that lowers to llvm.trap = SIGILL, on the
+# HOST, before any forward runs (repro: a 5-line host-only crop reproduces the exact
+# "Assert Error: index 16384 out of bounds" + Illegal instruction). The SAMPLER is
+# now DECOUPLED from this knob via the SAMPLE_* ladder below, so 1024px inline
+# samples no longer require raising the training resolution (which would need a
+# 1024px cache + activation checkpointing). Keep training at the working 128px smoke.
 comptime LATENT_HW = 16
 
 # ── recipe (train_sdxl.rs preset) ─────────────────────────────────────────────
@@ -178,11 +185,27 @@ comptime SDXL_CARRIER_RUNTIME_RESERVE_BYTES = 2 * 1024 * 1024 * 1024
 
 # ── sample-during-training (v1; sdxl_sample_resident) ─────────────────────────
 # When cadence fires, run an eps-pred Euler CFG denoise on the FROZEN UNet weights
-# + the LIVE per-ST LoRA at the trainer's comptime LATENT_HW, SDXL-VAE-decode, and
-# write <LORA_DIR>/samples/step_<N>.png. Geometry is the trainer's LATENT_HW
-# (LATENT_HW=16 -> 128px sample; 64 -> 512px). Conditioning v1 reuses the cached
-# caption's context/y as COND, zeros as UNCOND. See sdxl_sample_resident.mojo
+# + the LIVE per-ST LoRA, SDXL-VAE-decode, and write a PNG. Conditioning v1 reuses
+# the cached caption's context/y as COND, zeros as UNCOND. See sdxl_sample_resident.mojo
 # header for the why + the drop-in real-encode path.
+#
+# SAMPLER RESOLUTION LADDER (decoupled from the training LATENT_HW). The sampler
+# builds its latent from FRESH noise [4*S*S] (no cache crop), so it can render at any
+# rung S regardless of the training crop. Each rung is a comptime latent edge S; the
+# image is S*8 px. The caps sampler runtime-selects the rung from the prompt's
+# requested width (square); the legacy cached-caption path uses SAMPLE_DEFAULT_PX.
+# Every rung is instantiated into the binary (all three sdxl_real_forward[S,S] +
+# sdxl_ldm_decoder[S,S]); adding a rung = one comptime + one elif in the dispatch.
+comptime SAMPLE_S_128 = 16      # 128 px  (== the training smoke default; verified)
+comptime SAMPLE_S_512 = 64      # 512 px
+comptime SAMPLE_S_1024 = 128    # 1024 px (audit item 5 target)
+comptime SAMPLE_PX_128 = 128
+comptime SAMPLE_PX_512 = 512
+comptime SAMPLE_PX_1024 = 1024
+# 1024 rung MEASURED 2026-07-07: render STARTS but CUDA-OOMs mid-denoise (sampler
+# self-attn is math O(N^2); 16384 tokens + CFG pair > 24GB) — 1024 stays available
+# via the ladder for caps prompts but needs sampler-side flash/tiling first.
+comptime SAMPLE_DEFAULT_PX = 512   # legacy (non-caps) cached-caption render size
 comptime SAMPLE_STEPS = 30
 comptime SAMPLE_CFG = Float32(7.5)
 comptime SAMPLE_SEED = UInt64(12345)
@@ -688,16 +711,86 @@ def _host_f32_for_step_math(t: Tensor, ctx: DeviceContext) raises -> List[Float3
     return t.to_host(ctx)
 
 
-# ── _sdxl_run_sample — one sample-during-training image ──────────────────────
-#   cond cond    : the cached caption's context [1,77,2048] + y [1,2816] (v1; the
-#                  SAME tensors the train step built — see header).
-#   uncond cond  : zeros (built inside sdxl_sample_resident; CFG empty prompt).
-#   init noise   : gaussian [4*LATENT_HW*LATENT_HW] NCHW, seed = SAMPLE_SEED + step
-#                  (the trainer's _host_noise convention).
-#   denoise      : sdxl_sample_resident (frozen base UNet + live per-ST LoRA).
-#   decode+write : sdxl_decode_latent_to_png -> <samples_dir>/step_<N>.png.
-# Fail-loud: any raise propagates (no silent skip), matching the trainer's
-# fail-loud cadence contract.
+# ── sampler ladder: px <-> comptime rung ─────────────────────────────────────
+# The sampler is DECOUPLED from the training LATENT_HW: it builds its latent from
+# fresh noise [4*S*S] (no cache crop, so the LATENT_HW=128 crop-OOB SIGILL — a HOST
+# List bounds trap in the training crop, see the LATENT_HW note — can never happen
+# here). `px` is the requested SQUARE image edge; the rung is the latent edge S=px/8.
+def _sdxl_sample_px_supported(px: Int) -> Bool:
+    return px == SAMPLE_PX_128 or px == SAMPLE_PX_512 or px == SAMPLE_PX_1024
+
+
+# ── _sdxl_sample_render[S] — one render at comptime rung S (px = S*8) ─────────
+#   cond   : (context [1,77,2048], y [1,2816]) — caps or cached caption.
+#   uncond : zeros (built inside sdxl_sample_resident; CFG empty prompt).
+#   noise  : gaussian [4*S*S] NCHW, seed = `seed` (trainer _host_noise convention).
+#   denoise: sdxl_sample_resident[S,S] (frozen base UNet + live per-ST LoRA).
+#   write  : sdxl_decode_latent_to_png[S,S] -> <samples_dir>/step_<N><label>.png.
+# Fail-loud: any raise propagates (no silent skip).
+def _sdxl_sample_render[S: Int](
+    w: SdxlRealWeights,
+    lora: List[SdxlLoraSet],
+    context: Tensor,    # [1,77,2048] COND context
+    y: Tensor,          # [1,2816] COND ADM vector
+    vae_path: String,
+    samples_dir: String,
+    step: Int,
+    steps: Int,
+    cfg: Float32,
+    seed: UInt64,
+    label: String,      # "" for legacy; "_<prompt.label>" for caps
+    ctx: DeviceContext,
+) raises:
+    var n_lat = 4 * S * S
+    var init_noise = _host_noise(n_lat, seed)
+    var latent = sdxl_sample_resident[S, S](
+        w, lora, context.clone(ctx), y.clone(ctx), init_noise^, steps, cfg, ctx,
+    )
+    var out_path = (
+        samples_dir + String("/step_") + String(step) + label + String(".png")
+    )
+    sdxl_decode_latent_to_png[S, S](latent, vae_path, out_path, ctx)
+    print("[SDXL-lora] sample step=", step, " res=", S * 8, "px -> ", out_path)
+
+
+# ── _sdxl_sample_dispatch — runtime px -> comptime rung, then render ──────────
+# The runtime `px` selects one of the comptime-instantiated rungs. Every branch is
+# a distinct sdxl_sample_resident[S,S]/decoder[S,S] compiled into the binary.
+def _sdxl_sample_dispatch(
+    px: Int,
+    w: SdxlRealWeights,
+    lora: List[SdxlLoraSet],
+    context: Tensor,
+    y: Tensor,
+    vae_path: String,
+    samples_dir: String,
+    step: Int,
+    steps: Int,
+    cfg: Float32,
+    seed: UInt64,
+    label: String,
+    ctx: DeviceContext,
+) raises:
+    if px == SAMPLE_PX_128:
+        _sdxl_sample_render[SAMPLE_S_128](
+            w, lora, context, y, vae_path, samples_dir, step, steps, cfg, seed, label, ctx)
+    elif px == SAMPLE_PX_512:
+        _sdxl_sample_render[SAMPLE_S_512](
+            w, lora, context, y, vae_path, samples_dir, step, steps, cfg, seed, label, ctx)
+    elif px == SAMPLE_PX_1024:
+        _sdxl_sample_render[SAMPLE_S_1024](
+            w, lora, context, y, vae_path, samples_dir, step, steps, cfg, seed, label, ctx)
+    else:
+        raise Error(
+            String("SDXL sampler ladder: unsupported resolution ") + String(px)
+            + String("px (supported: 128/512/1024)")
+        )
+
+
+# ── _sdxl_run_sample — legacy cached-caption render (non-caps fallback) ───────
+# Reuses the cached caption's (context, y) as COND; renders at SAMPLE_DEFAULT_PX
+# (decoupled from the training LATENT_HW). Prompt-faithful caps sampling is the
+# standard path (_sdxl_run_sample_caps); this stays for the loud-warned fallback.
 def _sdxl_run_sample(
     w: SdxlRealWeights,
     lora: List[SdxlLoraSet],
@@ -708,17 +801,10 @@ def _sdxl_run_sample(
     step: Int,
     ctx: DeviceContext,
 ) raises:
-    var n_lat = 4 * LATENT_HW * LATENT_HW
-    var init_noise = _host_noise(n_lat, SAMPLE_SEED + UInt64(step))
-
-    var latent = sdxl_sample_resident[LATENT_HW, LATENT_HW](
-        w, lora, context.clone(ctx), y.clone(ctx), init_noise^,
-        SAMPLE_STEPS, SAMPLE_CFG, ctx,
+    _sdxl_sample_dispatch(
+        SAMPLE_DEFAULT_PX, w, lora, context, y, vae_path, samples_dir, step,
+        SAMPLE_STEPS, SAMPLE_CFG, SAMPLE_SEED + UInt64(step), String(""), ctx,
     )
-
-    var out_path = samples_dir + String("/step_") + String(step) + String(".png")
-    sdxl_decode_latent_to_png[LATENT_HW, LATENT_HW](latent, vae_path, out_path, ctx)
-    print("[SDXL-lora] sample step=", step, " -> ", out_path)
 
 
 # ── per-prompt validation caps (serenity.sample_prompts.v1) ──────────────────
@@ -819,12 +905,17 @@ def _sdxl_preflight_sample_caps(sample_cfg: SamplePromptConfig) raises:
             continue
         if p.frames != 1:
             raise Error(String("SDXL sample prompt ") + p.label + String(": only single-frame image samples supported"))
-        if p.width != LATENT_HW * 8 or p.height != LATENT_HW * 8:
+        if p.width != p.height:
             raise Error(
                 String("SDXL sample prompt ") + p.label + String(": requests ")
                 + String(p.width) + String("x") + String(p.height)
-                + String(" but this binary samples ") + String(LATENT_HW * 8)
-                + String("x") + String(LATENT_HW * 8)
+                + String(" but the sampler ladder supports SQUARE resolutions only")
+            )
+        if not _sdxl_sample_px_supported(p.width):
+            raise Error(
+                String("SDXL sample prompt ") + p.label + String(": requests ")
+                + String(p.width) + String("x") + String(p.height)
+                + String(" but the sampler ladder supports 128/512/1024 px only")
             )
         _sdxl_check_caps_shape(p.caps_pos, p.label)
         checked += 1
@@ -844,18 +935,12 @@ def _sdxl_run_sample_caps(
     seed: UInt64,
     ctx: DeviceContext,
 ) raises:
-    var n_lat = 4 * LATENT_HW * LATENT_HW
-    var init_noise = _host_noise(n_lat, seed)
-    var latent = sdxl_sample_resident[LATENT_HW, LATENT_HW](
-        w, lora, context.clone(ctx), y.clone(ctx), init_noise^,
-        prompt.steps, prompt.cfg, ctx,
+    # Runtime-select the ladder rung from THIS prompt's requested px (validated
+    # square + supported by _sdxl_preflight_sample_caps at load).
+    _sdxl_sample_dispatch(
+        prompt.width, w, lora, context, y, vae_path, samples_dir, step,
+        prompt.steps, prompt.cfg, seed, String("_") + prompt.label, ctx,
     )
-    var out_path = (
-        samples_dir + String("/step_") + String(step)
-        + String("_") + prompt.label + String(".png")
-    )
-    sdxl_decode_latent_to_png[LATENT_HW, LATENT_HW](latent, vae_path, out_path, ctx)
-    print("[SDXL-lora] caps sample step=", step, " prompt=", prompt.label, " -> ", out_path)
 
 
 def main() raises:
@@ -1166,11 +1251,11 @@ def main() raises:
             _sdxl_preflight_sample_caps(sample_cfg)
             print("[cadence] sample-during-training WIRED (caps) -> ", samples_dir,
                   " prompts=", len(sample_cfg.prompts), " file=", caps_sample_file,
-                  " latent=", LATENT_HW, "x", LATENT_HW, " -> ", LATENT_HW * 8, "px)")
+                  " res=per-prompt (ladder 128/512/1024px, decoupled from train latent))")
         else:
             print("[cadence] sample-during-training WIRED (legacy cached-caption) -> ", samples_dir,
                   " (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG,
-                  " latent=", LATENT_HW, "x", LATENT_HW, " -> ", LATENT_HW * 8, "px)")
+                  " res=", SAMPLE_DEFAULT_PX, "px (ladder default, decoupled from train latent))")
         print("[cadence] sample VAE:", sample_vae_path)
 
     if sample_enabled and should_sample_completed_step(sample_cadence, 0):
