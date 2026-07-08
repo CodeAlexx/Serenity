@@ -112,8 +112,11 @@ from serenitymojo.ops.linear import linear
 from serenitymojo.ops.linalg_backward import linear_backward_dx, linear_backward_dw
 from serenitymojo.ops.norm import rms_norm
 from serenitymojo.ops.norm_backward import rms_norm_backward_dx
-from serenitymojo.ops.layout import patchify
-from serenitymojo.ops.tensor_algebra import concat, slice as ta_slice, add as ta_add
+from serenitymojo.ops.layout import patchify, unpatchify
+from serenitymojo.ops.tensor_algebra import (
+    concat, slice as ta_slice, add as ta_add, sub as ta_sub, mul_scalar,
+    zeros_device,
+)
 from serenitymojo.ops.activations import silu
 from serenitymojo.ops.activation_backward import silu_backward
 from serenitymojo.ops.embeddings import timestep_embedding
@@ -186,6 +189,16 @@ from serenitymojo.training.full_ft_sidecar import (
     full_ft_sidecar_save, full_ft_sidecar_load,
     full_ft_sidecar_path_for_overlay,
 )
+# FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #7):
+# denoise from the LIVE pinned-host bf16 store via the FT streamed forward;
+# schedule / velocity / noise / pack / decode = the verified 512x512 CFG
+# inference pipeline recipe (pipeline/hidream_o1_cfg.mojo — already this arm's
+# conditioning source; hidream_o1_generate.mojo is its guidance=1 sibling).
+from serenitymojo.ops.random import randn
+from serenitymojo.image.png import save_png, ValueRange
+from serenitymojo.sampling.hidream_o1_scheduler import HiDreamO1Scheduler
+from serenitymojo.io.cap_cache import save_tensor_bin
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 
 comptime HIDREAM_FULL_FT = get_defined_int["HIDREAM_FULL_FT", 0]() != 0
 
@@ -246,6 +259,13 @@ comptime FT_MODEL_DIR = "/mnt/disk1/models/hidream-o1"
 comptime FT_TOK_PATH = "/mnt/disk1/models/hidream-o1/tokenizer.json"
 # the LoRA run-seed lineage, own stream for the FT arm (ideogram4 shape)
 comptime HD_FT_SEED = UInt64(0x41D3_7E11)
+
+# FT inline-sampling denoise recipe = the verified 512x512 CFG inference
+# pipeline defaults (pipeline/hidream_o1_cfg.mojo: GEN_STEPS 20, main guidance
+# 4.0, noise_scale_start 7.5, Default flow-match Euler shift 3.0).
+comptime HD_FT_SAMPLE_STEPS = 20
+comptime HD_FT_SAMPLE_CFG = Float32(4.0)
+comptime HD_FT_SAMPLE_NOISE_SCALE = Float32(7.5)
 
 
 def _slot_dims(slot: Int) raises -> List[Int]:
@@ -576,6 +596,273 @@ def _clip_grads_all(
     return gn
 
 
+# ── FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #7) ───
+# Samples the LIVE pinned-host bf16 store (base+updates already merged = the
+# current model, NO overlay reload, NO LoRA) with the FT arm's OWN streamed
+# forward — sampling reuses training memory by construction. Denoise recipe =
+# the verified 512x512 CFG inference pipeline (pipeline/hidream_o1_cfg.mojo:
+# Default flow-match Euler shift 3.0, x-PREDICTION → v=(x_pred-z)/sigma_clamped,
+# CFG v_uncond + g*(v_cond - v_uncond), model_output = -v_guided, init noise =
+# pixel-space N(0,1)*7.5 then patchify). Conditioning = the FT training step's
+# OWN in-process caption encode (the plan's hidream exception: the spine IS the
+# text encoder — build_t2i_input pads to the S_TEXT=256 bucket, key_valid masks
+# the pads; NO cached-cond files). No parity claim: smoke + artifact evidence
+# only (the denoise forward is the already-gated training forward).
+
+# Per-conditioning static tensors (mrope tables + padded mask), built ONCE per
+# sample event — the FT training step's exact builds minus the backward-only
+# mask_f32.
+struct _HiDreamFtSamplePrep(Movable):
+    var cos_q: Tensor
+    var sin_q: Tensor
+    var cos_k: Tensor
+    var sin_k: Tensor
+    var mask4: Tensor
+
+    def __init__(
+        out self, var cos_q: Tensor, var sin_q: Tensor,
+        var cos_k: Tensor, var sin_k: Tensor, var mask4: Tensor,
+    ):
+        self.cos_q = cos_q^
+        self.sin_q = sin_q^
+        self.cos_k = cos_k^
+        self.sin_k = sin_k^
+        self.mask4 = mask4^
+
+
+def _hidream_ft_sample_build_cond(
+    tok: Qwen3Tokenizer, cfg: HiDreamO1Config, var caption: String,
+) raises -> T2ISample:
+    """The FT training loop's exact caption-fit loop: chat-template + tokenize
+    via build_t2i_input (pads to the S_TEXT bucket with masked <|vision_pad|>),
+    halving the caption until the templated ids fit."""
+    while True:
+        try:
+            return build_t2i_input(tok, cfg, caption, HP, WP, S_TEXT)
+        except:
+            var keep = caption.byte_length() // 2
+            if keep < 8:
+                raise Error("hidream ft-sample: caption cannot fit bucket")
+            var cut = String("")
+            var taken = 0
+            for ch in caption.codepoint_slices():
+                var l = ch.byte_length()
+                if taken + l > keep:
+                    break
+                cut += String(ch)
+                taken += l
+            caption = cut^
+
+
+def _hidream_ft_sample_prep(
+    samp: T2ISample, cfg: HiDreamO1Config, ctx: DeviceContext
+) raises -> _HiDreamFtSamplePrep:
+    var tables = _build_mrope_tables(
+        samp.t_pos, samp.h_pos, samp.w_pos, Dh, cfg.rope_theta,
+        cfg.mrope_h, cfg.mrope_w,
+    )
+    comptime half = Dh // 2
+    var cq_sh: List[Int] = [S * H * half]
+    var ck_sh: List[Int] = [S * HKV * half]
+    var cos_q = Tensor.from_host(_replicate_heads(tables[0], S, half, H), cq_sh.copy(), STDtype.F32, ctx)
+    var sin_q = Tensor.from_host(_replicate_heads(tables[1], S, half, H), cq_sh^, STDtype.F32, ctx)
+    var cos_k = Tensor.from_host(_replicate_heads(tables[0], S, half, HKV), ck_sh.copy(), STDtype.F32, ctx)
+    var sin_k = Tensor.from_host(_replicate_heads(tables[1], S, half, HKV), ck_sh^, STDtype.F32, ctx)
+    var mask_h = _build_prefix_causal_mask_padded(S, H, samp.ar_len, samp.key_valid)
+    var m4_sh: List[Int] = [1, H, S, S]
+    var mask4 = Tensor.from_host(mask_h^, m4_sh^, STDtype.BF16, ctx)
+    return _HiDreamFtSamplePrep(cos_q^, sin_q^, cos_k^, sin_k^, mask4^)
+
+
+# ONE denoise forward: the FT training step's exact embed glue (heads FROZEN —
+# dit._embed/_t_embed/_patch_embed/_scatter_row/_final_layer, the same helpers
+# the FT loss forward uses) around the FT arm's OWN streamed stack forward
+# reading the LIVE host store (read-only: forward never writes back). Returns
+# x_pred's IMAGE rows [1, IMG_L, PATCH_VEC]. The tape's 36 recompute
+# checkpoints drop with `fwd` (no backward runs on samples).
+def _hidream_ft_forward_xpred(
+    dit: HiDreamO1Offloaded[S],
+    store: HiDreamO1HostBf16,
+    norm_w: TArc,
+    samp: T2ISample,
+    z: Tensor,                # [1, IMG_L, PATCH_VEC] bf16 pixel patches
+    model_t: Float32,         # t_pixeldit = 1 - sigma (the t-embed input)
+    prep: _HiDreamFtSamplePrep,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    var text_emb = dit._embed(samp.text_ids, ctx)
+    var t_emb = dit._t_embed(model_t, ctx)
+    var tms_idx = -1
+    for i in range(len(samp.text_ids)):
+        if samp.text_ids[i] == dit.config.tms_token_id:
+            tms_idx = i
+    var text_emb_t = _scatter_row(text_emb, t_emb, tms_idx, len(samp.text_ids), D, ctx)
+    var patch_emb = dit._patch_embed(z, ctx)
+    var hidden_t = concat(1, ctx, text_emb_t, patch_emb)
+    var fwd = hidream_o1_stack_ft_forward_streamed[S, H, HKV, Dh](
+        TArc(hidden_t^), prep.cos_q, prep.sin_q, prep.cos_k, prep.sin_k,
+        prep.mask4, store, D, F, EPS, ctx,
+    )
+    var final_normed = rms_norm(fwd.out[], norm_w[], EPS, ctx)
+    var out_full = dit._final_layer(final_normed, ctx)     # [1, S, PATCH_VEC]
+    var x_pred = ta_slice(out_full, 1, S_TEXT, IMG_L, ctx)
+    ctx.synchronize()   # land the stack's deferred frees; tape drops with fwd
+    return x_pred^
+
+
+# CFG Euler denoise over the live FT store — schedule/step/CFG math 1:1 with
+# the verified 512 inference pipeline (hidream_o1_cfg.denoise):
+#   sched = HiDreamO1Scheduler.full_n_step(n, 3.0)   (Default, deterministic)
+#   t_pixeldit = 1 - step_t/1000;  sigma_clamped = max(step_t/1000, 0.001)
+#   v = (x_pred - z)/sigma_clamped;  v_guided = v_u + g*(v_c - v_u)
+#   z <- sched.step(-v_guided)  ==  z + (sigma_next - sigma)*(-v_guided)
+# Returns the final PIXEL-PATCH tensor [1, IMG_L, PATCH_VEC] bf16 (hidream is
+# pixel-space: decode = unpatchify, no VAE, no latent).
+def _hidream_ft_sample_store_patches(
+    dit: HiDreamO1Offloaded[S],
+    store: HiDreamO1HostBf16,
+    norm_w: TArc,
+    cond: T2ISample,
+    uncond: T2ISample,
+    cond_prep: _HiDreamFtSamplePrep,
+    uncond_prep: _HiDreamFtSamplePrep,
+    init_noise: Tensor,       # [1, IMG_L, PATCH_VEC] bf16 (already *7.5, packed)
+    n_steps: Int,
+    guidance: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if n_steps < 1:
+        raise Error("hidream FT inline sampler: steps must be >= 1")
+    var sched = HiDreamO1Scheduler.full_n_step(n_steps, Float32(3.0))
+    var num_steps = sched.num_inference_steps()
+    var do_cfg = guidance > Float32(1.0)
+    var z = init_noise.clone(ctx)
+    print("[hidream-ft-sample] steps=", num_steps, " cfg=", guidance)
+    for step_idx in range(num_steps):
+        var step_t = sched.timestep(step_idx)
+        var t_pixeldit = Float32(1.0) - step_t / Float32(1000.0)
+        var sigma_clamped = step_t / Float32(1000.0)
+        if sigma_clamped < Float32(0.001):
+            sigma_clamped = Float32(0.001)
+
+        # COND (then UNCOND) pass — both the FT streamed forward, live store.
+        var x_pred_c = _hidream_ft_forward_xpred(
+            dit, store, norm_w, cond, z, t_pixeldit, cond_prep, ctx
+        )
+        if x_pred_c.dtype() != z.dtype():
+            x_pred_c = cast_tensor(x_pred_c, z.dtype(), ctx)
+        var v_cond = mul_scalar(
+            ta_sub(x_pred_c, z, ctx), Float32(1.0) / sigma_clamped, ctx
+        )
+        var v_guided: Tensor
+        if do_cfg:
+            var x_pred_u = _hidream_ft_forward_xpred(
+                dit, store, norm_w, uncond, z, t_pixeldit, uncond_prep, ctx
+            )
+            if x_pred_u.dtype() != z.dtype():
+                x_pred_u = cast_tensor(x_pred_u, z.dtype(), ctx)
+            var v_uncond = mul_scalar(
+                ta_sub(x_pred_u, z, ctx), Float32(1.0) / sigma_clamped, ctx
+            )
+            # v_guided = v_uncond + g*(v_cond - v_uncond)  (pipeline.rs:537)
+            v_guided = ta_add(
+                v_uncond,
+                mul_scalar(ta_sub(v_cond, v_uncond, ctx), guidance, ctx),
+                ctx,
+            )
+        else:
+            v_guided = v_cond^
+        # model_output = -v_guided; deterministic Default Euler step (the
+        # scheduler ignores the noise arg in Default mode — pass zeros).
+        var model_output = mul_scalar(v_guided, Float32(-1.0), ctx)
+        var noise_sh = model_output.shape()
+        var zeros = zeros_device(noise_sh^, model_output.dtype(), ctx)
+        z = sched.step(
+            model_output, step_idx, z, zeros,
+            HD_FT_SAMPLE_NOISE_SCALE, Float32(0.0), ctx,
+        )
+        ctx.synchronize()
+        print("[hidream-ft-sample] step", step_idx + 1, "/", num_steps,
+              " t=", step_t)
+    return z^
+
+
+# FT-arm cadence body (called from `_hidream_full_ft_run` behind
+# HIDREAM_FULL_FT). Conditioning v1 = the FT arm's OWN in-process caption
+# encode of STAGE CAPTION 0 (the plan's hidream exception — this arm already
+# tokenizes/encodes captions per training step; no cached-cond files) + the
+# 512 pipeline's " " uncond, both padded to the S_TEXT bucket. Sample-noise
+# seed = its OWN deterministic stream ((HD_FT_SEED ^ "SAMPLE") +
+# step*1000003 + prompt_idx) — DISJOINT from all three training streams
+# (HD_FT_SEED*6364...+step / *7919+step / *2654435761+step); randn is a pure
+# function of its seed, so sampling consumes NO training RNG and the
+# BYTE-EQUAL loss/resume class is untouched.
+def _hidream_ft_run_inline_samples(
+    dit: HiDreamO1Offloaded[S],
+    store: HiDreamO1HostBf16,
+    norm_w: TArc,
+    tok: Qwen3Tokenizer,
+    stage_dir: String,
+    out_dir: String,
+    completed_step: Int,
+    ctx: DeviceContext,
+) raises:
+    var samples_dir = out_dir + String("/samples")
+    makedirs(samples_dir, exist_ok=True)
+
+    # OWN sample-noise stream (the fleet derivation); prompt idx pi = 0 — ONE
+    # image per event, conditioned on stage caption 0.
+    var pi = 0
+    var sample_seed = (
+        (HD_FT_SEED ^ UInt64(0x53414D504C45))          # "SAMPLE"
+        + UInt64(completed_step) * UInt64(1000003)
+        + UInt64(pi)
+    )
+    var caption = _read_text(
+        stage_dir + String("/caption.") + String(pi) + String(".txt")
+    )
+    var cond = _hidream_ft_sample_build_cond(tok, dit.config, caption^)
+    var uncond = _hidream_ft_sample_build_cond(tok, dit.config, String(" "))
+    var cond_prep = _hidream_ft_sample_prep(cond, dit.config, ctx)
+    var uncond_prep = _hidream_ft_sample_prep(uncond, dit.config, ctx)
+    print("[hidream-ft-sample] step", completed_step,
+          " cond=stage caption", pi, " steps=", HD_FT_SAMPLE_STEPS,
+          " cfg=", HD_FT_SAMPLE_CFG, " seed=", sample_seed)
+
+    # init noise = the inference contract: pixel-space N(0,1)*7.5, patchified.
+    var z_sh: List[Int] = [1, 3, HP * PATCH, WP * PATCH]
+    var z0 = randn(z_sh^, sample_seed, STDtype.BF16, ctx)
+    z0 = mul_scalar(z0, HD_FT_SAMPLE_NOISE_SCALE, ctx)
+    var z_init = patchify(z0, PATCH, ctx)            # [1, IMG_L, PATCH_VEC]
+
+    var patches = _hidream_ft_sample_store_patches(
+        dit, store, norm_w, cond, uncond, cond_prep, uncond_prep,
+        z_init, HD_FT_SAMPLE_STEPS, HD_FT_SAMPLE_CFG, ctx,
+    )
+
+    var out_png = (
+        samples_dir + String("/ft_sample_step") + String(completed_step)
+        + String(".png")
+    )
+    # hidream decodes via its OWN final layer straight to pixel patches — NO
+    # VAE, NO latent (documented plan delta: no offline decode CLI; the
+    # persisted pre-image artifact is the raw pixel-PATCH tensor
+    # [1,IMG_L,PATCH_VEC] bf16 and its decode is unpatchify — pure layout, no
+    # model forward, no meaningful OOM surface). PNG write is in-process,
+    # non-fatal.
+    var pix_bin = out_png + String(".pix.bin")
+    save_tensor_bin(patches, pix_bin, ctx)
+    ctx.synchronize()
+    try:
+        var img = unpatchify(patches, 3, HP * PATCH, WP * PATCH, PATCH, ctx)
+        save_png(img, out_png, ctx, ValueRange.SIGNED)
+        print("[hidream-ft-sample] wrote", out_png,
+              " (", WP * PATCH, "x", HP * PATCH, ")")
+    except e:
+        print("[hidream-ft-sample] in-process PNG write failed (pixel",
+              "patches saved):", pix_bin, " err:", String(e))
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # FULL FINETUNE run (self-contained; called from main behind HIDREAM_FULL_FT).
 #
@@ -607,7 +894,7 @@ def _hidream_full_ft_run() raises:
     if len(args) < 3:
         raise Error(
             "usage (HIDREAM_FULL_FT): train_hidream_o1_real <stage_dir> <steps>"
-            " [lr] [-] [out_dir]"
+            " [lr] [-] [out_dir] [-] [-] [-] [resume_overlay] [sample_every]"
         )
     var stage_dir = String(args[1])
     var steps = atol(String(args[2]))
@@ -639,6 +926,19 @@ def _hidream_full_ft_run() raises:
             raise Error(
                 String("hidream full-FT resume: expected an overlay ")
                 + String(".safetensors path, got ") + resume_overlay
+            )
+    # argv 10 (optional; FT-arm ONLY — this whole parser sits behind the
+    # comptime HIDREAM_FULL_FT gate, inert on default builds) = inline sample
+    # cadence (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #7): sample the LIVE
+    # host store every N steps. "-" or absent = off; must be a positive int.
+    var sample_every = 0
+    if len(args) > 10 and String(args[10]) != "-":
+        sample_every = atol(String(args[10]))
+        if sample_every < 1:
+            raise Error(
+                String("hidream full-FT: argv 10 sample_every must be a ")
+                + String("positive int ('-' or absent = off), got ")
+                + String(args[10])
             )
     makedirs(out_dir, exist_ok=True)
 
@@ -713,6 +1013,25 @@ def _hidream_full_ft_run() raises:
     if n_samples == 0:
         raise Error("hidream full-FT: no image.<i> in stage dir")
     print("[data] samples:", n_samples)
+
+    # ── inline sampling (FT arm; FT_INLINE_SAMPLING_PLAN_2026-07-08, #7) ─────
+    # Fires after global step k when k % sample_every == 0 (never at k=0; the
+    # loop starts at k=1). v1 does NOT save-before-sample (the FT arm saves at
+    # run end only — documented delta vs ot_should_save_before_sample).
+    # Sampling reads the LIVE pinned-host store (the optimizer writes back
+    # into it every block — it IS the current model); conditioning = this
+    # arm's own in-process caption encode (stage caption 0 — the hidream
+    # exception) + " " uncond.
+    var sample_enabled = sample_every > 0
+    if sample_enabled:
+        print("[hidream-ft-sample] enabled every", sample_every,
+              "steps (steps=", HD_FT_SAMPLE_STEPS, " cfg=", HD_FT_SAMPLE_CFG,
+              ")")
+        print("[hidream-ft-sample] v1: LIVE host-store weights, sample res",
+              WP * PATCH, "x", HP * PATCH,
+              ", in-process caption-0 cond + ' ' uncond,")
+        print("[hidream-ft-sample]     NO save-before-sample (the FT arm",
+              "saves at run end)")
 
     var sw = _sigmas_and_weights()
     var train_start = perf_counter_ns()
@@ -853,6 +1172,18 @@ def _hidream_full_ft_run() raises:
             "| vram_used_gb", used_gb,
         )
 
+        # ── inline sampler: sample the LIVE host store, no save/reload ──────
+        if sample_enabled and step % sample_every == 0:
+            ctx.synchronize()
+            cu_mempool_trim_current(0)   # release pool blocks before the render
+            try:
+                _hidream_ft_run_inline_samples(
+                    dit, store, norm_w, tok, stage_dir, out_dir, step, ctx,
+                )
+            except e:
+                print("[hidream-ft-sample] sample FAILED (training continues):", e)
+            ctx.synchronize()
+
     # Save the trained surface (host bytes -> safetensors overlay, no GPU).
     var out_path = (
         out_dir + String("/hidream_o1_full_ft_") + String(steps)
@@ -869,8 +1200,9 @@ def _hidream_full_ft_run() raises:
     print("[hidream-ft] v1 notes: surface = 36x7 block matmuls (in_ln/post_ln/")
     print("  q_norm/k_norm/embed_tokens/heads/final norm+linear frozen); RESUME:")
     print("  pass the saved overlay as argv 9 (adafactor sidecar derived from")
-    print("  it); inline sampling not wired (overlay the saved bf16 mats over")
-    print("  the F32 base to sample).")
+    print("  it); inline sampling: argv 10 sample_every > 0 (samples the LIVE")
+    print("  store at 512, in-process caption-0 cond + ' ' uncond, no")
+    print("  save-before-sample).")
 
 
 def main() raises:
