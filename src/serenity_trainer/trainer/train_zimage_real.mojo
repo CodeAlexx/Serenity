@@ -54,6 +54,7 @@
 #     pixi run mojo run -I . serenitymojo/training/train_zimage_real.mojo [steps] [start_step] [state.safetensors]
 
 from std.sys import argv
+from std.sys.defines import get_defined_int
 from std.ffi import external_call
 from std.collections import List, Optional
 from std.gpu.host import DeviceContext
@@ -187,12 +188,18 @@ from serenitymojo.training.aspect_buckets import (
 from serenitymojo.models.zimage.zimage_stack_lora import (
     ZImageFullFTGrads, zimage_stack_lora_backward_main_device_fullft,
     build_zimage_zero_lora_device_set,
+    ZImageFullFTAfdStats, zimage_stack_lora_backward_main_device_fullft_afd,
 )
 from serenitymojo.training.full_finetune_zimage import (
     ZImageFullFTOpt, zimage_full_ft_opt_init, zimage_full_ft_grad_norm,
     zimage_full_ft_step, zimage_full_ft_save_checkpoint,
+    zimage_full_ft_opt_empty, zimage_full_ft_afd_states_init,
+    zimage_full_ft_save_checkpoint_device,
 )
-from serenitymojo.training.train_config import TRAIN_OPTIMIZER_ADAMW_8BIT
+from serenitymojo.training.adafactor_device import AdafactorDeviceState
+from serenitymojo.training.train_config import (
+    TRAIN_OPTIMIZER_ADAMW_8BIT, TRAIN_OPTIMIZER_ADAFACTOR,
+)
 # T2.E ControlNet (controlnet_layers > 0; default-off — C13: the LoRA path
 # routes around ALL of it). Control stack = the gated module
 # (models/zimage/controlnet_block.mojo, parity 46/46 + step smoke); trainer
@@ -288,6 +295,29 @@ comptime ZIMAGE_V2_CAPTURE = False
 # code compiled in: b1match/b1match2 byte-identical (verified 2026-06-11).
 comptime ZIMAGE_V2_GRAPH_B2 = False
 comptime ZIMAGE_V2_GRAPH_B2_PATH = ZIMAGE_V2_ENGINE and ZIMAGE_V2_GRAPH and ZIMAGE_V2_GRAPH_B2
+
+# ── FULL-FT optimizer scheme (-D ZIMAGE_FT_ADAFACTOR=1; the -D FULL_FT fleet
+# pattern). Default 0 = the as-built T2.C host scheme (F32 masters + bnb 8-bit
+# AdamW + RNE write-back; ~26s/step of host math at 5.31B params). 1 = the
+# krea2/chroma/klein blueprint: fused per-block DEVICE Adafactor + stochastic
+# rounding consuming each block's d_W on device against the RESIDENT bf16
+# weights (training/adafactor_device.mojo; no grad D2H / masters / moments /
+# write-back). ALTERNATIVE, not replacement (C13): the default arm — including
+# its run-start adam8bit equivalence gate — is untouched and compiled out of
+# this flag's path. NOTE: no global grad-norm clip on the adafactor arm (the
+# fused per-block consume can't know the global norm; adafactor's update-RMS
+# d-threshold clip stands in — full rationale in the _afd driver header,
+# zimage_stack_lora.mojo).
+comptime ZIMAGE_FT_ADAFACTOR = get_defined_int["ZIMAGE_FT_ADAFACTOR", 0]() != 0
+# -D ZIMAGE_FT_RNE=1: sr_seed=0 -> RNE bf16 writes on the adafactor arm (the
+# adafactor_device parity-gate mode); default = per-step/slot stochastic
+# rounding (the OT bf16 full-FT contract).
+comptime ZIMAGE_FT_RNE = get_defined_int["ZIMAGE_FT_RNE", 0]() != 0
+# SimpleTuner/torch-adafactor scalars (the fleet full-FT values: krea2/chroma/
+# klein all pass b2d=-0.8, eps2=1e-3, d=1.0; lr/wd come from the config).
+comptime ZIMAGE_FT_AF_BETA2_DECAY = Float64(-0.8)
+comptime ZIMAGE_FT_AF_EPS2 = Float64(1e-3)
+comptime ZIMAGE_FT_AF_D = Float64(1.0)
 
 comptime LAT_C = 16
 comptime LAT_H = 72
@@ -404,13 +434,26 @@ def validate_zimage_full_ft_config(cfg: TrainConfig) raises:
         raise Error("Z-Image full-FT requires 0 double blocks and 30 main layers")
     if cfg.mlp_hidden != F:
         raise Error("Z-Image full-FT config arch mismatch (mlp_hidden)")
-    if cfg.optimizer != TRAIN_OPTIMIZER_ADAMW_8BIT:
-        raise Error(
-            "Z-Image full-FT v1 requires optimizer ADAMW_8BIT (8-bit moments"
-            " are the enabler for 6.15B-param full-FT on this hardware;"
-            " F32-moment AdamW does not fit — VRAM/host math in"
-            " training/full_finetune_zimage.mojo)"
-        )
+    comptime if ZIMAGE_FT_ADAFACTOR:
+        # device-adafactor build: the comptime flag selects the scheme; accept
+        # the staged ADAMW_8BIT configs unchanged (compat) or an explicit
+        # ADAFACTOR tag.
+        if (
+            cfg.optimizer != TRAIN_OPTIMIZER_ADAMW_8BIT
+            and cfg.optimizer != TRAIN_OPTIMIZER_ADAFACTOR
+        ):
+            raise Error(
+                "Z-Image full-FT (ZIMAGE_FT_ADAFACTOR build) requires optimizer"
+                " ADAMW_8BIT (config compat) or ADAFACTOR"
+            )
+    else:
+        if cfg.optimizer != TRAIN_OPTIMIZER_ADAMW_8BIT:
+            raise Error(
+                "Z-Image full-FT v1 requires optimizer ADAMW_8BIT (8-bit moments"
+                " are the enabler for 6.15B-param full-FT on this hardware;"
+                " F32-moment AdamW does not fit — VRAM/host math in"
+                " training/full_finetune_zimage.mojo)"
+            )
     if not (cfg.lr > Float32(0.0)) or cfg.lr > Float32(1.0e-3):
         raise Error("Z-Image full-FT learning_rate must be in (0, 1e-3]")
     if cfg.batch_size == 2:
@@ -1938,6 +1981,8 @@ def _full_ft_step[
     main_blocks: List[ZImageBlockWeights],
     zero_dev: ZImageLoraDeviceSet,
     mut ft_opt: ZImageFullFTOpt,
+    mut af_states: List[AdafactorDeviceState],  # ZIMAGE_FT_ADAFACTOR arm only (else empty)
+    sr_seed: UInt64,                            # ZIMAGE_FT_ADAFACTOR arm only (0 = RNE)
     final_lin_w: Tensor,
     final_lin_b: Tensor,
     x_pad_h: List[Float32],
@@ -2048,47 +2093,89 @@ def _full_ft_step[
               " max_abs=", ps.max_abs, " target mean=", Float32(ts.mean),
               " std=", Float32(ts.std), " max_abs=", ts.max_abs)
 
-    var grads = zimage_stack_lora_backward_main_device_fullft[
-        H, Dh, N_IMG_B, N_TXT_B, S_B
-    ](
-        d_loss, main_blocks, mvall.per_block, zero_dev,
-        f_scale.copy(), final_lin_w,
-        uni_cos[], uni_sin[], fwd,
-        D, F, OUT_CH, EPS, FINAL_EPS, ctx,
-    )
-    var t_bwd = perf_counter_ns()
+    comptime if ZIMAGE_FT_ADAFACTOR:
+        # fused device Adafactor + SR: the backward CONSUMES each block's d_W
+        # on device (no D2H, no host optimizer, no write-back — the resident
+        # bf16 weights are updated in place). Grad clip NOT applied on this
+        # arm (rationale: _afd driver header / the comptime flag comment).
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        var st_afd = zimage_stack_lora_backward_main_device_fullft_afd[
+            H, Dh, N_IMG_B, N_TXT_B, S_B
+        ](
+            d_loss, main_blocks, mvall.per_block, zero_dev,
+            f_scale.copy(), final_lin_w,
+            uni_cos[], uni_sin[], fwd,
+            D, F, OUT_CH, EPS, FINAL_EPS,
+            af_states, k, Float64(step_lr),
+            ZIMAGE_FT_AF_BETA2_DECAY, ZIMAGE_FT_AF_EPS2, ZIMAGE_FT_AF_D,
+            Float64(train_cfg.weight_decay), sr_seed, ctx,
+        )
+        var t_bwdopt = perf_counter_ns()
+        var gn_afd = st_afd.grad_norm
 
-    var gn = zimage_full_ft_grad_norm(grads)
-    var gscale = Float32(1.0)
-    if gn > Float64(train_cfg.max_grad_norm) and gn > 0.0:
-        gscale = Float32(Float64(train_cfg.max_grad_norm) / gn)
-    var t_norm = perf_counter_ns()
+        var t1a = perf_counter_ns()
+        var secs_a = Float64(t1a - t0) / 1.0e9
+        print_trainer_progress(
+            String("ZImage-fullft"), k, run_steps, 1,
+            loss, gn_afd, secs_a, 0.0,
+            Float64(t1a - train_start_ns) / 1.0e9,
+        )
+        print("[FULLFT-AFD step=", k, "] grad_norm=", Float32(gn_afd),
+              " slots_stepped=", st_afd.grad_count,
+              " sr=", (0 if sr_seed == 0 else 1), " (no global clip — see header)")
+        print("[TIMING-FULLFT step=", k,
+              "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
+              " fwd=", Float32(Float64(t_fwd - t_prep) / 1.0e9),
+              " loss=", Float32(Float64(t_loss - t_fwd) / 1.0e9),
+              " bwd+afd_opt=", Float32(Float64(t_bwdopt - t_loss) / 1.0e9))
+        # lora_b_sum carries grad_norm on this arm ("trains" evidence: grads
+        # flowed + every slot stepped); the driver raises on nonfinite.
+        return StepResult(
+            loss, Float32(gn_afd), Float32(secs_a), Float32(gn_afd),
+            st_afd.grad_count, 0,
+        )
+    else:
+        var grads = zimage_stack_lora_backward_main_device_fullft[
+            H, Dh, N_IMG_B, N_TXT_B, S_B
+        ](
+            d_loss, main_blocks, mvall.per_block, zero_dev,
+            f_scale.copy(), final_lin_w,
+            uni_cos[], uni_sin[], fwd,
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+        )
+        var t_bwd = perf_counter_ns()
 
-    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
-    var st = zimage_full_ft_step(
-        ft_opt, grads, gscale, k, step_lr,
-        train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
-        train_cfg.weight_decay, main_blocks, ctx,
-    )
-    var t_opt = perf_counter_ns()
+        var gn = zimage_full_ft_grad_norm(grads)
+        var gscale = Float32(1.0)
+        if gn > Float64(train_cfg.max_grad_norm) and gn > 0.0:
+            gscale = Float32(Float64(train_cfg.max_grad_norm) / gn)
+        var t_norm = perf_counter_ns()
 
-    var t1 = perf_counter_ns()
-    var secs = Float64(t1 - t0) / 1.0e9
-    print_trainer_progress(
-        String("ZImage-fullft"), k, run_steps, 1,
-        loss, gn, secs, 0.0,
-        Float64(t1 - train_start_ns) / 1.0e9,
-    )
-    print("[FULLFT step=", k, "] upd_l1=", Float32(st.upd_l1),
-          " upd_max=", st.upd_max, " clip_scale=", gscale)
-    print("[TIMING-FULLFT step=", k,
-          "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
-          " fwd=", Float32(Float64(t_fwd - t_prep) / 1.0e9),
-          " loss=", Float32(Float64(t_loss - t_fwd) / 1.0e9),
-          " bwd+d2h=", Float32(Float64(t_bwd - t_loss) / 1.0e9),
-          " gnorm=", Float32(Float64(t_norm - t_bwd) / 1.0e9),
-          " opt+h2d=", Float32(Float64(t_opt - t_norm) / 1.0e9))
-    return StepResult(loss, Float32(gn), Float32(secs), Float32(st.upd_l1), 0, 0)
+        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        var st = zimage_full_ft_step(
+            ft_opt, grads, gscale, k, step_lr,
+            train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
+            train_cfg.weight_decay, main_blocks, ctx,
+        )
+        var t_opt = perf_counter_ns()
+
+        var t1 = perf_counter_ns()
+        var secs = Float64(t1 - t0) / 1.0e9
+        print_trainer_progress(
+            String("ZImage-fullft"), k, run_steps, 1,
+            loss, gn, secs, 0.0,
+            Float64(t1 - train_start_ns) / 1.0e9,
+        )
+        print("[FULLFT step=", k, "] upd_l1=", Float32(st.upd_l1),
+              " upd_max=", st.upd_max, " clip_scale=", gscale)
+        print("[TIMING-FULLFT step=", k,
+              "] prep=", Float32(Float64(t_prep - t0) / 1.0e9),
+              " fwd=", Float32(Float64(t_fwd - t_prep) / 1.0e9),
+              " loss=", Float32(Float64(t_loss - t_fwd) / 1.0e9),
+              " bwd+d2h=", Float32(Float64(t_bwd - t_loss) / 1.0e9),
+              " gnorm=", Float32(Float64(t_norm - t_bwd) / 1.0e9),
+              " opt+h2d=", Float32(Float64(t_opt - t_norm) / 1.0e9))
+        return StepResult(loss, Float32(gn), Float32(secs), Float32(st.upd_l1), 0, 0)
 
 
 def _zimage_full_ft_main(
@@ -2106,8 +2193,19 @@ def _zimage_full_ft_main(
     print("  config:", cfg_path)
     print("  trainable: 30 main blocks x 7 slot projections (5.31B params);")
     print("  frozen: refiners / embedders / norms / adaLN / final layer (v1 scope)")
-    print("  optimizer: host bnb 8-bit AdamW on F32 masters; lr=", train_cfg.lr,
-          " wd=", train_cfg.weight_decay, " max_grad_norm=", train_cfg.max_grad_norm)
+    comptime if ZIMAGE_FT_ADAFACTOR:
+        print("  optimizer: FUSED DEVICE Adafactor + ",
+              ("RNE (gate mode)" if ZIMAGE_FT_RNE else "stochastic rounding"),
+              " on the RESIDENT bf16 weights (ZIMAGE_FT_ADAFACTOR build);")
+        print("    b2d=", ZIMAGE_FT_AF_BETA2_DECAY, " eps2=", ZIMAGE_FT_AF_EPS2,
+              " d=", ZIMAGE_FT_AF_D, " lr=", train_cfg.lr,
+              " wd=", train_cfg.weight_decay)
+        print("    NO global grad-norm clip on this arm (fused per-block consume;")
+        print("    adafactor's update-RMS d-threshold clip stands in — driver header);")
+        print("    resume: fail-loud (adafactor row/col sidecar TODO, fleet-standard)")
+    else:
+        print("  optimizer: host bnb 8-bit AdamW on F32 masters; lr=", train_cfg.lr,
+              " wd=", train_cfg.weight_decay, " max_grad_norm=", train_cfg.max_grad_norm)
     print("  weights:", transformer_dir)
     print("  cache:", cache_dir)
     print("  output checkpoint dir:", out_dir)
@@ -2139,8 +2237,17 @@ def _zimage_full_ft_main(
     # zero LoRA set: scale==0 adapters -> the device forward IS the base forward.
     var zero_dev = build_zimage_zero_lora_device_set(NUM_NR, NUM_CR, MAIN_DEPTH, ctx)
 
-    # host-offloaded optimizer state (runs the fast-requant equivalence gate).
-    var ft_opt = zimage_full_ft_opt_init(main_blocks, D, F, ctx)
+    # optimizer state: default arm = host masters + 8-bit moments (init runs
+    # the fast-requant equivalence gate); adafactor arm = device factored
+    # row/col vars only (~20MB) + an EMPTY ZImageFullFTOpt placeholder.
+    var ft_opt: ZImageFullFTOpt
+    var af_states: List[AdafactorDeviceState]
+    comptime if ZIMAGE_FT_ADAFACTOR:
+        ft_opt = zimage_full_ft_opt_empty(ctx)
+        af_states = zimage_full_ft_afd_states_init(main_blocks, D, F, ctx)
+    else:
+        ft_opt = zimage_full_ft_opt_init(main_blocks, D, F, ctx)
+        af_states = List[AdafactorDeviceState]()
 
     if train_cfg.save_every > 0 and train_cfg.save_every < run_steps:
         print("[fullft] NOTE: mid-run save_every is not wired in v1;",
@@ -2153,6 +2260,12 @@ def _zimage_full_ft_main(
     for k in range(1, run_steps + 1):
         var slot = (k - 1) % cache.count()
         var step_seed = UInt64(k)
+        # adafactor arm: per-step SR seed (krea2 derivation; per-slot mix in
+        # the driver). ZIMAGE_FT_RNE build -> 0 -> RNE writes (gate mode).
+        var sr_seed = UInt64(0)
+        comptime if ZIMAGE_FT_ADAFACTOR:
+            comptime if not ZIMAGE_FT_RNE:
+                sr_seed = train_cfg.seed * UInt64(2654435761) + UInt64(k)
         var key = cache.peek_key(slot, ctx)
         if key.c != LAT_C:
             raise Error("zimage full-FT: unsupported latent channel count")
@@ -2163,6 +2276,7 @@ def _zimage_full_ft_main(
                 var r = _full_ft_step[72, 56, 224](
                     k, run_steps, slot, step_seed, cache, aux,
                     nr_blocks, cr_blocks, main_blocks, zero_dev, ft_opt,
+                    af_states, sr_seed,
                     final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, ctx,
                 )
@@ -2172,6 +2286,7 @@ def _zimage_full_ft_main(
                 var r2 = _full_ft_step[72, 56, 256](
                     k, run_steps, slot, step_seed, cache, aux,
                     nr_blocks, cr_blocks, main_blocks, zero_dev, ft_opt,
+                    af_states, sr_seed,
                     final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, ctx,
                 )
@@ -2184,6 +2299,7 @@ def _zimage_full_ft_main(
                 var r3 = _full_ft_step[64, 64, 224](
                     k, run_steps, slot, step_seed, cache, aux,
                     nr_blocks, cr_blocks, main_blocks, zero_dev, ft_opt,
+                    af_states, sr_seed,
                     final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, ctx,
                 )
@@ -2193,6 +2309,7 @@ def _zimage_full_ft_main(
                 var r4 = _full_ft_step[64, 64, 256](
                     k, run_steps, slot, step_seed, cache, aux,
                     nr_blocks, cr_blocks, main_blocks, zero_dev, ft_opt,
+                    af_states, sr_seed,
                     final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
                     train_cfg, train_start, ctx,
                 )
@@ -2212,10 +2329,21 @@ def _zimage_full_ft_main(
     print("first_loss=", first_loss, " last_loss=", last_loss)
     var trains = total_upd_l1 > 0.0
     if trains and (last_loss == last_loss):
-        print("RESULT: REAL Z-IMAGE FULL-FT TRAIN OK — total |update|_1 =",
-              Float32(total_upd_l1), "; loss", first_loss, "->", last_loss,
-              (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        zimage_full_ft_save_checkpoint(transformer_dir, out_dir, ft_opt, ctx)
+        comptime if ZIMAGE_FT_ADAFACTOR:
+            # on this arm lora_b_sum carried the per-step grad L2 (every slot
+            # stepped or the driver raised) — label the evidence accordingly.
+            print("RESULT: REAL Z-IMAGE FULL-FT TRAIN OK (device adafactor) — "
+                  "Σ grad_norm =", Float32(total_upd_l1), "; loss", first_loss,
+                  "->", last_loss,
+                  (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+            zimage_full_ft_save_checkpoint_device(
+                transformer_dir, out_dir, main_blocks, D, F, ctx
+            )
+        else:
+            print("RESULT: REAL Z-IMAGE FULL-FT TRAIN OK — total |update|_1 =",
+                  Float32(total_upd_l1), "; loss", first_loss, "->", last_loss,
+                  (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
+            zimage_full_ft_save_checkpoint(transformer_dir, out_dir, ft_opt, ctx)
     else:
         print("RESULT: FAIL trains=", trains)
 
