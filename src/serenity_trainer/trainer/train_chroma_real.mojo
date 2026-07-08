@@ -107,6 +107,12 @@ from serenitymojo.training.onetrainer_cache_preflight import (
 from serenitymojo.training.chroma_sample_resident import (
     chroma_sample_resident, chroma_decode_latent_to_png,
 )
+# FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #4):
+# denoise from the LIVE pinned-host bf16 store via the FT streamed forward;
+# schedule + decode are the LoRA sampler's parity-gated pieces.
+from serenitymojo.io.cap_cache import save_tensor_bin
+from serenitymojo.sampling.flux1_dev import build_flux1_sigma_schedule
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 
 # ── FULL FINETUNE (-D CHROMA_FULL_FT=1; FULL_FINETUNE_ROLLOUT_PLAN_2026-07-07,
 # chroma card — the krea2/klein `ot-mojo-full-finetune` blueprint) ────────────
@@ -528,6 +534,160 @@ def _validate_chroma_full_ft_config(cfg: TrainConfig) raises:
         )
 
 
+# ── FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #4) ───
+# CFG Euler flow-match denoise whose transformer forward is the FT arm's OWN
+# streamed forward (chroma_stack_ft_forward_streamed) reading the LIVE
+# pinned-host bf16 store — base+updates already merged = the current model,
+# NO LoRA, NO reload — so sampling reuses the training memory footprint by
+# construction. Schedule/step/CFG math is 1:1 with the parity-gated LoRA
+# sampler (training/chroma_sample_resident.mojo):
+#   sigmas = build_flux1_sigma_schedule(n_steps, N_IMG)     # n_steps+1, 1->0
+#   per step: frozen approximator at t_curr -> pooled mod table [MOD_INDEX,D],
+#   pred = uncond + cfg*(cond - uncond), img += dt*pred (dt<0), host F32 math.
+# No parity claim: smoke + artifact evidence only (the denoise forward is the
+# already-gated training forward). Returns the denoised PACKED latent
+# [N_IMG*IN_CH] host floats in trainer-scaled space (the FLUX VAE decode's
+# internal z/scale+shift inverts the trainer's (latent-SHIFT)*SCALE).
+def _chroma_ft_sample_store_latent(
+    base: ChromaStackBase,
+    approx: ChromaDitCache,
+    store: ChromaHostBf16,
+    cond_txt: List[Float32],      # [N_TXT*TXT_CH] cached caption T5 features
+    uncond_txt: List[Float32],    # [N_TXT*TXT_CH] zeros (the model's contract)
+    init_noise: List[Float32],    # [N_IMG*IN_CH] t=1 packed noise (own stream)
+    cos: List[Float32],
+    sin: List[Float32],
+    n_steps: Int,
+    cfg_scale: Float32,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    if n_steps < 1:
+        raise Error("chroma FT inline sampler: steps must be >= 1")
+    var sigmas = build_flux1_sigma_schedule(n_steps, N_IMG)
+    var img = init_noise.copy()   # [N_IMG*IN_CH], evolves in place each step
+    var n = len(img)
+    print("[chroma-ft-sample] steps=", n_steps, " cfg=", cfg_scale)
+    for step in range(n_steps):
+        var t_curr = sigmas[step]
+        var t_next = sigmas[step + 1]
+        var dt = t_next - t_curr   # < 0 (down the schedule)
+
+        # frozen approximator -> per-step modulation table at THIS sigma
+        # (== t_model; see chroma_sample_resident.mojo header).
+        var pooled_tensor = _pooled_modulation_tensor(approx, t_curr, ctx)
+        var pooled = _host_f32_for_step_math(pooled_tensor, ctx)
+
+        # COND pass: streamed FT forward from the LIVE host store.
+        var fwd_c = chroma_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
+            img.copy(), cond_txt.copy(), pooled.copy(), MOD_INDEX,
+            base, store, cos.copy(), sin.copy(),
+            D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+        )
+        var v = fwd_c.out.copy()
+        if len(v) != n:
+            raise Error("chroma FT inline sampler: velocity length mismatch")
+        # DROP the cond forward struct before the uncond forward — its 57 saved
+        # block inputs are dead weight here (no backward runs on samples).
+        _ = fwd_c^
+        if cfg_scale != Float32(1.0):
+            ctx.synchronize()   # land the async frees before the uncond fwd
+            var fwd_u = chroma_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
+                img.copy(), uncond_txt.copy(), pooled.copy(), MOD_INDEX,
+                base, store, cos.copy(), sin.copy(),
+                D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+            )
+            # CFG: pred = uncond + cfg*(cond - uncond), host F32 (the LoRA
+            # sampler's combine, chroma_sample_resident.mojo:158).
+            for i in range(n):
+                v[i] = fwd_u.out[i] + cfg_scale * (v[i] - fwd_u.out[i])
+            _ = fwd_u^
+        # Euler: img += dt*pred (chroma_sample_resident.mojo:159).
+        for i in range(n):
+            img[i] = img[i] + dt * v[i]
+        ctx.synchronize()
+        if step == 0 or step + 1 == n_steps or (step + 1) % 5 == 0:
+            print("[chroma-ft-sample] step", step + 1, "/", n_steps,
+                  " sigma=", t_curr)
+    return img^
+
+
+# FT-arm cadence body (called from `_chroma_full_ft_run` behind CHROMA_FULL_FT).
+# Conditioning = the model's existing resident-sampler contract
+# (chroma_sample_resident.mojo header): the CURRENT step's cached caption T5
+# features as COND + an all-zero vector as UNCOND — no live text encoder.
+# Sample-noise seed = its OWN deterministic stream derived from
+# (SEED_BASE, completed_step) — DISJOINT from all three training streams
+# (SEED_BASE+k / SEED_BASE*7919+k / SEED_BASE*2654435761+k); _host_noise is a
+# pure function of its seed, so sampling consumes NO training RNG and the
+# wobble-class resume gate (BYTE-EQUAL sigmas) is untouched.
+def _chroma_ft_run_inline_samples(
+    base: ChromaStackBase,
+    approx: ChromaDitCache,
+    store: ChromaHostBf16,
+    cond_txt: List[Float32],     # [N_TXT*TXT_CH] this step's cached caption T5
+    cos: List[Float32],
+    sin: List[Float32],
+    cfg: TrainConfig,
+    completed_step: Int,
+    ctx: DeviceContext,
+) raises:
+    var samples_dir = String(LORA_DIR) + String("/samples")
+    makedirs(samples_dir, exist_ok=True)
+
+    # UNCOND: zeroed text features (the LoRA sampler's CFG empty cond).
+    var uncond_txt = List[Float32]()
+    for _ in range(N_TXT * TXT_CH):
+        uncond_txt.append(Float32(0.0))
+
+    # OWN sample-noise stream (the shipped krea2/klein/zimage derivation):
+    # (SEED_BASE XOR "SAMPLE") folded with the global step (+ prompt idx = 0 —
+    # chroma samples ONE image per event, the cached-caption conditioning).
+    var sample_seed = (
+        (SEED_BASE ^ UInt64(0x53414D504C45))          # "SAMPLE"
+        + UInt64(completed_step) * UInt64(1000003)
+        + UInt64(0)
+    )
+    print("[chroma-ft-sample] step", completed_step, " steps=", SAMPLE_STEPS,
+          " cfg=", SAMPLE_CFG, " seed=", sample_seed)
+    var init_noise = _host_noise(N_IMG * IN_CH, sample_seed)
+
+    var latent = _chroma_ft_sample_store_latent(
+        base, approx, store, cond_txt.copy(), uncond_txt^, init_noise^,
+        cos.copy(), sin.copy(), SAMPLE_STEPS, SAMPLE_CFG, ctx,
+    )
+
+    var out_png = (
+        samples_dir + String("/ft_sample_step") + String(completed_step)
+        + String(".png")
+    )
+    # Persist the LATENT first so a process-separated decode
+    # (chroma_decode_latent CLI, fresh GPU pool) can ALWAYS produce the PNG,
+    # then attempt the in-process 512 decode; its failure is non-fatal.
+    var lat_bin = out_png + String(".lat.bin")
+    var lat_t = Tensor.from_host(
+        latent.copy(), [N_IMG, IN_CH], STDtype.F32, ctx
+    )
+    save_tensor_bin(lat_t, lat_bin, ctx)
+    ctx.synchronize()
+    cu_mempool_trim_current(0)   # release denoise transients pre-decode
+    # FLUX VAE (ae.safetensors) — the LoRA sampler's decode contract; cfg.vae
+    # overrides when set (must be the BFL flux VAE layout).
+    var vae_path = String(SAMPLE_VAE_PATH)
+    if cfg.vae.byte_length() > 0:
+        vae_path = cfg.vae.copy()
+    try:
+        chroma_decode_latent_to_png[
+            LAT_C, LAT_H, LAT_W, HT, WT, PATCH, N_IMG, IN_CH
+        ](latent, vae_path, out_png, ctx)
+        print("[chroma-ft-sample] wrote", out_png,
+              " (", LAT_W * 8, "x", LAT_H * 8, ")")
+    except e:
+        print("[chroma-ft-sample] in-process decode failed (latent saved):",
+              lat_bin, " err:", String(e))
+        print("[chroma-ft-sample] decode offline (fresh GPU pool): ",
+              "chroma_decode_latent ", lat_bin, " ", vae_path, " ", out_png)
+
+
 # resume_overlay ("" = fresh run): a prior FT run's saved overlay; the adafactor
 # sidecar is derived from it (full_ft_sidecar_path_for_overlay). Resume = base
 # ckpt store build THEN overlay bytes THEN sidecar states/t_step/seed; the loop
@@ -599,6 +759,24 @@ def _chroma_full_ft_run(
 
     var files = _list_cache(cache_dir)
     print("[cache] samples:", len(files))
+
+    # ── inline sampling (FT arm; FT_INLINE_SAMPLING_PLAN_2026-07-08, #4) ─────
+    # Fires after global step k when k % sample_every == 0 (never at k=0).
+    # v1 does NOT save-before-sample (the FT arm saves at run end only —
+    # documented delta vs ot_should_save_before_sample). Sampling reads the
+    # LIVE pinned-host store (the optimizer writes back into it every block —
+    # it IS the current model); conditioning = the model's resident-sampler
+    # contract (cached caption T5 cond + zero uncond, no live TE).
+    var sample_every = cfg.sample_every
+    var sample_enabled = sample_every > 0
+    if sample_enabled:
+        print("[chroma-ft-sample] enabled every", sample_every,
+              "steps (steps=", SAMPLE_STEPS, " cfg=", SAMPLE_CFG, ")")
+        print("[chroma-ft-sample] v1: LIVE host-store weights, sample res",
+              LAT_W * 8, "x", LAT_H * 8, ", cached-caption T5 cond + zero",
+              "uncond,")
+        print("[chroma-ft-sample]     NO save-before-sample (the FT arm saves",
+              "at run end)")
 
     print("")
     print("step  loss  (full-FT; sigma policy = chroma's own logit-normal shift dispatch)")
@@ -691,6 +869,19 @@ def _chroma_full_ft_run(
             "| vram_used_gb", used_gb,
         )
 
+        # ── inline sampler: sample the LIVE host store, no save/reload ──────
+        if sample_enabled and k % sample_every == 0:
+            ctx.synchronize()
+            cu_mempool_trim_current(0)   # release pool blocks before the render
+            try:
+                _chroma_ft_run_inline_samples(
+                    base, approx, store, txt_tokens.copy(),
+                    cos.copy(), sin.copy(), cfg, k, ctx,
+                )
+            except e:
+                print("[chroma-ft-sample] sample FAILED (training continues):", e)
+            ctx.synchronize()
+
     # Save the trained surface (host bytes -> safetensors overlay, no GPU).
     makedirs(String(LORA_DIR), exist_ok=True)
     var out_path = (
@@ -708,7 +899,8 @@ def _chroma_full_ft_run(
     print("[chroma-ft] v1 notes: surface = block matmuls (biases/norms/mods/")
     print("  embedders/final layer frozen); RESUME: pass the saved overlay as")
     print("  the arg after steps (adafactor sidecar derived from it); inline")
-    print("  sampling still not wired (overlay the saved file on the base ckpt).")
+    print("  sampling: set sample_every>0 (samples the LIVE store at 512,")
+    print("  cached-caption T5 cond + zero uncond, no save-before-sample).")
 
 
 def main() raises:
