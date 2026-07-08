@@ -197,6 +197,14 @@ from serenitymojo.training.full_finetune_zimage import (
     zimage_full_ft_save_checkpoint_device,
 )
 from serenitymojo.training.adafactor_device import AdafactorDeviceState
+# FULL-FT resume sidecar (the fleet helper; ZIMAGE_FT_ADAFACTOR arm only):
+# adafactor row/col states + t_step + seed_base round-trip. zimage's save is a
+# FULL checkpoint dir (not an overlay), so resume = load THAT dir as the
+# transformer + the sidecar derived from its diffusion_pytorch_model path.
+from serenitymojo.training.full_ft_sidecar import (
+    full_ft_sidecar_save, full_ft_sidecar_load,
+    full_ft_sidecar_path_for_overlay,
+)
 from serenitymojo.training.train_config import (
     TRAIN_OPTIMIZER_ADAMW_8BIT, TRAIN_OPTIMIZER_ADAFACTOR,
 )
@@ -2178,16 +2186,40 @@ def _full_ft_step[
         return StepResult(loss, Float32(gn), Float32(secs), Float32(st.upd_l1), 0, 0)
 
 
+# resume_ckpt_dir ("" = fresh run; ZIMAGE_FT_ADAFACTOR builds only): a prior
+# full-FT run's saved checkpoint DIR. zimage saves a FULL transformer checkpoint
+# (all keys; trained ones current), so resume loads THAT dir as the transformer
+# (no overlay pass) + the adafactor sidecar next to its diffusion_pytorch_model.
+# The loop continues at global step t_step+1 with the SAME train_cfg.seed —
+# the sigma/noise/SR streams (seed+k, seed*7919+k, seed*2654435761+k) continue
+# exactly. Fail-loud on any seed/shape/count mismatch. The host-adam8bit arm's
+# resume stays fail-loud (its masters+moments are a different sidecar contract).
 def _zimage_full_ft_main(
     cfg_path: String, train_cfg: TrainConfig, run_steps: Int, start_step: Int,
+    resume_ckpt_dir: String,
 ) raises:
-    if start_step != 0:
-        raise Error("zimage full-FT v1: resume (start_step != 0) is not supported")
     var transformer_dir = zimage_transformer_dir_from_train_config(train_cfg)
     var cache_dir = zimage_cache_dir_from_train_config(train_cfg)
     var out_dir = train_cfg.output_model_destination.copy()
     if out_dir == String(""):
         out_dir = String(LORA_DIR) + String("/full_ft_checkpoint")
+    if resume_ckpt_dir != String(""):
+        comptime if not ZIMAGE_FT_ADAFACTOR:
+            raise Error(
+                "zimage full-FT resume: only the ZIMAGE_FT_ADAFACTOR arm is "
+                + "wired (the host-adam8bit arm's masters+moments are a "
+                + "different sidecar contract; fail-loud)"
+            )
+        if resume_ckpt_dir == out_dir:
+            raise Error(
+                "zimage full-FT resume: output checkpoint dir == resume dir — "
+                + "the saver would overwrite its own mmap'd source; set a "
+                + "different output_model_destination"
+            )
+        # the saved dir IS a full transformer checkpoint — load it as the model.
+        transformer_dir = resume_ckpt_dir.copy()
+    elif start_step != 0:
+        raise Error("zimage full-FT v1: start_step requires a resume checkpoint dir")
 
     print("=== Z-Image FULL-RANK FINETUNE (T2.C) ===")
     print("  config:", cfg_path)
@@ -2202,7 +2234,8 @@ def _zimage_full_ft_main(
               " wd=", train_cfg.weight_decay)
         print("    NO global grad-norm clip on this arm (fused per-block consume;")
         print("    adafactor's update-RMS d-threshold clip stands in — driver header);")
-        print("    resume: fail-loud (adafactor row/col sidecar TODO, fleet-standard)")
+        print("    resume: WIRED (adafactor row/col sidecar; pass a prior full-FT")
+        print("    checkpoint dir as the resume arg — training/full_ft_sidecar.mojo)")
     else:
         print("  optimizer: host bnb 8-bit AdamW on F32 masters; lr=", train_cfg.lr,
               " wd=", train_cfg.weight_decay, " max_grad_norm=", train_cfg.max_grad_norm)
@@ -2249,6 +2282,45 @@ def _zimage_full_ft_main(
         ft_opt = zimage_full_ft_opt_init(main_blocks, D, F, ctx)
         af_states = List[AdafactorDeviceState]()
 
+    # ── RESUME (weights already loaded FROM the saved ckpt dir above; now the
+    # adafactor sidecar: states + t_step + seed) ──────────────────────────────
+    var start_k = 1
+    if resume_ckpt_dir != String(""):
+        var exp_rows = List[Int]()
+        var exp_cols = List[Int]()
+        for i in range(len(af_states)):
+            exp_rows.append(af_states[i].rows)
+            exp_cols.append(af_states[i].cols)
+        var sc = full_ft_sidecar_load(
+            full_ft_sidecar_path_for_overlay(
+                resume_ckpt_dir + String("/diffusion_pytorch_model.safetensors")
+            ),
+            exp_rows, exp_cols, ctx,
+        )
+        if sc.seed_base != train_cfg.seed:
+            raise Error(
+                String("zimage full-FT resume: sidecar seed_base ")
+                + String(sc.seed_base) + String(" != config seed ")
+                + String(train_cfg.seed)
+                + String(" — the sigma/noise streams would not continue")
+            )
+        if sc.t_step >= run_steps:
+            raise Error(
+                String("zimage full-FT resume: sidecar t_step ")
+                + String(sc.t_step) + String(" >= requested total steps ")
+                + String(run_steps) + String(" — nothing to continue")
+            )
+        if start_step != 0 and start_step != sc.t_step:
+            raise Error(
+                String("zimage full-FT resume: argv start_step ")
+                + String(start_step) + String(" != sidecar t_step ")
+                + String(sc.t_step)
+            )
+        start_k = sc.t_step + 1
+        af_states = sc^.take_states()
+        print("[fullft] RESUME from", resume_ckpt_dir,
+              "| continuing at global step", start_k, "/", run_steps)
+
     if train_cfg.save_every > 0 and train_cfg.save_every < run_steps:
         print("[fullft] NOTE: mid-run save_every is not wired in v1;",
               " the full checkpoint is written once at end of run")
@@ -2257,7 +2329,7 @@ def _zimage_full_ft_main(
     var last_loss = Float32(0.0)
     var total_upd_l1 = 0.0
     var train_start = perf_counter_ns()
-    for k in range(1, run_steps + 1):
+    for k in range(start_k, run_steps + 1):
         var slot = (k - 1) % cache.count()
         var step_seed = UInt64(k)
         # adafactor arm: per-step SR seed (krea2 derivation; per-slot mix in
@@ -2321,7 +2393,7 @@ def _zimage_full_ft_main(
             raise Error(
                 "zimage full-FT v1: only the 72x56 and 64x64 latent buckets are wired"
             )
-        if k == 1:
+        if k == start_k:
             first_loss = loss
         last_loss = loss
 
@@ -2338,6 +2410,16 @@ def _zimage_full_ft_main(
                   (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
             zimage_full_ft_save_checkpoint_device(
                 transformer_dir, out_dir, main_blocks, D, F, ctx
+            )
+            # Resume sidecar NEXT TO the checkpoint: adafactor row/col states
+            # + t_step (= completed global steps) + config seed (the stream
+            # continuity contract).
+            full_ft_sidecar_save(
+                af_states, run_steps, train_cfg.seed,
+                full_ft_sidecar_path_for_overlay(
+                    out_dir + String("/diffusion_pytorch_model.safetensors")
+                ),
+                ctx,
             )
         else:
             print("RESULT: REAL Z-IMAGE FULL-FT TRAIN OK — total |update|_1 =",
@@ -2850,12 +2932,21 @@ def main() raises:
     # T2.C: full-rank finetune is its own runtime driver (validated above by
     # validate_zimage_full_ft_config); the LoRA path below is untouched (C13).
     if train_cfg.adapter_algo == TRAIN_ADAPTER_ALGO_FULL:
+        # full-FT resume: the 3rd positional arg is a prior full-FT CHECKPOINT
+        # DIR (ZIMAGE_FT_ADAFACTOR builds; sidecar derived inside), not a LoRA
+        # state file.
+        var ft_resume_dir = String("")
         if resume_state != String("") and resume_state != String("-"):
-            raise Error("zimage full-FT v1: LoRA resume state does not apply")
+            if resume_state.endswith(String(".safetensors")):
+                raise Error(
+                    "zimage full-FT resume: pass the saved full-FT checkpoint "
+                    + "DIR (not a .safetensors LoRA state file)"
+                )
+            ft_resume_dir = resume_state.copy()
         if train_cfg.only_cache:
             print("[ZImage] only_cache requested; no train steps will run in this trainer")
             return
-        _zimage_full_ft_main(cfg_path, train_cfg, run_steps, start_step)
+        _zimage_full_ft_main(cfg_path, train_cfg, run_steps, start_step, ft_resume_dir)
         return
     # T2.E: controlnet training is its own runtime driver (validated above by
     # validate_zimage_controlnet_config); the LoRA path below is untouched (C13).

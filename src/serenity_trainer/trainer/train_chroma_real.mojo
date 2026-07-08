@@ -115,8 +115,15 @@ from serenitymojo.models.chroma.chroma_full_ft import (
     ChromaHostBf16, build_chroma_host_bf16, build_chroma_ft_adafactor_states,
     chroma_stack_ft_forward_streamed, chroma_stack_ft_backward_streamed,
     chroma_host_bf16_save, load_chroma_stack_base_bfl, load_chroma_dit_cache_bfl,
+    chroma_host_bf16_overlay_resume, chroma_ft_state_shapes,
 )
 from serenitymojo.training.adafactor_device import AdafactorDeviceState
+# FULL-FT resume sidecar (the fleet helper): adafactor row/col states + t_step
+# + seed_base round-trip; sidecar path derived from the overlay path.
+from serenitymojo.training.full_ft_sidecar import (
+    full_ft_sidecar_save, full_ft_sidecar_load,
+    full_ft_sidecar_path_for_overlay,
+)
 from serenitymojo.training.levers import levers_optimizer_active
 
 # FULL FINETUNE arm (build with -D CHROMA_FULL_FT=1): trains the block matmul
@@ -521,7 +528,15 @@ def _validate_chroma_full_ft_config(cfg: TrainConfig) raises:
         )
 
 
-def _chroma_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) raises:
+# resume_overlay ("" = fresh run): a prior FT run's saved overlay; the adafactor
+# sidecar is derived from it (full_ft_sidecar_path_for_overlay). Resume = base
+# ckpt store build THEN overlay bytes THEN sidecar states/t_step/seed; the loop
+# continues at global step t_step+1 with the SAME SEED_BASE, so the sigma/noise/
+# SR streams (SEED_BASE+k, SEED_BASE*7919+k, SEED_BASE*2654435761+k) continue
+# exactly. Fail-loud on any seed/shape/count mismatch.
+def _chroma_full_ft_run(
+    cfg: TrainConfig, run_steps: Int, cache_dir: String, resume_overlay: String
+) raises:
     _validate_chroma_full_ft_config(cfg)
     if run_steps < 1:
         raise Error("chroma full-FT v1: run_steps must be >= 1")
@@ -547,6 +562,35 @@ def _chroma_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) rai
     # Adafactor factored states, device-resident, flat (doubles*8 then singles*2).
     var af_states = build_chroma_ft_adafactor_states(store, ctx)
 
+    # ── RESUME (base store built above; now overlay + sidecar) ───────────────
+    var start_k = 1
+    if resume_overlay != String(""):
+        chroma_host_bf16_overlay_resume(store, resume_overlay)
+        var exp_rows = List[Int]()
+        var exp_cols = List[Int]()
+        chroma_ft_state_shapes(store, exp_rows, exp_cols)
+        var sc = full_ft_sidecar_load(
+            full_ft_sidecar_path_for_overlay(resume_overlay),
+            exp_rows, exp_cols, ctx,
+        )
+        if sc.seed_base != SEED_BASE:
+            raise Error(
+                String("chroma full-FT resume: sidecar seed_base ")
+                + String(sc.seed_base) + String(" != trainer SEED_BASE ")
+                + String(SEED_BASE)
+                + String(" — the sigma/noise streams would not continue")
+            )
+        if sc.t_step >= run_steps:
+            raise Error(
+                String("chroma full-FT resume: sidecar t_step ")
+                + String(sc.t_step) + String(" >= requested total steps ")
+                + String(run_steps) + String(" — nothing to continue")
+            )
+        start_k = sc.t_step + 1
+        af_states = sc^.take_states()
+        print("[chroma-ft] RESUME from", resume_overlay,
+              "| continuing at global step", start_k, "/", run_steps)
+
     # 3-axis RoPE tables (positions fixed for 512px; built once).
     var rope = build_flux1_rope_tables[N_IMG, N_TXT, H, Dh](HT, WT, ctx, STDtype.BF16)
     var cos = rope[0].to_host(ctx)
@@ -560,7 +604,7 @@ def _chroma_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) rai
     print("step  loss  (full-FT; sigma policy = chroma's own logit-normal shift dispatch)")
     var train_start = perf_counter_ns()
 
-    for k in range(1, run_steps + 1):
+    for k in range(start_k, run_steps + 1):
         var t0 = perf_counter_ns()
         var slot = (k - 1) % len(files)
         var st_c = SafeTensors.open(files[slot])
@@ -643,7 +687,7 @@ def _chroma_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) rai
             "[chroma-ft] step", k, "/", run_steps, "| loss", loss,
             "| sigma", sig,
             "| s/step", Float64(t1 - t0) / 1.0e9,
-            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k),
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k - start_k + 1),
             "| vram_used_gb", used_gb,
         )
 
@@ -654,10 +698,17 @@ def _chroma_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) rai
         + String(".safetensors")
     )
     chroma_host_bf16_save(store, out_path)
+    # Resume sidecar NEXT TO the overlay: adafactor row/col states + t_step
+    # (= completed global steps) + SEED_BASE (the stream continuity contract).
+    full_ft_sidecar_save(
+        af_states, run_steps, SEED_BASE,
+        full_ft_sidecar_path_for_overlay(out_path), ctx,
+    )
     print("[chroma-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
     print("[chroma-ft] v1 notes: surface = block matmuls (biases/norms/mods/")
-    print("  embedders/final layer frozen); resume + inline sampling not wired")
-    print("  (overlay the saved file on the base ckpt to sample); sidecar TODO.")
+    print("  embedders/final layer frozen); RESUME: pass the saved overlay as")
+    print("  the arg after steps (adafactor sidecar derived from it); inline")
+    print("  sampling still not wired (overlay the saved file on the base ckpt).")
 
 
 def main() raises:
@@ -682,9 +733,21 @@ def main() raises:
         var ft_steps = DEFAULT_RUN_STEPS
         if len(a) > arg_base:
             ft_steps = _parse_nonnegative_int(String(a[arg_base]))
+        # optional next arg = FT overlay to RESUME from (sidecar derived).
+        var ft_resume = String("")
+        if len(a) > arg_base + 1:
+            ft_resume = String(a[arg_base + 1])
+            if not ft_resume.endswith(String(".safetensors")):
+                raise Error(
+                    String("chroma full-FT resume: expected an overlay ")
+                    + String(".safetensors path, got ") + ft_resume
+                )
         if train_cfg.only_cache:
             raise Error("chroma full-FT v1: only_cache not wired (fail-loud)")
-        _chroma_full_ft_run(train_cfg, ft_steps, chroma_cache_dir_from_train_config(train_cfg))
+        _chroma_full_ft_run(
+            train_cfg, ft_steps,
+            chroma_cache_dir_from_train_config(train_cfg), ft_resume,
+        )
         return
 
     validate_chroma_train_config(train_cfg)

@@ -152,8 +152,15 @@ from serenitymojo.models.klein.klein_full_ft import (
     KleinHostBf16, build_klein_host_bf16, build_klein_ft_adafactor_states,
     klein_stack_ft_forward_streamed, klein_stack_ft_backward_streamed,
     klein_host_bf16_save,
+    klein_host_bf16_overlay_resume, klein_ft_state_shapes,
 )
 from serenitymojo.training.adafactor_device import AdafactorDeviceState
+# FULL-FT resume sidecar (the fleet helper): adafactor row/col states + t_step
+# + seed_base round-trip; sidecar path derived from the overlay path.
+from serenitymojo.training.full_ft_sidecar import (
+    full_ft_sidecar_save, full_ft_sidecar_load,
+    full_ft_sidecar_path_for_overlay,
+)
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -725,7 +732,17 @@ def _do_sample_all(
 # store → klein's own loss → streamed FT backward with fused device Adafactor
 # + SR + write-back → host-direct safetensors overlay save. Bypasses the
 # ENTIRE LoRA machinery (no turbo loader, no resident pins, no OT-AdamW state).
-def _klein_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) raises:
+# resume_overlay ("" = fresh run): a prior FT run's saved overlay; the adafactor
+# sidecar is derived from it (full_ft_sidecar_path_for_overlay). Resume = base
+# ckpt store build THEN overlay bytes THEN sidecar states/t_step/seed; the loop
+# continues at global step t_step+1 with the SAME SEED_BASE, so the sigma/noise/
+# SR streams (SEED_BASE+k, SEED_BASE*7919+k, SEED_BASE*2654435761+k) continue
+# exactly. resume_start_arg (0 = derive from the sidecar) must MATCH the
+# sidecar's t_step when given — fail-loud, never silently reposition a run.
+def _klein_full_ft_run(
+    cfg: TrainConfig, run_steps: Int, cache_dir: String,
+    resume_overlay: String, resume_start_arg: Int,
+) raises:
     # fail-loud guards (v1 scope: b1 only, no accum/EMA/dropout/levers/sampling)
     if cfg.batch_size != 1:
         raise Error("klein full-FT v1: batch_size must be 1")
@@ -758,6 +775,41 @@ def _klein_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) rais
     # Adafactor factored states, device-resident, flat (doubles*8 then singles*2).
     var af_states = build_klein_ft_adafactor_states(store, ctx)
 
+    # ── RESUME (base store built above; now overlay + sidecar) ───────────────
+    var start_k = 1
+    if resume_overlay != String(""):
+        klein_host_bf16_overlay_resume(store, resume_overlay)
+        var exp_rows = List[Int]()
+        var exp_cols = List[Int]()
+        klein_ft_state_shapes(store, exp_rows, exp_cols)
+        var sc = full_ft_sidecar_load(
+            full_ft_sidecar_path_for_overlay(resume_overlay),
+            exp_rows, exp_cols, ctx,
+        )
+        if sc.seed_base != SEED_BASE:
+            raise Error(
+                String("klein full-FT resume: sidecar seed_base ")
+                + String(sc.seed_base) + String(" != trainer SEED_BASE ")
+                + String(SEED_BASE)
+                + String(" — the sigma/noise streams would not continue")
+            )
+        if sc.t_step >= run_steps:
+            raise Error(
+                String("klein full-FT resume: sidecar t_step ")
+                + String(sc.t_step) + String(" >= requested total steps ")
+                + String(run_steps) + String(" — nothing to continue")
+            )
+        if resume_start_arg != 0 and resume_start_arg != sc.t_step:
+            raise Error(
+                String("klein full-FT resume: argv start_step ")
+                + String(resume_start_arg) + String(" != sidecar t_step ")
+                + String(sc.t_step)
+            )
+        start_k = sc.t_step + 1
+        af_states = sc^.take_states()
+        print("[klein-ft] RESUME from", resume_overlay,
+              "| continuing at global step", start_k, "/", run_steps)
+
     var rope = _build_klein_rope_host()
     var cos_dev = TArc(Tensor.from_host(rope[0].copy(), [S * H, Dh // 2], STDtype.F32, ctx))
     var sin_dev = TArc(Tensor.from_host(rope[1].copy(), [S * H, Dh // 2], STDtype.F32, ctx))
@@ -783,7 +835,7 @@ def _klein_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) rais
     print("step  loss  (full-FT; sigma policy = klein's own timestep_distribution dispatch)")
     var train_start = perf_counter_ns()
 
-    for k in range(1, run_steps + 1):
+    for k in range(start_k, run_steps + 1):
         var t0 = perf_counter_ns()
         var cache_slot = (k - 1) % len(cached_img_tokens)
         var latent_tokens_t = cached_img_tokens[cache_slot].copy()
@@ -854,7 +906,7 @@ def _klein_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) rais
             "[klein-ft] step", k, "/", run_steps, "| loss", loss,
             "| sigma", sigma,
             "| s/step", Float64(t1 - t0) / 1.0e9,
-            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k),
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k - start_k + 1),
             "| vram_used_gb", used_gb,
         )
 
@@ -865,10 +917,17 @@ def _klein_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) rais
         + String(".safetensors")
     )
     klein_host_bf16_save(store, out_path)
+    # Resume sidecar NEXT TO the overlay: adafactor row/col states + t_step
+    # (= completed global steps) + SEED_BASE (the stream continuity contract).
+    full_ft_sidecar_save(
+        af_states, run_steps, SEED_BASE,
+        full_ft_sidecar_path_for_overlay(out_path), ctx,
+    )
     print("[klein-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
     print("[klein-ft] v1 notes: surface = block matmuls (norms/mods/embedders/")
-    print("  final layer frozen); resume + inline sampling not wired (overlay the")
-    print("  saved file on the base ckpt to sample); adafactor sidecar TODO.")
+    print("  final layer frozen); RESUME: pass the saved overlay as the resume")
+    print("  arg (adafactor sidecar derived from it); inline sampling still not")
+    print("  wired (overlay the saved file on the base ckpt to sample).")
 
 
 def main() raises:
@@ -917,11 +976,17 @@ def main() raises:
     # bypasses the entire LoRA machinery below. Gate-don't-fork (C13).
     comptime if KLEIN_FULL_FT:
         _ = runtime_profile
-        if resume_lora != String(""):
-            raise Error("klein full-FT v1: resume not wired (fail-loud)")
-        if start_step != 0:
-            raise Error("klein full-FT v1: start_step must be 0")
-        _klein_full_ft_run(cfg, run_steps, cache_dir)
+        # resume arg (args[4]) = a prior FT run's OVERLAY (.safetensors); the
+        # adafactor sidecar path is derived from it. args[3] start_step, when
+        # given, must equal the sidecar's t_step (checked inside).
+        if resume_lora != String("") and not resume_lora.endswith(String(".safetensors")):
+            raise Error(
+                String("klein full-FT resume: expected an overlay ")
+                + String(".safetensors path, got ") + resume_lora
+            )
+        if resume_lora == String("") and start_step != 0:
+            raise Error("klein full-FT v1: start_step requires a resume overlay")
+        _klein_full_ft_run(cfg, run_steps, cache_dir, resume_lora, start_step)
         return
 
     print("=== Klein REAL LoRA training loop:", cfg.name, "===")

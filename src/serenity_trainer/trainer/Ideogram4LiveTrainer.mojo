@@ -60,12 +60,19 @@ from serenitymojo.ops.tensor_algebra import reshape, slice, permute, mul_scalar
 from serenitymojo.models.dit.ideogram4_resident import Ideogram4Weights
 from serenitymojo.models.dit.ideogram4_mrope import build_ideogram4_mrope
 from serenitymojo.models.ideogram4.ideogram4_full_ft import (
+    ideogram4_host_bf16_overlay_resume, ideogram4_ft_state_shapes,
     Ideogram4HostBf16,
     build_ideogram4_host_bf16,
     build_ideogram4_ft_adafactor_states,
     ideogram4_stack_ft_forward_streamed,
     ideogram4_stack_ft_backward_streamed,
     ideogram4_host_bf16_save,
+)
+# FULL-FT resume sidecar (the fleet helper): adafactor row/col states + t_step
+# + seed_base round-trip; sidecar path derived from the overlay path.
+from serenitymojo.training.full_ft_sidecar import (
+    full_ft_sidecar_save, full_ft_sidecar_load,
+    full_ft_sidecar_path_for_overlay,
 )
 from serenitymojo.training.schedule import sample_timestep_logit_normal_scaled
 
@@ -185,6 +192,12 @@ def _ideogram4_load_frozen_globals(
     return Ideogram4Weights(d^)
 
 
+# resume_overlay ("" = fresh run): a prior FT run's saved overlay; the adafactor
+# sidecar is derived from it (full_ft_sidecar_path_for_overlay). Resume = fp8
+# base store build (dequant) THEN overlay bytes THEN sidecar states/t_step/seed;
+# the loop continues at global step t_step+1 with the SAME I4_FT_SEED, so the
+# sigma/noise/SR streams (I4_FT_SEED+k, I4_FT_SEED*7919+k, ...) continue
+# exactly. Fail-loud on any seed/shape/count mismatch.
 def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
     progress_file: String,
     transformer: String,
@@ -194,6 +207,7 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
     lr: Float32,
     caption_dropout_prob: Float32,
     levers_config_path: String,
+    resume_overlay: String,
 ) raises:
     # ── fail-loud v1 guards (b1 / no accum / no EMA / no dropout / no levers) ─
     if run_steps < 1:
@@ -234,6 +248,35 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
     # Adafactor factored states, device-resident, flat li*6+wi.
     var af_states = build_ideogram4_ft_adafactor_states(store, ctx)
 
+    # ── RESUME (fp8-dequant base store built above; now overlay + sidecar) ───
+    var start_k = 1
+    if resume_overlay != String(""):
+        ideogram4_host_bf16_overlay_resume(store, resume_overlay)
+        var exp_rows = List[Int]()
+        var exp_cols = List[Int]()
+        ideogram4_ft_state_shapes(store, exp_rows, exp_cols)
+        var sc = full_ft_sidecar_load(
+            full_ft_sidecar_path_for_overlay(resume_overlay),
+            exp_rows, exp_cols, ctx,
+        )
+        if sc.seed_base != I4_FT_SEED:
+            raise Error(
+                String("ideogram4 full-FT resume: sidecar seed_base ")
+                + String(sc.seed_base) + String(" != trainer I4_FT_SEED ")
+                + String(I4_FT_SEED)
+                + String(" — the sigma/noise streams would not continue")
+            )
+        if sc.t_step >= run_steps:
+            raise Error(
+                String("ideogram4 full-FT resume: sidecar t_step ")
+                + String(sc.t_step) + String(" >= requested total steps ")
+                + String(run_steps) + String(" — nothing to continue")
+            )
+        start_k = sc.t_step + 1
+        af_states = sc^.take_states()
+        print("[ideogram4-ft] RESUME from", resume_overlay,
+              "| continuing at global step", start_k, "/", run_steps)
+
     var cache = Ideogram4TrainCache.open(cache_path)
     print("[cache] samples:", cache.len())
 
@@ -246,7 +289,7 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
     print("step  loss  (full-FT; sigma policy = ideogram4's own aitk logit-normal)")
     var train_start = perf_counter_ns()
 
-    for k in range(1, run_steps + 1):
+    for k in range(start_k, run_steps + 1):
         var t0 = perf_counter_ns()
         var sample_index = (k - 1) % cache.len()
         var seed = I4_FT_SEED + UInt64(k)
@@ -348,7 +391,7 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
             "[ideogram4-ft] step", k, "/", run_steps, "| loss", loss,
             "| t_flow", sample.t_flow,
             "| s/step", Float64(t1 - t0) / 1.0e9,
-            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k),
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k - start_k + 1),
             "| vram_used_gb", used_gb,
         )
 
@@ -358,6 +401,12 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
         + String(".safetensors")
     )
     ideogram4_host_bf16_save(store, out_path)
+    # Resume sidecar NEXT TO the overlay: adafactor row/col states + t_step
+    # (= completed global steps) + I4_FT_SEED (the stream continuity contract).
+    full_ft_sidecar_save(
+        af_states, run_steps, I4_FT_SEED,
+        full_ft_sidecar_path_for_overlay(out_path), ctx,
+    )
     if progress_file.byte_length() > 0:
         _append_status(
             progress_file,
@@ -365,9 +414,10 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
         )
     print("[ideogram4-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
     print("[ideogram4-ft] v1 notes: surface = 34x6 block matmuls (adaln bias/rms")
-    print("  scales/norm_q/k/embedders/final layer frozen); resume + inline")
+    print("  scales/norm_q/k/embedders/final layer frozen); RESUME: pass the saved")
+    print("  overlay as argv 12 (adafactor sidecar derived from it); inline")
     print("  sampling not wired (overlay the saved bf16 mats over the fp8 base")
-    print("  to sample); adafactor sidecar TODO.")
+    print("  to sample).")
 
 
 def main() raises:
@@ -452,9 +502,21 @@ def main() raises:
     # NOTE argv 8 (learning_rate) drives the FT lr; the LoRA default 4e-4 is
     # NOT a sane full-FT lr — pass it explicitly (smoke: 1e-5).
     comptime if IDEOGRAM4_FULL_FT:
+        # argv 12 (optional) = a prior FT run's overlay to RESUME from (the
+        # adafactor sidecar path is derived from it).
+        var ft_resume = String("")
+        if len(args) > 12:
+            var v12 = String(args[12])
+            if v12.byte_length() > 0 and v12 != String("-"):
+                if not v12.endswith(String(".safetensors")):
+                    raise Error(
+                        String("ideogram4 full-FT resume: expected an overlay ")
+                        + String(".safetensors path, got ") + v12
+                    )
+                ft_resume = v12^
         _ideogram4_full_ft_run[NT, GH, GW](
             progress_file, transformer, cache, output, steps, lr,
-            caption_dropout_prob, levers_config_path,
+            caption_dropout_prob, levers_config_path, ft_resume,
         )
         return
 

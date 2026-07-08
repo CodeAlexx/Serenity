@@ -172,12 +172,19 @@ from serenitymojo.pipeline.hidream_o1_cfg import build_t2i_input, T2ISample
 # below byte-unchanged (C13 gate-don't-fork). ────────────────────────────────
 from std.sys.defines import get_defined_int
 from serenitymojo.models.dit.hidream_o1_full_ft import (
+    hidream_o1_host_bf16_overlay_resume, hidream_o1_ft_state_shapes,
     HiDreamO1HostBf16,
     build_hidream_o1_host_bf16,
     build_hidream_o1_ft_adafactor_states,
     hidream_o1_stack_ft_forward_streamed,
     hidream_o1_stack_ft_backward_streamed,
     hidream_o1_host_bf16_save,
+)
+# FULL-FT resume sidecar (the fleet helper): adafactor row/col states + t_step
+# + seed_base round-trip; sidecar path derived from the overlay path.
+from serenitymojo.training.full_ft_sidecar import (
+    full_ft_sidecar_save, full_ft_sidecar_load,
+    full_ft_sidecar_path_for_overlay,
 )
 
 comptime HIDREAM_FULL_FT = get_defined_int["HIDREAM_FULL_FT", 0]() != 0
@@ -623,6 +630,16 @@ def _hidream_full_ft_run() raises:
         )
     if len(args) > 8 and String(args[8]) != "-":
         raise Error("hidream full-FT v1: grad dump is a LoRA-arm lever")
+    # argv 9 (optional) = a prior FT run's overlay to RESUME from (the
+    # adafactor sidecar path is derived from it).
+    var resume_overlay = String("")
+    if len(args) > 9 and String(args[9]) != "-":
+        resume_overlay = String(args[9])
+        if not resume_overlay.endswith(String(".safetensors")):
+            raise Error(
+                String("hidream full-FT resume: expected an overlay ")
+                + String(".safetensors path, got ") + resume_overlay
+            )
     makedirs(out_dir, exist_ok=True)
 
     print("==== hidream-o1 FULL FINETUNE (v1: 36 layers x 7 matmuls ~6.95B, device adafactor) ====")
@@ -653,6 +670,38 @@ def _hidream_full_ft_run() raises:
     # Adafactor factored states, device-resident, flat li*7+wi.
     var af_states = build_hidream_o1_ft_adafactor_states(store, ctx)
 
+    # ── RESUME (F32→bf16 base store built above; now overlay + sidecar) ──────
+    # Loop continues at global step t_step+1 with the SAME HD_FT_SEED, so the
+    # sigma/noise/SR streams (HD_FT_SEED*6364...+step, HD_FT_SEED*7919+step,
+    # HD_FT_SEED*2654435761+step) continue exactly. Fail-loud on mismatch.
+    var start_step = 1
+    if resume_overlay != String(""):
+        hidream_o1_host_bf16_overlay_resume(store, resume_overlay)
+        var exp_rows = List[Int]()
+        var exp_cols = List[Int]()
+        hidream_o1_ft_state_shapes(store, exp_rows, exp_cols)
+        var sc = full_ft_sidecar_load(
+            full_ft_sidecar_path_for_overlay(resume_overlay),
+            exp_rows, exp_cols, ctx,
+        )
+        if sc.seed_base != HD_FT_SEED:
+            raise Error(
+                String("hidream full-FT resume: sidecar seed_base ")
+                + String(sc.seed_base) + String(" != trainer HD_FT_SEED ")
+                + String(HD_FT_SEED)
+                + String(" — the sigma/noise streams would not continue")
+            )
+        if sc.t_step >= steps:
+            raise Error(
+                String("hidream full-FT resume: sidecar t_step ")
+                + String(sc.t_step) + String(" >= requested total steps ")
+                + String(steps) + String(" — nothing to continue")
+            )
+        start_step = sc.t_step + 1
+        af_states = sc^.take_states()
+        print("[hidream-ft] RESUME from", resume_overlay,
+              "| continuing at global step", start_step, "/", steps)
+
     var imgs = ShardedSafeTensors.open(stage_dir + "/images.safetensors")
     var n_samples = 0
     while True:
@@ -670,7 +719,7 @@ def _hidream_full_ft_run() raises:
 
     print("")
     print("step  loss  (full-FT; sigma policy = hidream's own aitk shift-3 uniform)")
-    for step in range(1, steps + 1):
+    for step in range(start_step, steps + 1):
         var t0 = perf_counter_ns()
         var idx = (step - 1) % n_samples
 
@@ -800,7 +849,7 @@ def _hidream_full_ft_run() raises:
             "[hidream-ft] step", step, "/", steps, "| loss", loss,
             "| sigma", sigma,
             "| s/step", Float64(t1 - t0) / 1.0e9,
-            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(step),
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(step - start_step + 1),
             "| vram_used_gb", used_gb,
         )
 
@@ -810,11 +859,18 @@ def _hidream_full_ft_run() raises:
         + String(".safetensors")
     )
     hidream_o1_host_bf16_save(store, out_path)
+    # Resume sidecar NEXT TO the overlay: adafactor row/col states + t_step
+    # (= completed global steps) + HD_FT_SEED (the stream continuity contract).
+    full_ft_sidecar_save(
+        af_states, steps, HD_FT_SEED,
+        full_ft_sidecar_path_for_overlay(out_path), ctx,
+    )
     print("[hidream-ft] DONE —", steps, "full-FT steps; weights:", out_path)
     print("[hidream-ft] v1 notes: surface = 36x7 block matmuls (in_ln/post_ln/")
-    print("  q_norm/k_norm/embed_tokens/heads/final norm+linear frozen); resume +")
-    print("  inline sampling not wired (overlay the saved bf16 mats over the F32")
-    print("  base to sample); adafactor sidecar TODO.")
+    print("  q_norm/k_norm/embed_tokens/heads/final norm+linear frozen); RESUME:")
+    print("  pass the saved overlay as argv 9 (adafactor sidecar derived from")
+    print("  it); inline sampling not wired (overlay the saved bf16 mats over")
+    print("  the F32 base to sample).")
 
 
 def main() raises:
