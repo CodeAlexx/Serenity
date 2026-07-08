@@ -145,6 +145,16 @@ from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.ops.tensor_algebra import permute, reshape, reshape_owned
 from serenitymojo.io.ffi import sys_system, sys_open, sys_close, O_RDONLY
 
+# ── FULL FINETUNE (-D KLEIN_FULL_FT=1; FULL_FINETUNE_ROLLOUT_PLAN_2026-07-07,
+# klein card — the krea2 `ot-mojo-full-finetune` blueprint) ───────────────────
+from std.sys.defines import get_defined_int
+from serenitymojo.models.klein.klein_full_ft import (
+    KleinHostBf16, build_klein_host_bf16, build_klein_ft_adafactor_states,
+    klein_stack_ft_forward_streamed, klein_stack_ft_backward_streamed,
+    klein_host_bf16_save,
+)
+from serenitymojo.training.adafactor_device import AdafactorDeviceState
+
 
 comptime TArc = ArcPointer[Tensor]
 
@@ -164,6 +174,11 @@ comptime KLEIN_V2_ENGINE = True
 # hand-chain. False = previous hand-chain path (C13 gate-don't-delete).
 comptime KLEIN_V2_GRAPH = True
 comptime KLEIN_V2_GRAPH_PATH = KLEIN_V2_ENGINE and KLEIN_V2_GRAPH
+# FULL FINETUNE arm (build with -D KLEIN_FULL_FT=1): trains the block matmul
+# surface (8 double x 8 mats + 24 single x 2 mats, ~8.7B params, ~17.4GB bf16)
+# through the pinned-host bf16 both-ways store + fused device Adafactor + SR.
+# Default 0 = every LoRA path below byte-unchanged (C13 gate-don't-fork).
+comptime KLEIN_FULL_FT = get_defined_int["KLEIN_FULL_FT", 0]() != 0
 
 from serenitymojo.training.lora_adamw_ot_fused import (
     LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
@@ -704,6 +719,158 @@ def _do_sample_all(
         board.log_text(String("prompts/") + p.label, step, p.prompt)
 
 
+# ── FULL-FT run (self-contained; called from main behind KLEIN_FULL_FT) ──────
+# Mirrors _krea2_full_ft_run: cache fetch → klein's own sigma policy →
+# flow-match → per-step mods → streamed FT forward from the pinned-host bf16
+# store → klein's own loss → streamed FT backward with fused device Adafactor
+# + SR + write-back → host-direct safetensors overlay save. Bypasses the
+# ENTIRE LoRA machinery (no turbo loader, no resident pins, no OT-AdamW state).
+def _klein_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) raises:
+    # fail-loud guards (v1 scope: b1 only, no accum/EMA/dropout/levers/sampling)
+    if cfg.batch_size != 1:
+        raise Error("klein full-FT v1: batch_size must be 1")
+    if cfg.grad_accum_steps > 1:
+        raise Error("klein full-FT v1: grad_accum_steps must be 1")
+    if cfg.ema_enabled:
+        raise Error("klein full-FT v1: EMA shadows not wired")
+    if cfg.caption_dropout_prob > Float32(0.0):
+        raise Error("klein full-FT v1: caption dropout not wired")
+    if levers_optimizer_active(cfg):
+        raise Error(
+            "klein full-FT v1: the optimizer is FIXED device-Adafactor+SR "
+            + "(the krea2 full-FT contract); unset the optimizer levers"
+        )
+    if run_steps < 1:
+        raise Error("klein full-FT v1: run_steps must be >= 1")
+    print("==== klein FULL FINETUNE (v1: 8-double + 24-single matmul surface, device adafactor) ====")
+    print(
+        "lr=", cfg.lr, " steps=", run_steps,
+        " SR=on  optimizer=torch-adafactor (b2d=-0.8 eps2=1e-3 d=1.0 wd=0)",
+    )
+
+    var ctx = DeviceContext()
+    var st = SafeTensors.open(cfg.checkpoint)
+    var base = load_klein_stack_base_training(st, cfg.d_model, ctx)
+    var mod_weights = load_klein_step_mod_weights(st, cfg.d_model, ctx)
+
+    # The pinned-host bf16 store = the live model (~17.4GB host RAM).
+    var store = build_klein_host_bf16(st, cfg.num_double, cfg.num_single, ctx)
+    # Adafactor factored states, device-resident, flat (doubles*8 then singles*2).
+    var af_states = build_klein_ft_adafactor_states(store, ctx)
+
+    var rope = _build_klein_rope_host()
+    var cos_dev = TArc(Tensor.from_host(rope[0].copy(), [S * H, Dh // 2], STDtype.F32, ctx))
+    var sin_dev = TArc(Tensor.from_host(rope[1].copy(), [S * H, Dh // 2], STDtype.F32, ctx))
+
+    # ── open cache + preload compatible samples (the LoRA trainer's discipline) ─
+    var cache = KleinCache(cache_dir)
+    print("  cache:", cache_dir, " samples:", cache.count())
+    var compatible = _compatible_cache_indices(cache, cfg, ctx)
+    print("  cache compatible samples:", len(compatible), "of", cache.count(), "for", LH, "x", LW)
+    var cached_img_tokens = List[TArc]()
+    var cached_txt_tokens = List[TArc]()
+    var preload_txt_sh = List[Int]()
+    preload_txt_sh.append(N_TXT); preload_txt_sh.append(cfg.joint_attention_dim)
+    for ci in range(len(compatible)):
+        var sample = cache.load(compatible[ci], ctx)
+        var img_tok = _latent_to_img_tokens_device(sample.latent, cfg.in_channels, ctx)
+        var txt_tok = reshape(sample.text_embedding, preload_txt_sh.copy(), ctx)
+        cached_img_tokens.append(TArc(img_tok^))
+        cached_txt_tokens.append(TArc(txt_tok^))
+    print("  preloaded cache tensors:", len(cached_img_tokens), "samples")
+
+    print("")
+    print("step  loss  (full-FT; sigma policy = klein's own timestep_distribution dispatch)")
+    var train_start = perf_counter_ns()
+
+    for k in range(1, run_steps + 1):
+        var t0 = perf_counter_ns()
+        var cache_slot = (k - 1) % len(cached_img_tokens)
+        var latent_tokens_t = cached_img_tokens[cache_slot].copy()
+        var txt_tokens_t = cached_txt_tokens[cache_slot].copy()
+        var n_img_vals = N_IMG * cfg.in_channels
+
+        # klein's own sigma policy (identical dispatch to the LoRA loop)
+        var sigma_seed = SEED_BASE + UInt64(k)
+        var sigma: Float32
+        if cfg.timestep_distribution == TSD_UNIFORM:
+            sigma = sample_timestep_uniform(sigma_seed)
+        elif cfg.timestep_distribution == TSD_SIGMOID:
+            sigma = sample_timestep_sigmoid(
+                sigma_seed, cfg.timestep_noising_weight, cfg.timestep_noising_bias
+            )
+        else:
+            sigma = sample_timestep_logit_normal(sigma_seed, cfg.timestep_shift)
+        sigma = apply_bias(
+            sigma, Float32(1.0), cfg.timestep_bias_strategy,
+            cfg.timestep_bias_multiplier,
+            cfg.timestep_bias_range_min, cfg.timestep_bias_range_max,
+        )
+
+        # flow-match in token space (identical math to the LoRA loop)
+        var noise = _host_noise(n_img_vals, SEED_BASE * UInt64(7919) + UInt64(k))
+        var noise_t = Tensor.from_host(
+            noise^, [N_IMG, cfg.in_channels], latent_tokens_t[].dtype(), ctx
+        )
+        var fm = flow_match_noise_target(latent_tokens_t[], sigma, noise_t, ctx)
+        var x_t_dev = TArc(fm.x_t.clone(ctx))
+        var target = _host_f32_for_step_math(fm.target, ctx)
+
+        # per-step modulation vecs from THIS sigma (incl. the final-layer adaLN)
+        var mods = build_klein_step_mods_device_cached(
+            mod_weights, sigma, cfg.timestep_dim, cfg.d_model, ctx
+        )
+        var img_mod = mods[0].copy()
+        var txt_mod = mods[1].copy()
+        var single_mod = mods[2].copy()
+        base.final_shift = mods[3].copy()
+        base.final_scale = mods[4].copy()
+
+        var fwd = klein_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
+            x_t_dev, txt_tokens_t, base, store,
+            img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
+            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+            cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx,
+        )
+        var lg = _klein_loss_grad(fwd.out, target, sigma, cfg)
+        var loss = lg.loss
+
+        var wrote = klein_stack_ft_backward_streamed[H, Dh, N_IMG, N_TXT, S](
+            lg.d_loss.copy(), base, store,
+            img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
+            cfg.d_model, cfg.mlp_hidden, cfg.out_channels, cfg.eps,
+            af_states,
+            k, Float64(cfg.lr), Float64(-0.8), Float64(1e-3),
+            Float64(1.0), Float64(0.0),
+            SEED_BASE * UInt64(2654435761) + UInt64(k),
+            ctx,
+        )
+        _ = wrote.grad_count
+
+        var t1 = perf_counter_ns()
+        var mi = ctx.get_memory_info()
+        var used_gb = Float64(Int(mi[1]) - Int(mi[0])) / (1024.0 * 1024.0 * 1024.0)
+        print(
+            "[klein-ft] step", k, "/", run_steps, "| loss", loss,
+            "| sigma", sigma,
+            "| s/step", Float64(t1 - t0) / 1.0e9,
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k),
+            "| vram_used_gb", used_gb,
+        )
+
+    # Save the trained surface (host bytes -> safetensors overlay, no GPU).
+    _ = sys_system(String("mkdir -p ") + LORA_DIR)
+    var out_path = (
+        String(LORA_DIR) + String("/klein_full_ft_") + String(run_steps)
+        + String(".safetensors")
+    )
+    klein_host_bf16_save(store, out_path)
+    print("[klein-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
+    print("[klein-ft] v1 notes: surface = block matmuls (norms/mods/embedders/")
+    print("  final layer frozen); resume + inline sampling not wired (overlay the")
+    print("  saved file on the base ckpt to sample); adafactor sidecar TODO.")
+
+
 def main() raises:
     # ── read the model config FILE (arch + recipe + paths). argv[1] overrides. ─
     var a = argv()
@@ -745,6 +912,17 @@ def main() raises:
         mode = String(a[5])
     var runtime_profile = VERBOSE_STAGE_LOG or _mode_enables_profile(mode)
     var cache_dir = klein_cache_dir_from_train_config(cfg)
+
+    # ── FULL FINETUNE arm (KLEIN_FULL_FT): its own self-contained loop —
+    # bypasses the entire LoRA machinery below. Gate-don't-fork (C13).
+    comptime if KLEIN_FULL_FT:
+        _ = runtime_profile
+        if resume_lora != String(""):
+            raise Error("klein full-FT v1: resume not wired (fail-loud)")
+        if start_step != 0:
+            raise Error("klein full-FT v1: start_step must be 0")
+        _klein_full_ft_run(cfg, run_steps, cache_dir)
+        return
 
     print("=== Klein REAL LoRA training loop:", cfg.name, "===")
     print("  config:", cfg_path)
