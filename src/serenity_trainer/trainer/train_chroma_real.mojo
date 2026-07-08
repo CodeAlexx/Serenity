@@ -108,6 +108,23 @@ from serenitymojo.training.chroma_sample_resident import (
     chroma_sample_resident, chroma_decode_latent_to_png,
 )
 
+# ── FULL FINETUNE (-D CHROMA_FULL_FT=1; FULL_FINETUNE_ROLLOUT_PLAN_2026-07-07,
+# chroma card — the krea2/klein `ot-mojo-full-finetune` blueprint) ────────────
+from std.sys.defines import get_defined_int
+from serenitymojo.models.chroma.chroma_full_ft import (
+    ChromaHostBf16, build_chroma_host_bf16, build_chroma_ft_adafactor_states,
+    chroma_stack_ft_forward_streamed, chroma_stack_ft_backward_streamed,
+    chroma_host_bf16_save, load_chroma_stack_base_bfl, load_chroma_dit_cache_bfl,
+)
+from serenitymojo.training.adafactor_device import AdafactorDeviceState
+from serenitymojo.training.levers import levers_optimizer_active
+
+# FULL FINETUNE arm (build with -D CHROMA_FULL_FT=1): trains the block matmul
+# surface (19 double x 8 mats + 38 single x 2 mats, ~8.6B params, ~17.2GB bf16)
+# through the pinned-host bf16 both-ways store + fused device Adafactor + SR.
+# Default 0 = every LoRA path below byte-unchanged (C13 gate-don't-fork).
+comptime CHROMA_FULL_FT = get_defined_int["CHROMA_FULL_FT", 0]() != 0
+
 
 # ── arch (chroma1-hd; H/Dh/D fixed comptime, verified vs the checkpoint) ─────
 comptime H = 24
@@ -464,6 +481,185 @@ def _chroma_run_sample(
     print("[Chroma-lora] sample step=", step, " -> ", out_path)
 
 
+# ── FULL-FT run (self-contained; called from main behind CHROMA_FULL_FT) ─────
+# Mirrors _klein_full_ft_run: cache fetch → chroma's OWN sigma policy (logit-
+# normal shift=cfg.timestep_shift, sigma_idx quantization — the LoRA loop's
+# exact dispatch) → flow-match in PACKED latent space (VAE shift/scale +
+# pack_latents) → frozen distilled-guidance approximator -> pooled_temb mods →
+# streamed FT forward from the pinned-host bf16 store → chroma's own MSE loss →
+# streamed FT backward with fused device Adafactor + SR + write-back →
+# host-direct safetensors overlay save (ORIGINAL BFL key names). Bypasses the
+# ENTIRE LoRA machinery (no turbo loader, no LoRA set, no OT-AdamW state).
+def _validate_chroma_full_ft_config(cfg: TrainConfig) raises:
+    # arch checks (the LoRA validate minus the LoRA/recipe pins — full-FT has
+    # no rank/alpha and takes lr from the config).
+    if cfg.checkpoint == String(""):
+        raise Error("Chroma full-FT config must set checkpoint")
+    if not cfg.checkpoint.endswith(String(".safetensors")):
+        raise Error("Chroma full-FT requires a single safetensors checkpoint")
+    if cfg.n_heads != H or cfg.head_dim != Dh or cfg.d_model != D:
+        raise Error("Chroma full-FT config arch mismatch (n_heads/head_dim/d_model)")
+    if cfg.in_channels != IN_CH or cfg.joint_attention_dim != TXT_CH or cfg.out_channels != OUT_CH:
+        raise Error("Chroma full-FT config arch mismatch (in/txt/out channels)")
+    if cfg.num_double != NUM_DOUBLE or cfg.num_single != NUM_SINGLE:
+        raise Error("Chroma full-FT requires double=19 single=38")
+    if cfg.mlp_hidden != FMLP:
+        raise Error("Chroma full-FT config mlp_hidden mismatch")
+    # fail-loud guards (v1 scope: b1 only, no accum/EMA/dropout/levers-opt)
+    if cfg.batch_size != 1:
+        raise Error("chroma full-FT v1: batch_size must be 1")
+    if cfg.grad_accum_steps > 1:
+        raise Error("chroma full-FT v1: grad_accum_steps must be 1")
+    if cfg.ema_enabled:
+        raise Error("chroma full-FT v1: EMA shadows not wired")
+    if cfg.caption_dropout_prob > Float32(0.0):
+        raise Error("chroma full-FT v1: caption dropout not wired")
+    if levers_optimizer_active(cfg):
+        raise Error(
+            "chroma full-FT v1: the optimizer is FIXED device-Adafactor+SR "
+            + "(the krea2 full-FT contract); unset the optimizer levers"
+        )
+
+
+def _chroma_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) raises:
+    _validate_chroma_full_ft_config(cfg)
+    if run_steps < 1:
+        raise Error("chroma full-FT v1: run_steps must be >= 1")
+    print("==== chroma FULL FINETUNE (v1: 19-double + 38-single matmul surface, device adafactor) ====")
+    print(
+        "lr=", cfg.lr, " steps=", run_steps,
+        " SR=on  optimizer=torch-adafactor (b2d=-0.8 eps2=1e-3 d=1.0 wd=0)",
+    )
+    print("  ckpt:", cfg.checkpoint, " (BFL double_blocks/single_blocks keys)")
+    print("  cache:", cache_dir)
+
+    var ctx = DeviceContext()
+    var st = SafeTensors.open(cfg.checkpoint)
+
+    # frozen residents: stack base (img_in/txt_in/final_layer) + approximator.
+    var base = load_chroma_stack_base_bfl(st, NUM_DOUBLE, NUM_SINGLE, ctx)
+    print("[load] BFL stack base resident (img_in/txt_in/final_layer.linear)")
+    var approx = load_chroma_dit_cache_bfl(cfg.checkpoint, ctx)
+    print("[load] BFL approximator resident (distilled_guidance_layer)")
+
+    # The pinned-host bf16 store = the live model (~17.2GB host RAM).
+    var store = build_chroma_host_bf16(st, NUM_DOUBLE, NUM_SINGLE, ctx)
+    # Adafactor factored states, device-resident, flat (doubles*8 then singles*2).
+    var af_states = build_chroma_ft_adafactor_states(store, ctx)
+
+    # 3-axis RoPE tables (positions fixed for 512px; built once).
+    var rope = build_flux1_rope_tables[N_IMG, N_TXT, H, Dh](HT, WT, ctx, STDtype.BF16)
+    var cos = rope[0].to_host(ctx)
+    var sin = rope[1].to_host(ctx)
+    print("[load] chroma 3-axis rope tables built (S*H x Dh/2)")
+
+    var files = _list_cache(cache_dir)
+    print("[cache] samples:", len(files))
+
+    print("")
+    print("step  loss  (full-FT; sigma policy = chroma's own logit-normal shift dispatch)")
+    var train_start = perf_counter_ns()
+
+    for k in range(1, run_steps + 1):
+        var t0 = perf_counter_ns()
+        var slot = (k - 1) % len(files)
+        var st_c = SafeTensors.open(files[slot])
+        var latent_cache = _load_chroma_cache_tensor(st_c, String("latent"), ctx)
+        var lat_raw = _host_f32_for_step_math(latent_cache, ctx)         # [16*64*64]
+
+        # t5_embed [1, seq, 4096] -> pad/truncate to [N_TXT, 4096] (zero pad rows).
+        var t5_info = st_c.tensor_info(String("t5_embed"))
+        var t5_seq = Int(t5_info.shape[1])
+        var t5_cache = _load_chroma_cache_tensor(st_c, String("t5_embed"), ctx)
+        var t5_flat = _host_f32_for_step_math(t5_cache, ctx)
+        var txt_tokens = List[Float32]()
+        for r in range(N_TXT):
+            if r < t5_seq:
+                for c in range(TXT_CH):
+                    txt_tokens.append(t5_flat[r * TXT_CH + c])
+            else:
+                for _ in range(TXT_CH):
+                    txt_tokens.append(Float32(0.0))
+
+        # ── VAE shift/scale then pack_latents (chroma's own cond prep) ──
+        for i in range(len(lat_raw)):
+            lat_raw[i] = (lat_raw[i] - VAE_SHIFT) * VAE_SCALE
+        var latent_packed = _pack_latents(lat_raw)
+
+        # ── chroma's own sigma policy (the LoRA loop's non-smoke dispatch) ──
+        var sigma = sample_timestep_logit_normal(SEED_BASE + UInt64(k), cfg.timestep_shift)
+        var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
+        if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
+            sigma_idx = NUM_TRAIN_TIMESTEPS - 1
+        var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+        var t_model = Float32(sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
+
+        # ── flow-match in PACKED latent space ──
+        var noise = _host_noise(N_IMG * IN_CH, SEED_BASE * UInt64(7919) + UInt64(k))
+        var noisy = List[Float32]()
+        var target = List[Float32]()
+        for i in range(len(latent_packed)):
+            noisy.append(noise[i] * sig + latent_packed[i] * (Float32(1.0) - sig))
+            target.append(noise[i] - latent_packed[i])
+
+        # ── frozen approximator -> per-step modulation table ──
+        var pooled_tensor = _pooled_modulation_tensor(approx, t_model, ctx)
+        var pooled = _host_f32_for_step_math(pooled_tensor, ctx)
+
+        # ── streamed FT forward from the live host store ──
+        var fwd = chroma_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
+            noisy.copy(), txt_tokens.copy(), pooled.copy(), MOD_INDEX,
+            base, store, cos.copy(), sin.copy(),
+            D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
+        )
+
+        # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
+        var nout = len(fwd.out)
+        var d_loss = List[Float32]()
+        var sse = 0.0
+        var inv_n = Float32(2.0) / Float32(nout)
+        for i in range(nout):
+            var diff = fwd.out[i] - target[i]
+            sse += Float64(diff) * Float64(diff)
+            d_loss.append(inv_n * diff)
+        var loss = Float32(sse / Float64(nout))
+
+        # ── streamed FT backward + fused device Adafactor + SR + write-back ──
+        var wrote = chroma_stack_ft_backward_streamed[H, Dh, N_IMG, N_TXT, S](
+            d_loss.copy(), base, store, cos.copy(), sin.copy(), fwd,
+            D, FMLP, OUT_CH, EPS,
+            af_states,
+            k, Float64(cfg.lr), Float64(-0.8), Float64(1e-3),
+            Float64(1.0), Float64(0.0),
+            SEED_BASE * UInt64(2654435761) + UInt64(k),
+            ctx,
+        )
+        _ = wrote.grad_count
+
+        var t1 = perf_counter_ns()
+        var mi = ctx.get_memory_info()
+        var used_gb = Float64(Int(mi[1]) - Int(mi[0])) / (1024.0 * 1024.0 * 1024.0)
+        print(
+            "[chroma-ft] step", k, "/", run_steps, "| loss", loss,
+            "| sigma", sig,
+            "| s/step", Float64(t1 - t0) / 1.0e9,
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k),
+            "| vram_used_gb", used_gb,
+        )
+
+    # Save the trained surface (host bytes -> safetensors overlay, no GPU).
+    makedirs(String(LORA_DIR), exist_ok=True)
+    var out_path = (
+        String(LORA_DIR) + String("/chroma_full_ft_") + String(run_steps)
+        + String(".safetensors")
+    )
+    chroma_host_bf16_save(store, out_path)
+    print("[chroma-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
+    print("[chroma-ft] v1 notes: surface = block matmuls (biases/norms/mods/")
+    print("  embedders/final layer frozen); resume + inline sampling not wired")
+    print("  (overlay the saved file on the base ckpt to sample); sidecar TODO.")
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -475,6 +671,22 @@ def main() raises:
             arg_base = 2
 
     var train_cfg = read_model_config(cfg_path)
+
+    # ── FULL FINETUNE arm (CHROMA_FULL_FT): its own self-contained loop —
+    # bypasses the entire LoRA machinery below (incl. the LoRA-recipe pins in
+    # validate_chroma_train_config; the FT arm has its own fail-loud validate).
+    # Gate-don't-fork (C13).
+    comptime if CHROMA_FULL_FT:
+        var ft_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
+        validate_onetrainer_cache_preflight_plan(ft_preflight)
+        var ft_steps = DEFAULT_RUN_STEPS
+        if len(a) > arg_base:
+            ft_steps = _parse_nonnegative_int(String(a[arg_base]))
+        if train_cfg.only_cache:
+            raise Error("chroma full-FT v1: only_cache not wired (fail-loud)")
+        _chroma_full_ft_run(train_cfg, ft_steps, chroma_cache_dir_from_train_config(train_cfg))
+        return
+
     validate_chroma_train_config(train_cfg)
     var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
