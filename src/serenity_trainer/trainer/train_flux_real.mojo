@@ -120,6 +120,38 @@ from serenitymojo.training.flux_sample_resident import (
 )
 from std.os import makedirs
 
+# ── FULL FINETUNE (-D FLUX_FULL_FT=1; FULL_FINETUNE_ROLLOUT_PLAN_2026-07-07,
+# flux card — the chroma worked example's arm with the flux deltas) ───────────
+from std.sys.defines import get_defined_int
+from serenitymojo.models.flux.flux_full_ft import (
+    FluxHostBf16, build_flux_host_bf16, build_flux_ft_adafactor_states,
+    flux_stack_ft_forward_streamed, flux_stack_ft_backward_streamed,
+    flux_host_bf16_save, flux_ckpt_has_guidance,
+)
+from serenitymojo.training.adafactor_device import AdafactorDeviceState
+from serenitymojo.training.levers import levers_optimizer_active
+
+# FULL FINETUNE arm (build with -D FLUX_FULL_FT=1): trains the block matmul
+# surface (19 double x 8 mats + 38 single x 2 mats, ~8.6B params, ~17.2GB bf16)
+# through the pinned-host bf16 both-ways store + fused device Adafactor + SR.
+# Default 0 = every LoRA path below byte-unchanged (C13 gate-don't-fork).
+#
+# CHECKPOINT NOTE: the staged flux1-dev.safetensors is a SYMLINK to
+# flux1-schnell.safetensors — SCHNELL weights under the dev name (23.8GB BF16,
+# BFL keys, verified 2026-07-08). Schnell has NO guidance_in embedder; the FT
+# arm auto-detects that (flux_ckpt_has_guidance) and loads the stack base with
+# has_guidance=False, so NO guidance vector is fed. A real dev ckpt under the
+# same path auto-detects True and feeds GUIDANCE*1000 — no code change.
+comptime FLUX_FULL_FT = get_defined_int["FLUX_FULL_FT", 0]() != 0
+
+# FT-arm defaults (config cache_dir/dataset_cache_dir overrides FT_CACHE_DIR).
+# FT_CACHE_DIR is the DERIVED boxjana flux cache (latent+t5 verbatim from the
+# chroma boxjana cache — shared flux VAE+T5 — plus REAL Mojo CLIP-L clip_pool
+# per caption; pipeline/flux_cache_from_chroma.mojo). The LoRA arm's CACHE_DIR
+# above points at a dead EriDiffusion path and is NOT used by the FT arm.
+comptime FT_CACHE_DIR = "/home/alex/mojodiffusion/output/cache/boxjana_flux_512"
+comptime FT_OUT_DIR = "/home/alex/mojodiffusion/output/flux_boxjana"
+
 
 # ── arch (flux1-dev; H/Dh/D fixed comptime, verified vs the checkpoint) ──────
 comptime H = 24
@@ -430,6 +462,208 @@ def _pack_latents(lat: List[Float32]) -> List[Float32]:
     return out^
 
 
+# ── FULL-FT run (self-contained; called from main behind FLUX_FULL_FT) ───────
+# Mirrors _chroma_full_ft_run: cache fetch (latent + t5 + clip_pool) → FLUX's
+# OWN sigma policy (logit-normal shift=cfg.timestep_shift, sigma_idx
+# quantization — this file's LoRA-loop dispatch, lines tagged train_flux.rs:
+# 767-813) → flow-match in PACKED latent space (VAE shift/scale + pack_latents,
+# train_flux.rs:736) → FLUX conditioning (timestep*1000 + guidance*1000 when
+# the ckpt has guidance_in + CLIP-L clip_pool vector — the flux_stack embed
+# chain) → streamed FT forward from the pinned-host bf16 store → flux's own
+# MSE loss → streamed FT backward with fused device Adafactor + SR +
+# write-back → host-direct safetensors overlay save (ORIGINAL BFL key names).
+# Bypasses the ENTIRE LoRA machinery (no turbo loader, no LoRA set, no AdamW).
+def _validate_flux_full_ft_config(cfg: TrainConfig) raises:
+    # arch checks (the LoRA validate minus the LoRA/recipe pins — full-FT has
+    # no rank/alpha and takes lr from the config).
+    if cfg.checkpoint == String(""):
+        raise Error("Flux full-FT config must set checkpoint")
+    if not cfg.checkpoint.endswith(String(".safetensors")):
+        raise Error("Flux full-FT requires a single safetensors checkpoint")
+    if cfg.n_heads != H or cfg.head_dim != Dh or cfg.d_model != D:
+        raise Error("Flux full-FT config arch mismatch (n_heads/head_dim/d_model)")
+    if cfg.in_channels != IN_CH or cfg.joint_attention_dim != TXT_CH or cfg.out_channels != OUT_CH:
+        raise Error("Flux full-FT config arch mismatch (in/txt/out channels)")
+    if cfg.num_double != NUM_DOUBLE or cfg.num_single != NUM_SINGLE:
+        raise Error("Flux full-FT requires double=19 single=38")
+    if cfg.mlp_hidden != FMLP:
+        raise Error("Flux full-FT config mlp_hidden mismatch")
+    if cfg.timestep_dim != T_DIM:
+        raise Error("Flux full-FT config timestep_dim mismatch")
+    # fail-loud guards (v1 scope: b1 only, no accum/EMA/dropout/levers-opt)
+    if cfg.batch_size != 1:
+        raise Error("flux full-FT v1: batch_size must be 1")
+    if cfg.grad_accum_steps > 1:
+        raise Error("flux full-FT v1: grad_accum_steps must be 1")
+    if cfg.ema_enabled:
+        raise Error("flux full-FT v1: EMA shadows not wired")
+    if cfg.caption_dropout_prob > Float32(0.0):
+        raise Error("flux full-FT v1: caption dropout not wired")
+    if levers_optimizer_active(cfg):
+        raise Error(
+            "flux full-FT v1: the optimizer is FIXED device-Adafactor+SR "
+            + "(the krea2 full-FT contract); unset the optimizer levers"
+        )
+
+
+def _flux_full_ft_run(cfg: TrainConfig, run_steps: Int, cache_dir: String) raises:
+    _validate_flux_full_ft_config(cfg)
+    if run_steps < 1:
+        raise Error("flux full-FT v1: run_steps must be >= 1")
+    print("==== flux FULL FINETUNE (v1: 19-double + 38-single matmul surface, device adafactor) ====")
+    print(
+        "lr=", cfg.lr, " steps=", run_steps,
+        " SR=on  optimizer=torch-adafactor (b2d=-0.8 eps2=1e-3 d=1.0 wd=0)",
+    )
+    print("  ckpt:", cfg.checkpoint)
+    print("  NOTE: on-box flux1-dev.safetensors -> flux1-schnell.safetensors symlink")
+    print("        (SCHNELL weights under the dev name; 23.8GB all-BF16 BFL keys)")
+    print("  cache:", cache_dir)
+
+    var ctx = DeviceContext()
+    var st = SafeTensors.open(cfg.checkpoint)
+
+    # schnell detection: no guidance_in.* keys in the header -> no guidance vec.
+    var has_guidance = flux_ckpt_has_guidance(st)
+    if has_guidance:
+        print("[load] guidance_in PRESENT (dev-class ckpt): guidance vec =", GUIDANCE, "* 1000")
+    else:
+        print("[load] guidance_in ABSENT (SCHNELL ckpt): has_guidance=False, no guidance vec fed")
+
+    # frozen residents: the full FluxStackBase (img_in/txt_in, time/guidance/
+    # vector embed MLPs, per-block mod.lin linears, final layer) — the flux
+    # delta vs chroma's tiny base+approximator (~6.6GB device for the mod.lins).
+    var base = load_flux_stack_base(st, NUM_DOUBLE, NUM_SINGLE, has_guidance, ctx)
+    print("[load] FluxStackBase resident (embedders + per-block mod.lin + final layer)")
+
+    # The pinned-host bf16 store = the live model (~17.2GB host RAM).
+    var store = build_flux_host_bf16(st, NUM_DOUBLE, NUM_SINGLE, ctx)
+    # Adafactor factored states, device-resident, flat (doubles*8 then singles*2).
+    var af_states = build_flux_ft_adafactor_states(store, ctx)
+
+    # 3-axis RoPE tables (positions fixed for 512px; built once).
+    var rope = build_flux1_rope_tables[N_IMG, N_TXT, H, Dh](HT, WT, ctx, STDtype.BF16)
+    var cos = rope[0].to_host(ctx)
+    var sin = rope[1].to_host(ctx)
+    print("[load] flux 3-axis rope tables built (S*H x Dh/2)")
+
+    var files = _list_cache(cache_dir)
+    print("[cache] samples:", len(files))
+
+    print("")
+    print("step  loss  (full-FT; sigma policy = flux's own logit-normal shift dispatch)")
+    var train_start = perf_counter_ns()
+
+    for k in range(1, run_steps + 1):
+        var t0 = perf_counter_ns()
+        var slot = (k - 1) % len(files)
+        var st_c = SafeTensors.open(files[slot])
+        var lat_cache = _cache_tensor(st_c, String("latent"), ctx)
+        var lat_raw = _host_f32_for_step_math(lat_cache, ctx)              # [16*64*64]
+        var clip_pool_cache = _cache_tensor(st_c, String("clip_pool"), ctx)   # [1,768]
+        var clip_pool = _host_f32_for_step_math(clip_pool_cache, ctx)
+        if len(clip_pool) != VEC_DIM:
+            raise Error("flux full-FT: cache clip_pool is not [1,768] (real CLIP-L pool required)")
+
+        # t5_embed [1, seq, 4096] -> pad/truncate to [N_TXT, 4096] (zero pad rows).
+        var t5_info = st_c.tensor_info(String("t5_embed"))
+        var t5_seq = Int(t5_info.shape[1])
+        var t5_cache = _cache_tensor(st_c, String("t5_embed"), ctx)
+        var t5_flat = _host_f32_for_step_math(t5_cache, ctx)
+        var txt_tokens = List[Float32]()
+        for r in range(N_TXT):
+            if r < t5_seq:
+                for c in range(TXT_CH):
+                    txt_tokens.append(t5_flat[r * TXT_CH + c])
+            else:
+                for _ in range(TXT_CH):
+                    txt_tokens.append(Float32(0.0))
+
+        # ── VAE shift/scale (train_flux.rs:736) then pack_latents ──
+        for i in range(len(lat_raw)):
+            lat_raw[i] = (lat_raw[i] - VAE_SHIFT) * VAE_SCALE
+        var latent_packed = _pack_latents(lat_raw)
+
+        # ── flux's own sigma policy (this file's LoRA-loop non-smoke dispatch) ──
+        var sigma = sample_timestep_logit_normal(SEED_BASE + UInt64(k), cfg.timestep_shift)
+        var sigma_idx = Int(sigma * Float32(NUM_TRAIN_TIMESTEPS))
+        if sigma_idx > NUM_TRAIN_TIMESTEPS - 1:
+            sigma_idx = NUM_TRAIN_TIMESTEPS - 1
+        var sig = Float32(sigma_idx + 1) / Float32(NUM_TRAIN_TIMESTEPS)
+        var t_model = Float32(sigma_idx) / Float32(NUM_TRAIN_TIMESTEPS)
+        # caller pre-scales t by 1000 (BFL time_factor; flux1_dit.mojo convention).
+        var timestep = List[Float32]()
+        timestep.append(t_model * Float32(1000.0))
+        # guidance (dev only): pre-scaled *1000; None for schnell.
+        var guidance = Optional[List[Float32]](None)
+        if has_guidance:
+            var gl = List[Float32]()
+            gl.append(GUIDANCE * Float32(1000.0))
+            guidance = Optional[List[Float32]](gl^)
+
+        # ── flow-match in PACKED latent space ──
+        var noise = _host_noise(N_IMG * IN_CH, SEED_BASE * UInt64(7919) + UInt64(k))
+        var noisy = List[Float32]()
+        var target = List[Float32]()
+        for i in range(len(latent_packed)):
+            noisy.append(noise[i] * sig + latent_packed[i] * (Float32(1.0) - sig))
+            target.append(noise[i] - latent_packed[i])
+
+        # ── streamed FT forward from the live host store ──
+        var fwd = flux_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
+            noisy, txt_tokens, timestep, guidance, clip_pool,
+            base, store, cos, sin,
+            D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+        )
+
+        # ── loss = MSE(pred, target) ; d_loss = (2/N)(pred - target) ──
+        var nout = len(fwd.out)
+        var d_loss = List[Float32]()
+        var sse = 0.0
+        var inv_n = Float32(2.0) / Float32(nout)
+        for i in range(nout):
+            var diff = fwd.out[i] - target[i]
+            sse += Float64(diff) * Float64(diff)
+            d_loss.append(inv_n * diff)
+        var loss = Float32(sse / Float64(nout))
+
+        # ── streamed FT backward + fused device Adafactor + SR + write-back ──
+        var wrote = flux_stack_ft_backward_streamed[H, Dh, N_IMG, N_TXT, S](
+            d_loss, base, store, cos, sin, fwd,
+            D, FMLP, OUT_CH, EPS,
+            af_states,
+            k, Float64(cfg.lr), Float64(-0.8), Float64(1e-3),
+            Float64(1.0), Float64(0.0),
+            SEED_BASE * UInt64(2654435761) + UInt64(k),
+            ctx,
+        )
+        _ = wrote.grad_count
+
+        var t1 = perf_counter_ns()
+        var mi = ctx.get_memory_info()
+        var used_gb = Float64(Int(mi[1]) - Int(mi[0])) / (1024.0 * 1024.0 * 1024.0)
+        print(
+            "[flux-ft] step", k, "/", run_steps, "| loss", loss,
+            "| sigma", sig,
+            "| s/step", Float64(t1 - t0) / 1.0e9,
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k),
+            "| vram_used_gb", used_gb,
+        )
+
+    # Save the trained surface (host bytes -> safetensors overlay, no GPU).
+    makedirs(String(FT_OUT_DIR), exist_ok=True)
+    var out_path = (
+        String(FT_OUT_DIR) + String("/flux_full_ft_") + String(run_steps)
+        + String(".safetensors")
+    )
+    flux_host_bf16_save(store, out_path)
+    print("[flux-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
+    print("[flux-ft] v1 notes: surface = block matmuls (biases/norms/mod.lins/")
+    print("  embedders/final layer frozen — OT trains those too, documented delta);")
+    print("  resume + inline sampling not wired (overlay the saved file on the base")
+    print("  ckpt to sample); the base ckpt is SCHNELL bytes under the dev name.")
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -441,6 +675,25 @@ def main() raises:
             arg_base = 2
 
     var train_cfg = read_model_config(cfg_path)
+
+    # ── FULL FINETUNE arm (FLUX_FULL_FT): its own self-contained loop —
+    # bypasses the entire LoRA machinery below (incl. the LoRA-recipe pins in
+    # validate_flux_train_config; the FT arm has its own fail-loud validate).
+    # Gate-don't-fork (C13).
+    comptime if FLUX_FULL_FT:
+        var ft_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
+        validate_onetrainer_cache_preflight_plan(ft_preflight)
+        var ft_steps = DEFAULT_RUN_STEPS
+        if len(a) > arg_base:
+            ft_steps = _parse_nonnegative_int(String(a[arg_base]))
+        if train_cfg.only_cache:
+            raise Error("flux full-FT v1: only_cache not wired (fail-loud)")
+        _flux_full_ft_run(
+            train_cfg, ft_steps,
+            ot_cache_dir_from_train_config(train_cfg, String(FT_CACHE_DIR)),
+        )
+        return
+
     validate_flux_train_config(train_cfg)
     var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
     validate_onetrainer_cache_preflight_plan(cache_preflight)
