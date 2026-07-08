@@ -27,6 +27,18 @@
 #                             over the JSON — the JSON contributes ONLY the
 #                             lever keys (Ideogram4LoRATrainer syncs the shared
 #                             scalars from the argv-built TrainConfig).
+#  12 ft_resume_overlay      (FULL-FT arm ONLY, -D IDEOGRAM4_FULL_FT=1: a prior
+#                             FT run's saved overlay to resume from; "-" or
+#                             absent = fresh run. Parsed ONLY inside the
+#                             comptime FT gate — inert on default builds.)
+#  13 ft_sample_every        (FULL-FT arm ONLY: inline sample cadence — sample
+#                             the LIVE host store every N steps; "-" or absent
+#                             = off; must be a positive int. Parsed ONLY inside
+#                             the comptime FT gate — inert on default builds.
+#                             argv 14 is RESERVED for a sample-prompt/
+#                             conditioning path; v1 conditions on the cached
+#                             llm features — the model's resident-sampler
+#                             contract, no live TE — so it is not wired.)
 #
 # The UI launches this as a background process. Progress is written as
 # Serenity-shaped callback lines so TrainerRuntimeBridge can tail the file.
@@ -56,7 +68,9 @@ from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.tensor_view import from_parts
 from serenitymojo.ops.cast import cast_tensor
-from serenitymojo.ops.tensor_algebra import reshape, slice, permute, mul_scalar
+from serenitymojo.ops.tensor_algebra import (
+    reshape, slice, permute, mul_scalar, add, zeros_device,
+)
 from serenitymojo.models.dit.ideogram4_resident import Ideogram4Weights
 from serenitymojo.models.dit.ideogram4_mrope import build_ideogram4_mrope
 from serenitymojo.models.ideogram4.ideogram4_full_ft import (
@@ -75,6 +89,16 @@ from serenitymojo.training.full_ft_sidecar import (
     full_ft_sidecar_path_for_overlay,
 )
 from serenitymojo.training.schedule import sample_timestep_logit_normal_scaled
+# FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #6):
+# denoise from the LIVE pinned-host bf16 store via the FT streamed forward;
+# schedule + decode are the LoRA sampler's parity-gated pieces
+# (Ideogram4SampleResident / ideogram4_pipeline chunk 9).
+from serenitymojo.io.cap_cache import save_tensor_bin
+from serenitymojo.ops.random import randn
+from serenitymojo.sampling.ideogram4_schedule import (
+    ideogram4_logitnormal, ideogram4_schedule_mean, make_step_intervals,
+)
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 
 from serenity_trainer.dataLoader.Ideogram4CacheReader import Ideogram4TrainCache
 from serenity_trainer.model.Ideogram4Predict import (
@@ -85,6 +109,9 @@ from serenity_trainer.trainer.Ideogram4LoRATrainStep import (
     ideogram4_lora_embed_resident,
     ideogram4_lora_final_forward_resident,
     ideogram4_lora_final_backward,
+)
+from serenity_trainer.trainer.Ideogram4SampleResident import (
+    ideogram4_decode_latent_to_png,
 )
 from serenity_trainer.modelSampler.Ideogram4Sampler import (
     IDEOGRAM4_NUM_LAYERS,
@@ -164,6 +191,11 @@ def _append_status(path: String, text: String) raises:
 # ══════════════════════════════════════════════════════════════════════════
 comptime I4_FT_SEED = UInt64(0x1D3A_4A11)   # the LoRA run-config noise_seed default
 
+# FT inline-sampling denoise recipe = the inference/LoRA-sampler defaults
+# (ideogram4_pipeline.mojo STEPS/CFG via Ideogram4LoRATrainRunConfig.defaults).
+comptime I4_FT_SAMPLE_STEPS = 8
+comptime I4_FT_SAMPLE_CFG = Float32(7.0)
+
 
 def _ideogram4_load_frozen_globals(
     st: ShardedSafeTensors, ctx: DeviceContext
@@ -192,6 +224,198 @@ def _ideogram4_load_frozen_globals(
     return Ideogram4Weights(d^)
 
 
+# ── FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #6) ───
+# ONE transformer forward of the denoise loop: the FT arm's OWN streamed
+# forward (ideogram4_stack_ft_forward_streamed) reading the LIVE pinned-host
+# bf16 store — base+updates already merged = the current model, NO LoRA, NO
+# reload — so sampling reuses the training memory footprint by construction.
+# The cond glue is the FT training step's exact packing+embed+final chain
+# (this file's train loop / Ideogram4LoRATrainStep.mojo:466-503): packed
+# inputs (LoRA-sampler contract: default text_len = NT) → mrope → frozen embed
+# → streamed stack fwd → frozen final layer → toolkit velocity = -(image rows)
+# in [1,128,GH,GW] F32. The forward struct's 34 recompute checkpoints are
+# dropped immediately (no backward runs on samples).
+def _ideogram4_ft_forward_velocity[NT: Int, GH: Int, GW: Int](
+    frozen_w: Ideogram4Weights,
+    store: Ideogram4HostBf16,
+    z: Tensor,             # [1, 128, GH, GW] F32 — current denoise latent
+    t_flow: Float32,       # flow time; the embed flips model_t = 1 - t_flow
+    llm: Tensor,           # [1, NT, 53248] bf16 conditioning (cond OR uncond)
+    ctx: DeviceContext,
+) raises -> Tensor:
+    comptime NIMG = GH * GW
+    comptime SEQ = NT + NIMG
+    comptime HIDDEN = IDEOGRAM4_HIDDEN
+    comptime HEADS = IDEOGRAM4_NUM_HEADS
+    comptime DH = IDEOGRAM4_HEAD_DIM
+    comptime FF = IDEOGRAM4_INTERMEDIATE_SIZE
+    comptime ADALN = IDEOGRAM4_ADALN_DIM
+
+    var packed = ideogram4_build_packed_inputs[NT, GH, GW](z, llm, ctx)
+    var tv = List[Float32]()
+    tv.append(Float32(1.0) - t_flow)
+    var model_t = Tensor.from_host(tv^, [1], STDtype.F32, ctx)
+    var sec = List[Int]()
+    sec.append(IDEOGRAM4_MROPE_SECTION_0)
+    sec.append(IDEOGRAM4_MROPE_SECTION_1)
+    sec.append(IDEOGRAM4_MROPE_SECTION_2)
+    var cs = build_ideogram4_mrope(
+        packed.position_ids, DH, sec, IDEOGRAM4_MROPE_THETA, ctx, STDtype.BF16,
+    )
+    var cosf = cs[0].clone(ctx)
+    var sinf = cs[1].clone(ctx)
+    var x_bf = cast_tensor(packed.x, STDtype.BF16, ctx)
+    var llm_bf = cast_tensor(packed.llm_full, STDtype.BF16, ctx)
+    var emb = ideogram4_lora_embed_resident(
+        frozen_w, x_bf, llm_bf, model_t, packed.indicator, HIDDEN, ctx
+    )
+    var x2d = reshape(emb.x_in, [SEQ, HIDDEN], ctx)
+    var adaln2 = reshape(emb.adaln_input, [1, ADALN], ctx)
+
+    # streamed FT forward from the live host store (read-only here).
+    var fwd = ideogram4_stack_ft_forward_streamed[SEQ, HIDDEN, HEADS, DH, FF, ADALN](
+        x2d, adaln2, cosf, sinf, store, ctx
+    )
+    var h3 = reshape(fwd.out[], [1, SEQ, HIDDEN], ctx)   # copy; fwd dies here
+    var fin = ideogram4_lora_final_forward_resident(frozen_w, h3, emb.adaln_input, ctx)
+    var image_velocity = slice(fin.out, 1, NT, NIMG, ctx)
+    var iv4 = reshape(image_velocity, [1, GH, GW, IDEOGRAM4_PACKED_CHANNELS], ctx)
+    var iv = permute(iv4, [0, 3, 1, 2], ctx)
+    var velocity = mul_scalar(iv, Float32(-1.0), ctx)
+    ctx.synchronize()   # land the stack's deferred frees before the next pass
+    return velocity^
+
+
+# CFG Euler denoise over the live FT store — schedule/step/CFG math 1:1 with
+# the parity-gated LoRA sampler (ideogram4_sample_resident, which is itself
+# 1:1 with the gated inference pipeline chunk 9):
+#   mean = ideogram4_schedule_mean(16*GH, 16*GW, 0.5)   # resolution-aware mu
+#   si   = make_step_intervals(n_steps)
+#   for step in range(n_steps-1, -1, -1):
+#       t_val/s_val = ideogram4_logitnormal(si[step+1] / si[step], mean)
+#       t_flow = 1 - t_val            # embed flips back: model_t = t_val
+#       v = cfg*pos_vel + (1-cfg)*neg_vel        # asymmetric CFG, negated vel
+#       z = z - v*(s_val - t_val)                # NEGATED-velocity Euler step
+# No parity claim: smoke + artifact evidence only (the denoise forward is the
+# already-gated training forward). Returns the denoised PATCH-SPACE latent
+# [1, 128, GH, GW] F32 (the LoRA sampler's decode contract).
+def _ideogram4_ft_sample_store_latent[NT: Int, GH: Int, GW: Int](
+    frozen_w: Ideogram4Weights,
+    store: Ideogram4HostBf16,
+    cond_llm: Tensor,        # [1, NT, 53248] bf16 cached-caption llm features
+    uncond_llm: Tensor,      # [1, NT, 53248] bf16 zeros (CFG empty cond)
+    init_noise: Tensor,      # [1, 128, GH, GW] F32 t=1 noise (own stream)
+    n_steps: Int,
+    cfg_scale: Float32,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if n_steps < 1:
+        raise Error("ideogram4 FT inline sampler: steps must be >= 1")
+    var mean = ideogram4_schedule_mean(GH * 16, GW * 16, 0.5)
+    var si = make_step_intervals(n_steps)
+    var z = init_noise.clone(ctx)   # [1,128,GH,GW] F32, evolves each step
+    print("[ideogram4-ft-sample] steps=", n_steps, " cfg=", cfg_scale)
+    for step in range(n_steps - 1, -1, -1):
+        var t_val = ideogram4_logitnormal(Float64(si[step + 1]), mean)
+        var s_val = ideogram4_logitnormal(Float64(si[step]), mean)
+        var t_flow = Float32(1.0) - t_val
+
+        # COND then UNCOND pass — both the FT streamed forward, live store.
+        var pos_vel = _ideogram4_ft_forward_velocity[NT, GH, GW](
+            frozen_w, store, z, t_flow, cond_llm, ctx
+        )
+        var neg_vel = _ideogram4_ft_forward_velocity[NT, GH, GW](
+            frozen_w, store, z, t_flow, uncond_llm, ctx
+        )
+        # asymmetric CFG on the (negated) velocities, then Euler down-step
+        # (ideogram4_sample_resident:150-158).
+        var v = add(
+            mul_scalar(pos_vel, cfg_scale, ctx),
+            mul_scalar(neg_vel, Float32(1.0) - cfg_scale, ctx),
+            ctx,
+        )
+        z = add(z, mul_scalar(v, -(s_val - t_val), ctx), ctx)
+        ctx.synchronize()
+        print("[ideogram4-ft-sample] step", n_steps - step, "/", n_steps,
+              " sigma=", t_val)
+    return z^
+
+
+# FT-arm cadence body (called from `_ideogram4_full_ft_run` behind
+# IDEOGRAM4_FULL_FT). Conditioning = the model's existing resident-sampler
+# contract (Ideogram4SampleResident header / _ideogram4_run_sample): a CACHED
+# caption's llm_features [1,NT,53248] as COND (prompt index 0 -> cache sample
+# 0 — the training cache is the conditioning source, no live TE) + zeroed
+# features as UNCOND. Sample-noise seed = its OWN deterministic stream
+# ((I4_FT_SEED ^ "SAMPLE") + step*1000003 + prompt_idx) — DISJOINT from all
+# three training streams (I4_FT_SEED+k / *7919+k / *2654435761+k); randn and
+# cache.sample are pure functions of their seeds, so sampling consumes NO
+# training RNG and the BYTE-EQUAL loss/resume class is untouched.
+def _ideogram4_ft_run_inline_samples[NT: Int, GH: Int, GW: Int](
+    frozen_w: Ideogram4Weights,
+    store: Ideogram4HostBf16,
+    cache: Ideogram4TrainCache,
+    output: String,
+    completed_step: Int,
+    ctx: DeviceContext,
+) raises:
+    var samples_dir = output + String("/samples")
+    makedirs(samples_dir, exist_ok=True)
+
+    # OWN sample-noise stream (the shipped krea2/klein/zimage/chroma
+    # derivation); prompt idx pi = 0 — ONE image per event, conditioned on
+    # cache sample 0 (the LoRA sampler's pi % cache.len() contract).
+    var pi = 0
+    var sample_seed = (
+        (I4_FT_SEED ^ UInt64(0x53414D504C45))          # "SAMPLE"
+        + UInt64(completed_step) * UInt64(1000003)
+        + UInt64(pi)
+    )
+    var cond_index = pi % cache.len()
+    # cache.sample's clean/noise/noisy byproducts are unused here (cheap
+    # relative to the denoise); its noise draw is a pure fn of sample_seed.
+    var cond_sample = cache.sample[NT, GH, GW](
+        cond_index, Float32(0.0), sample_seed, ctx
+    )
+    var cond_llm = cond_sample.llm_features[].clone(ctx)   # [1,NT,53248] bf16
+    var uncond_llm = zeros_device(
+        [1, NT, cond_llm.shape()[2]], cond_llm.dtype(), ctx
+    )
+    print("[ideogram4-ft-sample] step", completed_step,
+          " cond_cache_idx=", cond_index, " steps=", I4_FT_SAMPLE_STEPS,
+          " cfg=", I4_FT_SAMPLE_CFG, " seed=", sample_seed)
+    var init_noise = randn(
+        [1, IDEOGRAM4_PACKED_CHANNELS, GH, GW], sample_seed, STDtype.F32, ctx
+    )
+
+    var latent = _ideogram4_ft_sample_store_latent[NT, GH, GW](
+        frozen_w, store, cond_llm, uncond_llm, init_noise,
+        I4_FT_SAMPLE_STEPS, I4_FT_SAMPLE_CFG, ctx,
+    )
+
+    var out_png = (
+        samples_dir + String("/ft_sample_step") + String(completed_step)
+        + String(".png")
+    )
+    # Persist the LATENT first so a process-separated decode
+    # (models/ideogram4/ideogram4_decode_latent CLI, fresh GPU pool) can
+    # ALWAYS produce the PNG, then attempt the in-process 512 decode; its
+    # failure is non-fatal.
+    var lat_bin = out_png + String(".lat.bin")
+    save_tensor_bin(latent, lat_bin, ctx)
+    ctx.synchronize()
+    cu_mempool_trim_current(0)   # release denoise transients pre-decode
+    try:
+        ideogram4_decode_latent_to_png[GH, GW](latent, out_png, ctx)
+        print("[ideogram4-ft-sample] wrote", out_png,
+              " (", GW * 16, "x", GH * 16, ")")
+    except e:
+        print("[ideogram4-ft-sample] in-process decode failed (latent saved):",
+              lat_bin, " err:", String(e))
+        print("[ideogram4-ft-sample] decode offline (fresh GPU pool): ",
+              "ideogram4_decode_latent ", lat_bin, " - ", out_png)
+
+
 # resume_overlay ("" = fresh run): a prior FT run's saved overlay; the adafactor
 # sidecar is derived from it (full_ft_sidecar_path_for_overlay). Resume = fp8
 # base store build (dequant) THEN overlay bytes THEN sidecar states/t_step/seed;
@@ -208,6 +432,7 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
     caption_dropout_prob: Float32,
     levers_config_path: String,
     resume_overlay: String,
+    sample_every: Int,
 ) raises:
     # ── fail-loud v1 guards (b1 / no accum / no EMA / no dropout / no levers) ─
     if run_steps < 1:
@@ -279,6 +504,25 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
 
     var cache = Ideogram4TrainCache.open(cache_path)
     print("[cache] samples:", cache.len())
+
+    # ── inline sampling (FT arm; FT_INLINE_SAMPLING_PLAN_2026-07-08, #6) ─────
+    # Fires after global step k when k % sample_every == 0 (never at k=0; the
+    # loop starts at k=1). v1 does NOT save-before-sample (the FT arm saves at
+    # run end only — documented delta vs ot_should_save_before_sample).
+    # Sampling reads the LIVE pinned-host store (the optimizer writes back
+    # into it every block — it IS the current model); conditioning = the
+    # model's resident-sampler contract (cached llm cond + zero uncond, no
+    # live TE).
+    var sample_enabled = sample_every > 0
+    if sample_enabled:
+        print("[ideogram4-ft-sample] enabled every", sample_every,
+              "steps (steps=", I4_FT_SAMPLE_STEPS, " cfg=", I4_FT_SAMPLE_CFG,
+              ")")
+        print("[ideogram4-ft-sample] v1: LIVE host-store weights, sample res",
+              GW * 16, "x", GH * 16, ", cached llm cond (cache idx 0) + zero",
+              "uncond,")
+        print("[ideogram4-ft-sample]     NO save-before-sample (the FT arm",
+              "saves at run end)")
 
     makedirs(output, exist_ok=True)
     if progress_file.byte_length() > 0:
@@ -395,6 +639,18 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
             "| vram_used_gb", used_gb,
         )
 
+        # ── inline sampler: sample the LIVE host store, no save/reload ──────
+        if sample_enabled and k % sample_every == 0:
+            ctx.synchronize()
+            cu_mempool_trim_current(0)   # release pool blocks before the render
+            try:
+                _ideogram4_ft_run_inline_samples[NT, GH, GW](
+                    gw, store, cache, output, k, ctx,
+                )
+            except e:
+                print("[ideogram4-ft-sample] sample FAILED (training continues):", e)
+            ctx.synchronize()
+
     # Save the trained surface (host bytes -> safetensors overlay, no GPU).
     var out_path = (
         output + String("/ideogram4_full_ft_") + String(run_steps)
@@ -416,8 +672,8 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
     print("[ideogram4-ft] v1 notes: surface = 34x6 block matmuls (adaln bias/rms")
     print("  scales/norm_q/k/embedders/final layer frozen); RESUME: pass the saved")
     print("  overlay as argv 12 (adafactor sidecar derived from it); inline")
-    print("  sampling not wired (overlay the saved bf16 mats over the fp8 base")
-    print("  to sample).")
+    print("  sampling: argv 13 sample_every > 0 (samples the LIVE store at 512,")
+    print("  cached llm cond + zero uncond, no save-before-sample).")
 
 
 def main() raises:
@@ -514,9 +770,27 @@ def main() raises:
                         + String(".safetensors path, got ") + v12
                     )
                 ft_resume = v12^
+        # argv 13 (optional, parsed ONLY inside this comptime FT gate — inert
+        # on default builds) = inline sample cadence: sample the LIVE host
+        # store every N steps. "-" or absent = off; must be a positive int.
+        # argv 14 is RESERVED for a sample-prompt/conditioning path — NOT
+        # wired: v1 conditions on the cached llm features (the model's
+        # resident-sampler contract, no live TE).
+        var ft_sample_every = 0
+        if len(args) > 13:
+            var v13 = String(args[13])
+            if v13.byte_length() > 0 and v13 != String("-"):
+                ft_sample_every = atol(v13)
+                if ft_sample_every < 1:
+                    raise Error(
+                        String("ideogram4 full-FT: argv 13 sample_every must ")
+                        + String("be a positive int ('-' or absent = off), got ")
+                        + v13
+                    )
         _ideogram4_full_ft_run[NT, GH, GW](
             progress_file, transformer, cache, output, steps, lr,
             caption_dropout_prob, levers_config_path, ft_resume,
+            ft_sample_every,
         )
         return
 
