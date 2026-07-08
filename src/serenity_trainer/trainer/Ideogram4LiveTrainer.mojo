@@ -453,7 +453,9 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
     comptime FF = IDEOGRAM4_INTERMEDIATE_SIZE
     comptime ADALN = IDEOGRAM4_ADALN_DIM
 
-    print("==== ideogram4 FULL FINETUNE (v1: 34 layers x 6 matmuls ~8.99B, device adafactor) ====")
+    print("==== ideogram4 FULL FINETUNE (v2 FULL SURFACE: 34 layers x 13 params")
+    print("     (6 matmuls + adaln bias + 6 rms scales) ~8.985B, device adafactor")
+    print("     2D-factored / 1D-unfactored) ====")
     print(
         "lr=", lr, " steps=", run_steps,
         " SR=on  optimizer=torch-adafactor (b2d=-0.8 eps2=1e-3 d=1.0 wd=0)",
@@ -470,7 +472,8 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
     # The pinned-host bf16 store = the live model (~18GB host RAM, CONVERTED
     # from the fp8 checkpoint at build via load_fp8_dequant).
     var store = build_ideogram4_host_bf16(st, IDEOGRAM4_NUM_LAYERS, ctx)
-    # Adafactor factored states, device-resident, flat li*6+wi.
+    # Adafactor states, device-resident, flat li*13+wi (2D factored slots 0-5,
+    # 1D unfactored slots 6-12 — sidecar v2 mixed-state contract).
     var af_states = build_ideogram4_ft_adafactor_states(store, ctx)
 
     # ── RESUME (fp8-dequant base store built above; now overlay + sidecar) ───
@@ -669,9 +672,11 @@ def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
             String("Finished Ideogram4 FULL-FT: weights ") + out_path,
         )
     print("[ideogram4-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
-    print("[ideogram4-ft] v1 notes: surface = 34x6 block matmuls (adaln bias/rms")
-    print("  scales/norm_q/k/embedders/final layer frozen); RESUME: pass the saved")
-    print("  overlay as argv 12 (adafactor sidecar derived from it); inline")
+    print("[ideogram4-ft] v2 notes: surface = 34x13 per-block params (6 matmuls +")
+    print("  adaln bias + attn/ffn rms scales + norm_q/k; embedders/final layer")
+    print("  still frozen — Phase C); RESUME: pass the saved overlay as argv 12")
+    print("  (adafactor sidecar derived from it; v1 204-tensor overlays/sidecars")
+    print("  fail loud on the count checks); inline")
     print("  sampling: argv 13 sample_every > 0 (samples the LIVE store at 512,")
     print("  cached llm cond + zero uncond, no save-before-sample).")
 
