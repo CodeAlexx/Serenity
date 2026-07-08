@@ -132,9 +132,11 @@ from serenitymojo.training.full_ft_sidecar import (
 )
 from serenitymojo.training.levers import levers_optimizer_active
 
-# FULL FINETUNE arm (build with -D CHROMA_FULL_FT=1): trains the block matmul
-# surface (19 double x 8 mats + 38 single x 2 mats, ~8.6B params, ~17.2GB bf16)
-# through the pinned-host bf16 both-ways store + fused device Adafactor + SR.
+# FULL FINETUNE arm (build with -D CHROMA_FULL_FT=1): trains the v2 FULL
+# per-block surface (FULL_SURFACE_PLAN_2026-07-08 Phase B row 3: 19 double x
+# 20 params + 38 single x 6 params — matmuls + ALL linear biases + q/k rms
+# scales; ~8.609B params, ~17.2GB bf16) through the pinned-host bf16 both-ways
+# store + fused device Adafactor (2D factored / 1D unfactored) + SR.
 # Default 0 = every LoRA path below byte-unchanged (C13 gate-don't-fork).
 comptime CHROMA_FULL_FT = get_defined_int["CHROMA_FULL_FT", 0]() != 0
 
@@ -700,7 +702,8 @@ def _chroma_full_ft_run(
     _validate_chroma_full_ft_config(cfg)
     if run_steps < 1:
         raise Error("chroma full-FT v1: run_steps must be >= 1")
-    print("==== chroma FULL FINETUNE (v1: 19-double + 38-single matmul surface, device adafactor) ====")
+    print("==== chroma FULL FINETUNE (v2 FULL per-block surface: 19x20 + 38x6 params —")
+    print("     matmuls + ALL linear biases + q/k rms scales; device adafactor 2D/1D) ====")
     print(
         "lr=", cfg.lr, " steps=", run_steps,
         " SR=on  optimizer=torch-adafactor (b2d=-0.8 eps2=1e-3 d=1.0 wd=0)",
@@ -719,7 +722,8 @@ def _chroma_full_ft_run(
 
     # The pinned-host bf16 store = the live model (~17.2GB host RAM).
     var store = build_chroma_host_bf16(st, NUM_DOUBLE, NUM_SINGLE, ctx)
-    # Adafactor factored states, device-resident, flat (doubles*8 then singles*2).
+    # Adafactor states, device-resident, flat (doubles*20 then singles*6;
+    # 2D factored matmuls + 1D unfactored biases/scales — sidecar v2 mixed).
     var af_states = build_chroma_ft_adafactor_states(store, ctx)
 
     # ── RESUME (base store built above; now overlay + sidecar) ───────────────
@@ -896,11 +900,13 @@ def _chroma_full_ft_run(
         full_ft_sidecar_path_for_overlay(out_path), ctx,
     )
     print("[chroma-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
-    print("[chroma-ft] v1 notes: surface = block matmuls (biases/norms/mods/")
-    print("  embedders/final layer frozen); RESUME: pass the saved overlay as")
-    print("  the arg after steps (adafactor sidecar derived from it); inline")
-    print("  sampling: set sample_every>0 (samples the LIVE store at 512,")
-    print("  cached-caption T5 cond + zero uncond, no save-before-sample).")
+    print("[chroma-ft] v2 notes: surface = FULL per-block (matmuls + ALL linear")
+    print("  biases + q/k rms scales; mods = frozen approximator rows, embedders/")
+    print("  final layer frozen — Phase C); RESUME: pass the saved overlay as")
+    print("  the arg after steps (adafactor sidecar derived from it; v1 228-")
+    print("  tensor artifacts fail loud); inline sampling: set sample_every>0")
+    print("  (samples the LIVE store at 512, cached-caption T5 cond + zero")
+    print("  uncond, no save-before-sample).")
 
 
 def main() raises:
