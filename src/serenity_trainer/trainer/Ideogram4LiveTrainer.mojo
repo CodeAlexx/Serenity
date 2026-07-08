@@ -43,6 +43,58 @@ from serenity_trainer.trainer.Ideogram4LoRATrainer import (
 )
 from serenity_trainer.util.config.TrainConfig import TrainConfig
 
+# ── FULL FINETUNE arm (-D IDEOGRAM4_FULL_FT=1; FULL_FINETUNE_ROLLOUT_PLAN_
+# 2026-07-07 ideogram4 card — the krea2/chroma `ot-mojo-full-finetune`
+# blueprint; mirrors train_chroma_real.mojo `_chroma_full_ft_run`). Default 0 =
+# every LoRA path below byte-unchanged (C13 gate-don't-fork). ───────────────
+from std.sys.defines import get_defined_int
+from std.time import perf_counter_ns
+from std.memory import ArcPointer
+
+from serenitymojo.tensor import Tensor
+from serenitymojo.io.dtype import STDtype
+from serenitymojo.io.sharded import ShardedSafeTensors
+from serenitymojo.io.tensor_view import from_parts
+from serenitymojo.ops.cast import cast_tensor
+from serenitymojo.ops.tensor_algebra import reshape, slice, permute, mul_scalar
+from serenitymojo.models.dit.ideogram4_resident import Ideogram4Weights
+from serenitymojo.models.dit.ideogram4_mrope import build_ideogram4_mrope
+from serenitymojo.models.ideogram4.ideogram4_full_ft import (
+    Ideogram4HostBf16,
+    build_ideogram4_host_bf16,
+    build_ideogram4_ft_adafactor_states,
+    ideogram4_stack_ft_forward_streamed,
+    ideogram4_stack_ft_backward_streamed,
+    ideogram4_host_bf16_save,
+)
+from serenitymojo.training.schedule import sample_timestep_logit_normal_scaled
+
+from serenity_trainer.dataLoader.Ideogram4CacheReader import Ideogram4TrainCache
+from serenity_trainer.model.Ideogram4Predict import (
+    ideogram4_build_packed_inputs,
+    ideogram4_flow_target,
+)
+from serenity_trainer.trainer.Ideogram4LoRATrainStep import (
+    ideogram4_lora_embed_resident,
+    ideogram4_lora_final_forward_resident,
+    ideogram4_lora_final_backward,
+)
+from serenity_trainer.modelSampler.Ideogram4Sampler import (
+    IDEOGRAM4_NUM_LAYERS,
+    IDEOGRAM4_NUM_HEADS,
+    IDEOGRAM4_HEAD_DIM,
+    IDEOGRAM4_HIDDEN,
+    IDEOGRAM4_INTERMEDIATE_SIZE,
+    IDEOGRAM4_ADALN_DIM,
+    IDEOGRAM4_PACKED_CHANNELS,
+    IDEOGRAM4_MROPE_SECTION_0,
+    IDEOGRAM4_MROPE_SECTION_1,
+    IDEOGRAM4_MROPE_SECTION_2,
+    IDEOGRAM4_MROPE_THETA,
+)
+
+comptime IDEOGRAM4_FULL_FT = get_defined_int["IDEOGRAM4_FULL_FT", 0]() != 0
+
 
 comptime DEFAULT_TRANSFORMER = "/home/alex/.serenity/models/ideogram-4-fp8/transformer/diffusion_pytorch_model.safetensors"
 comptime DEFAULT_CACHE = "/home/alex/trainings/ideogram4_giger_cache/cache.safetensors"
@@ -68,6 +120,254 @@ def _append_status(path: String, text: String) raises:
     )
     f.write("\n")
     f.close()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# FULL FINETUNE run (self-contained; called from main behind IDEOGRAM4_FULL_FT).
+#
+# Mirrors _chroma_full_ft_run (train_chroma_real.mojo:524-661): cache fetch →
+# ideogram4's OWN aitk sigma policy (t = logit-normal scale 1.0 = sigmoid(N(0,1)),
+# the LoRA loop's exact dispatch — Ideogram4LoRATrainer.mojo:315-318, separate
+# *7919 RNG stream) → flow-match in the PACKED latent space (cache clean
+# [1,128,GH,GW]; noisy = (1-t)*clean + t*noise via the cache reader's
+# ideogram4_add_noise; target = noise - clean via ideogram4_flow_target —
+# Ideogram4Predict.mojo:244-267, aitk-audited row 8 of the parity ledger) →
+# cond glue = the LoRA loop's exact packing+embed (ideogram4_build_packed_inputs
+# + mrope + ideogram4_lora_embed_resident — Ideogram4LoRATrainStep.mojo:466-498)
+# → streamed FT forward from the pinned-host bf16 store → ideogram4's own MSE
+# loss (loss = mean((velocity-target)^2), d = (2/N)(velocity-target) — the
+# literal default path of _i4_flow_loss_and_dvel, Ideogram4LoRATrainStep.mojo:
+# 601-610, computed host-side like the chroma FT arm) → final-frozen backward
+# (ideogram4_lora_final_backward) → streamed FT backward with fused device
+# Adafactor (b2d=-0.8, eps2=1e-3, d=1.0, wd=0) + SR + write-back → host-direct
+# safetensors overlay save (ORIGINAL layers.N.* key names). Bypasses the
+# ENTIRE LoRA machinery (no LoRA set, no AdamW state, no levers).
+#
+# Frozen GLOBALS (embedders input_proj/t_embedding/adaln_proj/llm_cond_*/
+# embed_image_indicator + final_layer) stay DEVICE-RESIDENT as an
+# Ideogram4Weights SUBSET (every non-"layers." checkpoint tensor, fp8 kept
+# fp8-resident + per-row F32 scale exactly like Ideogram4Weights.load —
+# ideogram4_resident.mojo:38-50; the per-step forward dequants through the
+# parity-gated _resident_w_fp8 path). The 34 layers' weights live ONLY in the
+# pinned-host bf16 store (built fp8→bf16 via load_fp8_dequant).
+#
+# v1 fail-loud scope: b1 only (this runner has no batch/accum argv — enforced
+# by construction), no EMA, no caption dropout, no levers, no grad clip
+# (Adafactor d=1.0 update clipping is the OT recipe), save at run end only.
+# ══════════════════════════════════════════════════════════════════════════
+comptime I4_FT_SEED = UInt64(0x1D3A_4A11)   # the LoRA run-config noise_seed default
+
+
+def _ideogram4_load_frozen_globals(
+    st: ShardedSafeTensors, ctx: DeviceContext
+) raises -> Ideogram4Weights:
+    """Ideogram4Weights over the NON-layer checkpoint tensors only (embedders +
+    final layer + llm cond + indicator embed, with their fp8 scales) — the
+    same dtype routing as Ideogram4Weights.load (ideogram4_resident.mojo:38-50)
+    filtered to `not name.startswith("layers.")` so the ~9GB block surface is
+    NOT device-resident (it streams from the pinned-host bf16 store)."""
+    var d = Dict[String, ArcPointer[Tensor]]()
+    var n = 0
+    for ref nm in st.names():
+        if nm.startswith(String("layers.")):
+            continue
+        var info = st.tensor_info(nm)
+        if info.dtype == STDtype.F8_E4M3:
+            d[nm] = ArcPointer(Tensor.from_view_raw(
+                from_parts(info.dtype, info.shape.copy(), st.tensor_bytes(nm)), ctx))
+        elif info.dtype == STDtype.F32:
+            d[nm] = ArcPointer(Tensor.from_view_as_f32(
+                from_parts(info.dtype, info.shape.copy(), st.tensor_bytes(nm)), ctx))
+        else:
+            d[nm] = ArcPointer(Tensor.from_view(st.tensor_view(nm), ctx))
+        n += 1
+    print("[ideogram4-ft] frozen globals device-resident:", n, "non-layer tensors")
+    return Ideogram4Weights(d^)
+
+
+def _ideogram4_full_ft_run[NT: Int, GH: Int, GW: Int](
+    progress_file: String,
+    transformer: String,
+    cache_path: String,
+    output: String,
+    run_steps: Int,
+    lr: Float32,
+    caption_dropout_prob: Float32,
+    levers_config_path: String,
+) raises:
+    # ── fail-loud v1 guards (b1 / no accum / no EMA / no dropout / no levers) ─
+    if run_steps < 1:
+        raise Error("ideogram4 full-FT v1: steps must be >= 1")
+    if caption_dropout_prob > Float32(0.0):
+        raise Error("ideogram4 full-FT v1: caption dropout not wired (fail-loud)")
+    if levers_config_path.byte_length() > 0:
+        raise Error(
+            "ideogram4 full-FT v1: levers config not wired — the optimizer is "
+            "FIXED device-Adafactor+SR (the krea2 full-FT contract)"
+        )
+
+    comptime NIMG = GH * GW
+    comptime SEQ = NT + NIMG
+    comptime HIDDEN = IDEOGRAM4_HIDDEN
+    comptime HEADS = IDEOGRAM4_NUM_HEADS
+    comptime DH = IDEOGRAM4_HEAD_DIM
+    comptime FF = IDEOGRAM4_INTERMEDIATE_SIZE
+    comptime ADALN = IDEOGRAM4_ADALN_DIM
+
+    print("==== ideogram4 FULL FINETUNE (v1: 34 layers x 6 matmuls ~8.99B, device adafactor) ====")
+    print(
+        "lr=", lr, " steps=", run_steps,
+        " SR=on  optimizer=torch-adafactor (b2d=-0.8 eps2=1e-3 d=1.0 wd=0)",
+    )
+    print("  ckpt:", transformer, " (fp8 -> bf16 pinned-host store)")
+    print("  cache:", cache_path)
+
+    var ctx = DeviceContext()
+    var st = ShardedSafeTensors.open(transformer)
+
+    # frozen residents: every non-layer tensor (embedders + final layer).
+    var gw = _ideogram4_load_frozen_globals(st, ctx)
+
+    # The pinned-host bf16 store = the live model (~18GB host RAM, CONVERTED
+    # from the fp8 checkpoint at build via load_fp8_dequant).
+    var store = build_ideogram4_host_bf16(st, IDEOGRAM4_NUM_LAYERS, ctx)
+    # Adafactor factored states, device-resident, flat li*6+wi.
+    var af_states = build_ideogram4_ft_adafactor_states(store, ctx)
+
+    var cache = Ideogram4TrainCache.open(cache_path)
+    print("[cache] samples:", cache.len())
+
+    makedirs(output, exist_ok=True)
+    if progress_file.byte_length() > 0:
+        _clear_progress(progress_file)
+        _append_status(progress_file, String("Staging Ideogram4 FULL-FT trainer"))
+
+    print("")
+    print("step  loss  (full-FT; sigma policy = ideogram4's own aitk logit-normal)")
+    var train_start = perf_counter_ns()
+
+    for k in range(1, run_steps + 1):
+        var t0 = perf_counter_ns()
+        var sample_index = (k - 1) % cache.len()
+        var seed = I4_FT_SEED + UInt64(k)
+        # ── ideogram4's OWN sigma policy (Ideogram4LoRATrainer.mojo:315-318):
+        # t_flow ~ logit-normal(0,1) scale 1.0 = sigmoid(N(0,1)) — matches BOTH
+        # aitk (sigmoid(randn) timestep, parity-ledger row 8) and OT; separate
+        # *7919 RNG stream from the noise draw (the zimage idiom).
+        var t_step = sample_timestep_logit_normal_scaled(
+            I4_FT_SEED * UInt64(7919) + UInt64(k), Float32(1.0)
+        )
+        # cache fetch: clean [1,128,GH,GW] F32 + llm [1,NT,53248] BF16;
+        # noise = randn(seed), noisy = (1-t)*clean + t*noise (reader-computed —
+        # Ideogram4CacheReader.mojo:233-267 / Ideogram4Predict.ideogram4_add_noise).
+        var sample = cache.sample[NT, GH, GW](sample_index, t_step, seed, ctx)
+
+        # ── cond glue = the LoRA loop's exact packing + embed
+        # (Ideogram4LoRATrainStep.mojo ideogram4_lora_train_forward_resident:
+        # 466-498): packed inputs (+ text_len pad indicator), mrope, bf16 casts,
+        # frozen embed -> x_in [1,SEQ,HIDDEN] + adaln_input [1,1,ADALN].
+        var packed = ideogram4_build_packed_inputs[NT, GH, GW](
+            sample.noisy[], sample.llm_features[], ctx, sample.text_len
+        )
+        var tv = List[Float32]()
+        tv.append(Float32(1.0) - sample.t_flow)
+        var model_t = Tensor.from_host(tv^, [1], STDtype.F32, ctx)
+        var sec = List[Int]()
+        sec.append(IDEOGRAM4_MROPE_SECTION_0)
+        sec.append(IDEOGRAM4_MROPE_SECTION_1)
+        sec.append(IDEOGRAM4_MROPE_SECTION_2)
+        var cs = build_ideogram4_mrope(
+            packed.position_ids, DH, sec, IDEOGRAM4_MROPE_THETA, ctx, STDtype.BF16,
+        )
+        var cosf = cs[0].clone(ctx)
+        var sinf = cs[1].clone(ctx)
+        var x_bf = cast_tensor(packed.x, STDtype.BF16, ctx)
+        var llm_bf = cast_tensor(packed.llm_full, STDtype.BF16, ctx)
+        var emb = ideogram4_lora_embed_resident(
+            gw, x_bf, llm_bf, model_t, packed.indicator, HIDDEN, ctx
+        )
+
+        # seam to the P1-gate stack shapes (2-D x, [1,Adaln] adaln — see
+        # ideogram4_full_ft.mojo header / ideogram4_block_ft_parity.mojo:134-141).
+        var x2d = reshape(emb.x_in, [SEQ, HIDDEN], ctx)
+        var adaln2 = reshape(emb.adaln_input, [1, ADALN], ctx)
+
+        # ── streamed FT forward from the live host store ──
+        var fwd = ideogram4_stack_ft_forward_streamed[SEQ, HIDDEN, HEADS, DH, FF, ADALN](
+            x2d, adaln2, cosf, sinf, store, ctx
+        )
+
+        # final layer (FROZEN) + velocity (the LoRA loop's exact transform —
+        # Ideogram4LoRATrainStep.mojo:497-503).
+        var h3 = reshape(fwd.out[], [1, SEQ, HIDDEN], ctx)
+        var fin = ideogram4_lora_final_forward_resident(gw, h3, emb.adaln_input, ctx)
+        var image_velocity = slice(fin.out, 1, NT, NIMG, ctx)
+        var iv4 = reshape(image_velocity, [1, GH, GW, IDEOGRAM4_PACKED_CHANNELS], ctx)
+        var iv = permute(iv4, [0, 3, 1, 2], ctx)
+        var velocity = mul_scalar(iv, Float32(-1.0), ctx)
+
+        # ── flow target + ideogram4's own MSE loss (literal default path of
+        # _i4_flow_loss_and_dvel, Ideogram4LoRATrainStep.mojo:601-610; computed
+        # host-side like _chroma_full_ft_run:616-625) ──
+        var target = ideogram4_flow_target(sample.noise[], sample.clean[], ctx)
+        var v_h = velocity.to_host(ctx)
+        var t_h = target.to_host(ctx)
+        var nout = len(v_h)
+        var d_vel_h = List[Float32]()
+        var sse = 0.0
+        var inv_n = Float32(2.0) / Float32(nout)
+        for i in range(nout):
+            var diff = v_h[i] - t_h[i]
+            sse += Float64(diff) * Float64(diff)
+            d_vel_h.append(inv_n * diff)
+        var loss = Float32(sse / Float64(nout))
+        var d_velocity = Tensor.from_host(d_vel_h^, velocity.shape(), STDtype.F32, ctx)
+
+        # final-frozen backward -> d_h [1,SEQ,HIDDEN] bf16 (the LoRA loop's
+        # ideogram4_lora_final_backward, dx-only through final linear/ln).
+        var d_h = ideogram4_lora_final_backward[NT, GH, GW](
+            d_velocity, h3, fin.fscale, fin.flw, ctx
+        )
+        var d_h2 = reshape(d_h, [SEQ, HIDDEN], ctx)
+
+        # ── streamed FT backward + fused device Adafactor + SR + write-back ──
+        var wrote = ideogram4_stack_ft_backward_streamed[SEQ, HIDDEN, HEADS, DH, FF, ADALN](
+            d_h2, adaln2, cosf, sinf, store, fwd,
+            af_states,
+            k, Float64(lr), Float64(-0.8), Float64(1e-3),
+            Float64(1.0), Float64(0.0),
+            I4_FT_SEED * UInt64(2654435761) + UInt64(k),
+            ctx,
+        )
+        _ = wrote.grad_count
+
+        var t1 = perf_counter_ns()
+        var mi = ctx.get_memory_info()
+        var used_gb = Float64(Int(mi[1]) - Int(mi[0])) / (1024.0 * 1024.0 * 1024.0)
+        print(
+            "[ideogram4-ft] step", k, "/", run_steps, "| loss", loss,
+            "| t_flow", sample.t_flow,
+            "| s/step", Float64(t1 - t0) / 1.0e9,
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(k),
+            "| vram_used_gb", used_gb,
+        )
+
+    # Save the trained surface (host bytes -> safetensors overlay, no GPU).
+    var out_path = (
+        output + String("/ideogram4_full_ft_") + String(run_steps)
+        + String(".safetensors")
+    )
+    ideogram4_host_bf16_save(store, out_path)
+    if progress_file.byte_length() > 0:
+        _append_status(
+            progress_file,
+            String("Finished Ideogram4 FULL-FT: weights ") + out_path,
+        )
+    print("[ideogram4-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
+    print("[ideogram4-ft] v1 notes: surface = 34x6 block matmuls (adaln bias/rms")
+    print("  scales/norm_q/k/embedders/final layer frozen); resume + inline")
+    print("  sampling not wired (overlay the saved bf16 mats over the fp8 base")
+    print("  to sample); adafactor sidecar TODO.")
 
 
 def main() raises:
@@ -145,6 +445,18 @@ def main() raises:
         steps = 1
     if save_every_steps < 0:
         save_every_steps = 0
+
+    # ── FULL FINETUNE arm (IDEOGRAM4_FULL_FT): its own self-contained loop —
+    # bypasses the entire LoRA machinery below (TrainConfig recipe, LoRA set,
+    # AdamW, levers). Gate-don't-fork (C13): default builds are byte-unchanged.
+    # NOTE argv 8 (learning_rate) drives the FT lr; the LoRA default 4e-4 is
+    # NOT a sane full-FT lr — pass it explicitly (smoke: 1e-5).
+    comptime if IDEOGRAM4_FULL_FT:
+        _ideogram4_full_ft_run[NT, GH, GW](
+            progress_file, transformer, cache, output, steps, lr,
+            caption_dropout_prob, levers_config_path,
+        )
+        return
 
     makedirs(output, exist_ok=True)
     _clear_progress(progress_file)
