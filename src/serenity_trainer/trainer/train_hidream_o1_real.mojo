@@ -165,6 +165,23 @@ from serenitymojo.ops.fp8 import fp8_e4m3_dequant_perrow_to_bf16
 from serenitymojo.ops.fp8_quant import fp8_e4m3_rowscale, fp8_e4m3_encode_perrow
 from serenitymojo.pipeline.hidream_o1_cfg import build_t2i_input, T2ISample
 
+# ── FULL FINETUNE arm (-D HIDREAM_FULL_FT=1; FULL_FINETUNE_ROLLOUT_PLAN_
+# 2026-07-07 hidream card — the krea2/chroma/ideogram4 `ot-mojo-full-finetune`
+# blueprint; mirrors Ideogram4LiveTrainer._ideogram4_full_ft_run and
+# train_chroma_real.mojo `_chroma_full_ft_run`). Default 0 = every LoRA path
+# below byte-unchanged (C13 gate-don't-fork). ────────────────────────────────
+from std.sys.defines import get_defined_int
+from serenitymojo.models.dit.hidream_o1_full_ft import (
+    HiDreamO1HostBf16,
+    build_hidream_o1_host_bf16,
+    build_hidream_o1_ft_adafactor_states,
+    hidream_o1_stack_ft_forward_streamed,
+    hidream_o1_stack_ft_backward_streamed,
+    hidream_o1_host_bf16_save,
+)
+
+comptime HIDREAM_FULL_FT = get_defined_int["HIDREAM_FULL_FT", 0]() != 0
+
 comptime TArc = ArcPointer[Tensor]
 
 comptime S_TEXT = 256
@@ -208,6 +225,20 @@ comptime HIDREAM_CAPTION_DROPOUT = Float32(0.0)
 comptime APPLY_GAUSS_SHIFT_WEIGHT = False
 comptime MODEL_DIR = "/home/alex/HiDream-O1-Image-Dev-weights"
 comptime TOK_PATH = "/home/alex/HiDream-O1-Image-Dev-weights/tokenizer.json"
+# FULL-FT arm checkpoint (the on-box staging, 2026-07-08): HiDream-ai/
+# HiDream-O1-Image, 8 F32 shards, 759 tensors / 8.80B params / 35.2GB
+# (model.safetensors.index.json metadata). Key namespace verified against
+# this trainer's fetch paths: model.language_model.layers.{0..35} x 11
+# tensors (= 396), model.x_embedder.proj1/proj2, model.t_embedder1.mlp,
+# model.final_layer2.linear, model.language_model.{embed_tokens,norm};
+# model.visual.* / lm_head are skipped by the loader (frozen, unused for
+# t2i). config.json == HiDreamO1Config.dev_8b (4096/36/32/8/128/12288,
+# rope_theta 5e6, vocab 151936). The LoRA arm's MODEL_DIR above is left
+# untouched (C13).
+comptime FT_MODEL_DIR = "/mnt/disk1/models/hidream-o1"
+comptime FT_TOK_PATH = "/mnt/disk1/models/hidream-o1/tokenizer.json"
+# the LoRA run-seed lineage, own stream for the FT arm (ideogram4 shape)
+comptime HD_FT_SEED = UInt64(0x41D3_7E11)
 
 
 def _slot_dims(slot: Int) raises -> List[Int]:
@@ -538,7 +569,263 @@ def _clip_grads_all(
     return gn
 
 
+# ══════════════════════════════════════════════════════════════════════════
+# FULL FINETUNE run (self-contained; called from main behind HIDREAM_FULL_FT).
+#
+# Mirrors _ideogram4_full_ft_run (Ideogram4LiveTrainer.mojo:188-370): stage-A
+# fetch → hidream's OWN sigma policy — THE SAME gated recipe this trainer's
+# LoRA loop runs (header lines 4-26, aitk oracle, MJ-1041: t_id ~ UNIFORM over
+# the 1000-step shift-3 schedule via _sigmas_and_weights, noise = randn *
+# NOISE_SCALE 8.0, noisy = (1-σ)·clean + σ·noise, model_t = 1-σ, x-PREDICTION
+# → v_pred = (noisy - x_pred)/σ_floored, target = noise - clean, plain MSE —
+# APPLY_GAUSS_SHIFT_WEIGHT stays False) → cond glue = the LoRA loop's exact
+# data path (patchify + caption-halving build_t2i_input + _scatter_row +
+# mrope/mask builds) with the 5 heads FROZEN (dit._t_embed/_patch_embed/
+# _final_layer — the inference helpers the LoRA loop inlines only to add head
+# adapters) → streamed FT forward from the pinned-host bf16 store → host loss
+# + d_out (the literal legacy MSE block, wt=1.0) → final-frozen backward
+# (linear_backward_dx + rms_norm_backward_dx) → streamed FT backward with
+# fused device Adafactor (b2d=-0.8, eps2=1e-3, d=1.0, wd=0) + SR + write-back
+# → host-direct safetensors overlay save (ORIGINAL model.language_model.
+# layers.N.* key names). Bypasses the ENTIRE LoRA machinery (no LoRA set, no
+# AdamW state, no levers, no EMA). NO grad clip: Adafactor's d=1.0 update
+# clipping is the OT full-FT recipe (the fleet FT arms all drop the aitk
+# global clip — Ideogram4LiveTrainer.mojo:154-156).
+#
+# v1 fail-loud scope: b1 only (no batch/accum argv — by construction), no EMA,
+# no caption dropout, no levers/config, no rank, save at run end only.
+# ══════════════════════════════════════════════════════════════════════════
+def _hidream_full_ft_run() raises:
+    var args = argv()
+    if len(args) < 3:
+        raise Error(
+            "usage (HIDREAM_FULL_FT): train_hidream_o1_real <stage_dir> <steps>"
+            " [lr] [-] [out_dir]"
+        )
+    var stage_dir = String(args[1])
+    var steps = atol(String(args[2]))
+    if steps < 1:
+        raise Error("hidream full-FT v1: steps must be >= 1")
+    var lr = Float32(1.0e-5)
+    if len(args) > 3 and String(args[3]) != "-":
+        lr = Float32(atof(String(args[3])))
+    if len(args) > 4 and String(args[4]) != "-":
+        raise Error("hidream full-FT v1: rank arg is a LoRA lever — pass '-'")
+    var out_dir = String("/home/alex/mojodiffusion/output/hidream_o1_full_ft")
+    if len(args) > 5 and String(args[5]) != "-":
+        out_dir = String(args[5])
+    if len(args) > 6 and String(args[6]) != "-" and Float32(atof(String(args[6]))) > Float32(0.0):
+        raise Error("hidream full-FT v1: EMA not wired (fail-loud)")
+    if len(args) > 7 and String(args[7]) != "-":
+        raise Error(
+            "hidream full-FT v1: levers config not wired — the optimizer is "
+            "FIXED device-Adafactor+SR (the krea2 full-FT contract)"
+        )
+    if len(args) > 8 and String(args[8]) != "-":
+        raise Error("hidream full-FT v1: grad dump is a LoRA-arm lever")
+    makedirs(out_dir, exist_ok=True)
+
+    print("==== hidream-o1 FULL FINETUNE (v1: 36 layers x 7 matmuls ~6.95B, device adafactor) ====")
+    print(
+        "lr=", lr, " steps=", steps,
+        " SR=on  optimizer=torch-adafactor (b2d=-0.8 eps2=1e-3 d=1.0 wd=0)",
+    )
+    print("  ckpt:", String(FT_MODEL_DIR), " (F32 -> bf16 pinned-host store)")
+    print("  stage:", stage_dir)
+
+    var ctx = DeviceContext()
+    var cfg = HiDreamO1Config.dev_8b()
+
+    # frozen residents: embed_tokens + final norm + the 5 head linears
+    # (HiDreamO1Offloaded.shared, from_view_as_bf16 — hidream_o1.mojo:745-760).
+    # The offloaded layer loader is NOT used on this arm; layers live ONLY in
+    # the pinned-host bf16 store below.
+    print("[load] HiDream-O1 shared residents (bf16)")
+    var dit = HiDreamO1Offloaded[S].load(String(FT_MODEL_DIR), cfg, ctx)
+    var tok = Qwen3Tokenizer(String(FT_TOK_PATH))
+    var norm_w = dit.shared[String("model.language_model.norm.weight")].copy()
+    var final_w = dit.shared[String("model.final_layer2.linear.weight")].copy()
+
+    # The pinned-host bf16 store = the live model (~12.9GiB host RAM, CONVERTED
+    # from the F32 checkpoint at build via Tensor.from_view_as_bf16).
+    var st = ShardedSafeTensors.open(String(FT_MODEL_DIR))
+    var store = build_hidream_o1_host_bf16(st, LAYERS, ctx)
+    # Adafactor factored states, device-resident, flat li*7+wi.
+    var af_states = build_hidream_o1_ft_adafactor_states(store, ctx)
+
+    var imgs = ShardedSafeTensors.open(stage_dir + "/images.safetensors")
+    var n_samples = 0
+    while True:
+        try:
+            _ = imgs.tensor_view(String("image.") + String(n_samples))
+            n_samples += 1
+        except:
+            break
+    if n_samples == 0:
+        raise Error("hidream full-FT: no image.<i> in stage dir")
+    print("[data] samples:", n_samples)
+
+    var sw = _sigmas_and_weights()
+    var train_start = perf_counter_ns()
+
+    print("")
+    print("step  loss  (full-FT; sigma policy = hidream's own aitk shift-3 uniform)")
+    for step in range(1, steps + 1):
+        var t0 = perf_counter_ns()
+        var idx = (step - 1) % n_samples
+
+        # ── data: clean patches + templated ids (the LoRA loop's exact path) ─
+        var img = Tensor.from_view(imgs.tensor_view(String("image.") + String(idx)), ctx)
+        var img_bf = cast_tensor(img, STDtype.BF16, ctx)
+        var clean = patchify(img_bf, PATCH, ctx)               # [1,IMG_L,3072] bf16
+        var clean_h = clean.to_host(ctx)
+
+        var caption = _read_text(stage_dir + "/caption." + String(idx) + ".txt")
+        var samp: T2ISample
+        while True:
+            try:
+                samp = build_t2i_input(tok, cfg, caption, HP, WP, S_TEXT)
+                break
+            except:
+                var keep = caption.byte_length() // 2
+                if keep < 8:
+                    raise Error("hidream full-FT: caption cannot fit bucket")
+                var cut = String("")
+                var taken = 0
+                for ch in caption.codepoint_slices():
+                    var l = ch.byte_length()
+                    if taken + l > keep:
+                        break
+                    cut += String(ch)
+                    taken += l
+                caption = cut^
+
+        # sigma / noise / noisy / model_t (host F32 math — recipe verbatim)
+        var stt = HD_FT_SEED * UInt64(6364136223846793005) + UInt64(step)
+        stt = stt * 6364136223846793005 + 1442695040888963407
+        var t_id = Int((stt >> 33) % UInt64(1000))
+        var sigma = sw.sigmas[t_id]
+        var noise = _gauss(IMG_L * PATCH_VEC, HD_FT_SEED * UInt64(7919) + UInt64(step))
+        var noisy_h = List[Float32]()
+        var target_h = List[Float32]()
+        for i in range(IMG_L * PATCH_VEC):
+            var nz = noise[i] * NOISE_SCALE
+            noisy_h.append((Float32(1.0) - sigma) * clean_h[i] + sigma * nz)
+            target_h.append(nz - clean_h[i])
+        var noisy = Tensor.from_host(noisy_h.copy(), [1, IMG_L, PATCH_VEC], STDtype.BF16, ctx)
+
+        # ── embed: ALL heads FROZEN (the inference helpers; the LoRA loop
+        # inlines these ONLY to train head adapters — v1 FT surface is the 36
+        # blocks' matmuls, heads stay frozen like krea2/ideogram4 v1) ─────────
+        var text_emb = dit._embed(samp.text_ids, ctx)
+        var model_t = Float32(1.0) - sigma
+        var t_emb = dit._t_embed(model_t, ctx)
+        var tms_idx = -1
+        for i in range(len(samp.text_ids)):
+            if samp.text_ids[i] == cfg.tms_token_id:
+                tms_idx = i
+        var text_emb_t = _scatter_row(text_emb, t_emb, tms_idx, len(samp.text_ids), D, ctx)
+        var patch_emb = dit._patch_embed(noisy, ctx)           # [1,IMG_L,D]
+        var hidden_t = concat(1, ctx, text_emb_t, patch_emb)
+
+        # mrope tables + mask (per step; host — the LoRA loop's exact build)
+        var tables = _build_mrope_tables(
+            samp.t_pos, samp.h_pos, samp.w_pos, Dh, cfg.rope_theta,
+            cfg.mrope_h, cfg.mrope_w,
+        )
+        comptime half = Dh // 2
+        var cq_sh: List[Int] = [S * H * half]
+        var ck_sh: List[Int] = [S * HKV * half]
+        var cos_q = Tensor.from_host(_replicate_heads(tables[0], S, half, H), cq_sh.copy(), STDtype.F32, ctx)
+        var sin_q = Tensor.from_host(_replicate_heads(tables[1], S, half, H), cq_sh^, STDtype.F32, ctx)
+        var cos_k = Tensor.from_host(_replicate_heads(tables[0], S, half, HKV), ck_sh.copy(), STDtype.F32, ctx)
+        var sin_k = Tensor.from_host(_replicate_heads(tables[1], S, half, HKV), ck_sh^, STDtype.F32, ctx)
+
+        var mask_h = _build_prefix_causal_mask_padded(S, H, samp.ar_len, samp.key_valid)
+        var m4_sh: List[Int] = [1, H, S, S]
+        var mask4 = Tensor.from_host(mask_h.copy(), m4_sh^, STDtype.BF16, ctx)
+        var mhs_sh: List[Int] = [H * S, S]
+        var mask_f32 = Tensor.from_host(mask_h^, mhs_sh^, STDtype.F32, ctx)
+
+        # ── streamed FT forward from the live host store ──
+        var fwd = hidream_o1_stack_ft_forward_streamed[S, H, HKV, Dh](
+            TArc(hidden_t^), cos_q, sin_q, cos_k, sin_k, mask4, store,
+            D, F, EPS, ctx,
+        )
+
+        # final norm + final linear (BOTH frozen on this arm)
+        var final_normed = rms_norm(fwd.out[], norm_w[], EPS, ctx)
+        var out_full = dit._final_layer(final_normed, ctx)     # [1,S,3072]
+        var out_h = out_full.to_host(ctx)
+
+        # ── loss + d_out (host F32; x-prediction -> velocity chain — the
+        # literal legacy block, wt == 1.0 plain MSE; NO grad clip on FT) ──────
+        comptime NOUT = IMG_L * PATCH_VEC
+        var base = S_TEXT * PATCH_VEC
+        var d_full = List[Float32]()
+        for _ in range(base):
+            d_full.append(0.0)
+        var sigma_div = sigma if sigma > SIGMA_FLOOR else SIGMA_FLOOR
+        var inv_sigma = Float32(1.0) / sigma_div
+        var sse = 0.0
+        var dcoef = -Float32(2.0) / Float32(NOUT) * inv_sigma
+        for i in range(NOUT):
+            var x_pred = out_h[base + i]
+            var v_pred = (noisy_h[i] - x_pred) * inv_sigma
+            var diff = v_pred - target_h[i]
+            sse += Float64(diff) * Float64(diff)
+            d_full.append(dcoef * diff)
+        var loss = Float32(sse / Float64(NOUT))
+        var d_out_t = Tensor.from_host(d_full^, [1, S, PATCH_VEC], STDtype.BF16, ctx)
+
+        # final backward (frozen): dx through final linear, then final-norm dx.
+        var d_final_normed = linear_backward_dx(d_out_t, final_w[], S, D, PATCH_VEC, ctx)
+        var d_x0 = rms_norm_backward_dx(d_final_normed, fwd.out[], norm_w[], EPS, ctx)
+
+        # ── streamed FT backward + fused device Adafactor + SR + write-back ──
+        var wrote = hidream_o1_stack_ft_backward_streamed[S, H, HKV, Dh](
+            d_x0, cos_q, sin_q, cos_k, sin_k, mask4, mask_f32, store, fwd,
+            af_states,
+            step, Float64(lr), Float64(-0.8), Float64(1e-3),
+            Float64(1.0), Float64(0.0),
+            HD_FT_SEED * UInt64(2654435761) + UInt64(step),
+            D, F, EPS, ctx,
+        )
+        _ = wrote.grad_count
+
+        var t1 = perf_counter_ns()
+        var mi = ctx.get_memory_info()
+        var used_gb = Float64(Int(mi[1]) - Int(mi[0])) / (1024.0 * 1024.0 * 1024.0)
+        print(
+            "[hidream-ft] step", step, "/", steps, "| loss", loss,
+            "| sigma", sigma,
+            "| s/step", Float64(t1 - t0) / 1.0e9,
+            "| avg", (Float64(t1 - train_start) / 1.0e9) / Float64(step),
+            "| vram_used_gb", used_gb,
+        )
+
+    # Save the trained surface (host bytes -> safetensors overlay, no GPU).
+    var out_path = (
+        out_dir + String("/hidream_o1_full_ft_") + String(steps)
+        + String(".safetensors")
+    )
+    hidream_o1_host_bf16_save(store, out_path)
+    print("[hidream-ft] DONE —", steps, "full-FT steps; weights:", out_path)
+    print("[hidream-ft] v1 notes: surface = 36x7 block matmuls (in_ln/post_ln/")
+    print("  q_norm/k_norm/embed_tokens/heads/final norm+linear frozen); resume +")
+    print("  inline sampling not wired (overlay the saved bf16 mats over the F32")
+    print("  base to sample); adafactor sidecar TODO.")
+
+
 def main() raises:
+    # ── FULL FINETUNE arm (HIDREAM_FULL_FT): its own self-contained loop —
+    # bypasses the entire LoRA machinery below (TrainConfig recipe, 257-adapter
+    # LoRA set, fused AdamW, levers, EMA). Gate-don't-fork (C13): default
+    # builds are byte-unchanged.
+    comptime if HIDREAM_FULL_FT:
+        _hidream_full_ft_run()
+        return
+
     var args = argv()
     if len(args) < 3:
         raise Error(
