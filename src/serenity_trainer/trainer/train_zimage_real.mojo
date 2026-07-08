@@ -136,7 +136,9 @@ from serenitymojo.training.sample_prompt_config import (
     validate_step_sample_cadence, should_sample_completed_step,
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
+    SamplePromptConfig, read_sample_prompt_config,
 )
+from serenitymojo.io.cap_cache import save_tensor_bin
 from serenitymojo.training.onetrainer_train_loop_policy import (
     OT_GRAD_POLICY_ON_ONLY,
     ot_cache_dir_from_train_config,
@@ -2186,6 +2188,283 @@ def _full_ft_step[
         return StepResult(loss, Float32(gn), Float32(secs), Float32(st.upd_l1), 0, 0)
 
 
+# ── FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #2) ───
+# Mirror of `_render_sample_resident`'s denoise (numeric conventions are
+# byte-for-byte the inference _denoise: t = 1 - sigma, pred = -velocity,
+# Euler x += (sigma_next - sigma) * pred, latent kept BF16, step arithmetic
+# F32, Comfy simple sigmas shift 3.0), but run against the FT arm's LIVE
+# RESIDENT weights — the optimizer mutates nr/cr/main_blocks in place, so the
+# resident weights ARE the current model (no store streaming, no reload).
+# `zero_dev` is the FT arm's scale==0 adapter set: the device forward IS the
+# base forward. Returns the final BF16 latent [1,LAT_C,LH,WL] WITHOUT
+# decoding — the caller persists it and try/excepts the in-process VAE decode
+# separately (VRAM caution: the FT arm peaks 15.2GB on the 16GB card).
+# No parity claim: smoke + artifact evidence only (the denoise forward is the
+# already-gated training/inference forward).
+def _zimage_ft_sample_resident_latent[
+    LH: Int, WL: Int, CAP: Int
+](
+    cache: KleinCache,
+    sample_slot: Int,
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    zero_dev: ZImageLoraDeviceSet,
+    aux: ZImageRealAux,
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_pad_h: List[Float32], cap_pad_h: List[Float32],
+    steps: Int, seed: UInt64,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    comptime HT_R = LH // PATCH
+    comptime WT_R = WL // PATCH
+    comptime N_IMG_REAL_R = HT_R * WT_R
+    comptime IMG_PAD_R = (32 - (N_IMG_REAL_R % 32)) % 32
+    comptime N_IMG_R = N_IMG_REAL_R + IMG_PAD_R
+    comptime N_TXT_R = CAP
+    comptime S_R = N_IMG_R + N_TXT_R
+
+    if steps < 1:
+        raise Error("zimage FT inline sampler: steps must be >= 1")
+
+    # ── conditioning from the cached sample (cond-only; no caption dropout) ──
+    var s = cache.load(sample_slot, ctx)
+    var valid_cap = _valid_cap_from_mask(s.text_mask, ctx)
+    if valid_cap <= 0:
+        raise Error("zimage FT inline sampler: empty caption")
+    if valid_cap > CAP:
+        valid_cap = CAP
+
+    var cap2 = _cap_tensor_from_cache[CAP](s.text_embedding, valid_cap, False, ctx)
+    var cap_seq = build_cap_seq(aux, cap2, EPS, ctx)
+    for r in range(valid_cap, CAP):
+        for c in range(D):
+            cap_seq[r * D + c] = cap_pad_h[c]
+
+    # ── positions + rope (identical builder to the trainer step) ──
+    var pos_step = build_positions(N_IMG_R, HT_R, WT_R, CAP, valid_cap)
+    var x_pos = pos_step[0].copy()
+    var cap_pos = pos_step[1].copy()
+    var uni_pos = List[List[Int]]()
+    for i in range(len(x_pos)):
+        uni_pos.append(x_pos[i].copy())
+    for i in range(len(cap_pos)):
+        uni_pos.append(cap_pos[i].copy())
+    var xr = build_rope(x_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var x_cos = xr[0].copy(); var x_sin = xr[1].copy()
+    var cr = build_rope(cap_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var cap_cos = cr[0].copy(); var cap_sin = cr[1].copy()
+    var ur = build_rope(uni_pos, H, Dh, ROPE_THETA, AXIS0, AXIS1, AXIS2, ctx)
+    var uni_cos = ur[0].copy(); var uni_sin = ur[1].copy()
+
+    # ── t=1 init latent: seeded gaussian [1,LAT_C,LH,WL] kept BF16.
+    # The seed comes from the sampler's OWN stream (caller) — randn here is a
+    # pure function of it; NO training RNG state is consumed/advanced.
+    var noise = _render_gaussian_noise(LAT_C * LH * WL, seed)
+    var x = Tensor.from_host(noise^, [1, LAT_C, LH, WL], STDtype.BF16, ctx)
+
+    # ── Comfy ZImage simple sigmas (steps+1 pts, 1.0..0.0, shift 3.0) ──
+    var sigmas = zimage_comfy_simple_sigmas_with_shift(steps, ZIMAGE_SAMPLE_SIGMA_SHIFT)
+
+    for i in range(steps):
+        var t = Float32(1.0) - sigmas[i]  # DiT timestep convention (= 1 - sigma)
+        var adaln = build_adaln(aux, t, ADALN_DIM, T_SCALE, ctx)
+        var nr_mod = List[ZImageModVecs]()
+        for j in range(NUM_NR):
+            nr_mod.append(build_block_modvecs(aux.nr_mod_w[j][], aux.nr_mod_b[j][], adaln, D, ctx))
+        var main_mod = List[ZImageModVecs]()
+        for j in range(MAIN_DEPTH):
+            main_mod.append(build_block_modvecs(aux.main_mod_w[j][], aux.main_mod_b[j][], adaln, D, ctx))
+        var f_scale = build_f_scale(aux, adaln, D, ctx)
+
+        # x_seq from the current latent (+ IMG_PAD learned x_pad rows).
+        var x_seq = build_x_seq(aux, x, LAT_C, LH, WL, PATCH, ctx)
+        for _pad in range(IMG_PAD_R):
+            for c in range(D):
+                x_seq.append(x_pad_h[c])
+
+        var patches = zimage_stack_lora_predict_main_device_tensor[H, Dh, N_IMG_R, N_TXT_R, S_R](
+            x_seq^, cap_seq.copy(),
+            nr_blocks, nr_mod, cr_blocks, main_blocks, main_mod, zero_dev,
+            f_scale^, final_lin_w, final_lin_b,
+            x_cos[], x_sin[], cap_cos[], cap_sin[], uni_cos[], uni_sin[],
+            D, F, OUT_CH, EPS, FINAL_EPS, ctx,
+        )
+        var vel = zimage_unpatchify_image_rows_channel_minor(
+            patches^, LAT_C, LH, WL, PATCH, ctx
+        )
+        # scheduler: pred = -vel (cfg==1 negation), x += (sigma_next - sigma)*pred.
+        var pred = ta_mul_scalar(vel, -1.0, ctx)
+        var dt = sigmas[i + 1] - sigmas[i]
+        var x_compute = _render_cast(x, STDtype.F32, ctx)
+        x = _render_cast(ta_add(x_compute, ta_mul_scalar(pred, dt, ctx), ctx), STDtype.BF16, ctx)
+        if i == 0 or i + 1 == steps or (i + 1) % 5 == 0:
+            print("[zimage-ft-sample] step", i + 1, "/", steps, " sigma=", sigmas[i])
+    return x^
+
+
+# One FT sample: denoise at the TRAINING bucket -> persist the LATENT first
+# (so an offline decode is ALWAYS possible), then attempt the in-process VAE
+# decode inside try/except — its failure is NON-FATAL (krea2 pattern,
+# train_krea2.mojo _krea2_ft_run_inline_samples). MEASURED on the 16GB 5080:
+# the FT arm holds ~14.7GB at cadence (12.3GB live resident weights + pool
+# blocks fragmented around them; trim reclaims ~nothing), so the in-process
+# decode OOMs — the .lat.bin + the printed models/zimage/zimage_decode_latent
+# CLI command (fresh process, virgin pool) is the expected v1 path.
+def _zimage_ft_sample_one[
+    LH: Int, WL: Int, CAP: Int
+](
+    cache: KleinCache,
+    sample_slot: Int,
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    zero_dev: ZImageLoraDeviceSet,
+    aux: ZImageRealAux,
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_pad_h: List[Float32], cap_pad_h: List[Float32],
+    steps: Int, seed: UInt64, out_png: String,
+    ctx: DeviceContext,
+) raises:
+    var latent = _zimage_ft_sample_resident_latent[LH, WL, CAP](
+        cache, sample_slot, nr_blocks, cr_blocks, main_blocks, zero_dev, aux,
+        final_lin_w, final_lin_b, x_pad_h, cap_pad_h, steps, seed, ctx,
+    )
+    var lat_bin = out_png + String(".lat.bin")
+    save_tensor_bin(latent, lat_bin, ctx)
+    ctx.synchronize()
+    cu_mempool_trim_current(0)   # release denoise transients before the decode
+    try:
+        var dec = ZImageDecoder[LH, WL].load(VAE_DIR, ctx)
+        var rgb = dec.decode(_render_cast(latent, STDtype.BF16, ctx), ctx)
+        save_png(rgb, out_png, ctx, ValueRange.SIGNED)
+        print("[zimage-ft-sample] wrote", out_png, " (", WL * 8, "x", LH * 8, ")")
+    except e:
+        print("[zimage-ft-sample] in-process decode failed (latent saved):",
+              lat_bin, " err:", String(e))
+        print("[zimage-ft-sample] decode offline (fresh GPU pool): ",
+              "zimage_decode_latent ", lat_bin, " ", VAE_DIR, " ", out_png)
+
+
+# FT-arm cadence body (called from `_zimage_full_ft_main`). Conditioning =
+# the LoRA render's cached-caption contract (cached text_embedding
+# [1,512,2560] cond-only — NO live TE): each prompt renders from the FIRST
+# cache slot (scan starts at pi % count so prompts spread across captions)
+# whose TRAINING bucket matches the prompt's width/height — the render
+# reuses training shapes by construction (NO new 1024 instantiation,
+# train_zimage_real.mojo:842 rule). v1 is CFG=1 cond-only (prompt.cfg must
+# be 1.0) and the prompt TEXT is advisory (documented v1 delta).
+# Sample-noise seed = its OWN deterministic stream derived from
+# (cfg.seed, completed_step, prompt idx) — DISJOINT from all three training
+# streams (seed+k / seed*7919+k / seed*2654435761+k); sampling consumes NO
+# training RNG, so the BYTE-EQUAL loss/resume class is untouched.
+def _zimage_ft_run_inline_samples(
+    cache: KleinCache,
+    nr_blocks: List[ZImageBlockWeights],
+    cr_blocks: List[ZImageBlockWeights],
+    main_blocks: List[ZImageBlockWeights],
+    zero_dev: ZImageLoraDeviceSet,
+    aux: ZImageRealAux,
+    final_lin_w: Tensor, final_lin_b: Tensor,
+    x_pad_h: List[Float32], cap_pad_h: List[Float32],
+    train_cfg: TrainConfig,
+    read sample_cfg: SamplePromptConfig,
+    completed_step: Int,
+    out_dir: String,
+    ctx: DeviceContext,
+) raises:
+    var samples_dir = out_dir + String("/samples")
+    _ = sys_system(String("mkdir -p ") + samples_dir)
+    for pi in range(len(sample_cfg.prompts)):
+        var prompt = sample_cfg.prompts[pi].copy()
+        if not prompt.enabled:
+            continue
+        if prompt.frames != 1:
+            raise Error("zimage FT inline sampler: only single-frame image samples are supported")
+        if prompt.random_seed:
+            raise Error("zimage FT inline sampler: random_seed is not supported; the sampler derives its own (seed, step) stream")
+        if prompt.cfg != Float32(1.0):
+            raise Error("zimage FT inline sampler v1 is CFG=1 cond-only (the resident render contract); set cfg 1.0")
+        if (
+            prompt.sample_inpainting
+            or prompt.base_image_path.byte_length() > 0
+            or prompt.mask_image_path.byte_length() > 0
+        ):
+            raise Error("zimage FT inline sampler: init image/inpaint/mask sampling is not supported")
+
+        # conditioning slot: first cache slot whose TRAINING bucket matches
+        # the prompt geometry (px = latent*8). Fail loud when none matches —
+        # the FT arm samples at the training buckets only.
+        var n_cache = cache.count()
+        var slot = -1
+        for j in range(n_cache):
+            var cand = (pi + j) % n_cache
+            var ck = cache.peek_key(cand, ctx)
+            if ck.c == LAT_C and ck.h * 8 == prompt.height and ck.w * 8 == prompt.width:
+                slot = cand
+                break
+        if slot < 0:
+            raise Error(
+                String("zimage FT inline sampler: no cache slot matches prompt ")
+                + String(pi) + String(" geometry ") + String(prompt.width)
+                + String("x") + String(prompt.height)
+                + String(" — the FT arm samples at the training buckets only")
+            )
+        var key = cache.peek_key(slot, ctx)
+        var valid_cap = _cache_valid_cap(cache, slot, ctx)
+
+        # OWN sample-noise stream (krea2 derivation): (seed XOR "SAMPLE")
+        # folded with the global step + prompt index. NOT one of the training
+        # streams; the noise builder is a pure function of this seed.
+        var sample_seed = (
+            (train_cfg.seed ^ UInt64(0x53414D504C45))     # "SAMPLE"
+            + UInt64(completed_step) * UInt64(1000003)
+            + UInt64(pi)
+        )
+        var out_png = (
+            samples_dir + String("/step_") + String(completed_step)
+            + String("_") + String(pi) + String(".png")
+        )
+        print("[zimage-ft-sample] step", completed_step, " prompt", pi,
+              " slot", slot, " bucket", key.h, "x", key.w,
+              " steps=", prompt.steps, " seed=", sample_seed)
+
+        if key.h == 72 and key.w == 56:
+            if valid_cap <= 224:
+                _zimage_ft_sample_one[72, 56, 224](
+                    cache, slot, nr_blocks, cr_blocks, main_blocks, zero_dev,
+                    aux, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    prompt.steps, sample_seed, out_png, ctx,
+                )
+            elif valid_cap <= 256:
+                _zimage_ft_sample_one[72, 56, 256](
+                    cache, slot, nr_blocks, cr_blocks, main_blocks, zero_dev,
+                    aux, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    prompt.steps, sample_seed, out_png, ctx,
+                )
+            else:
+                raise Error("zimage FT inline sampler: caption too long for 256 bucket")
+        elif key.h == 64 and key.w == 64:
+            if valid_cap <= 224:
+                _zimage_ft_sample_one[64, 64, 224](
+                    cache, slot, nr_blocks, cr_blocks, main_blocks, zero_dev,
+                    aux, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    prompt.steps, sample_seed, out_png, ctx,
+                )
+            elif valid_cap <= 256:
+                _zimage_ft_sample_one[64, 64, 256](
+                    cache, slot, nr_blocks, cr_blocks, main_blocks, zero_dev,
+                    aux, final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    prompt.steps, sample_seed, out_png, ctx,
+                )
+            else:
+                raise Error("zimage FT inline sampler: caption too long for 256 bucket")
+        else:
+            raise Error(
+                "zimage FT inline sampler: only the 72x56 and 64x64 latent buckets are wired"
+            )
+
+
 # resume_ckpt_dir ("" = fresh run; ZIMAGE_FT_ADAFACTOR builds only): a prior
 # full-FT run's saved checkpoint DIR. zimage saves a FULL transformer checkpoint
 # (all keys; trained ones current), so resume loads THAT dir as the transformer
@@ -2325,6 +2604,27 @@ def _zimage_full_ft_main(
         print("[fullft] NOTE: mid-run save_every is not wired in v1;",
               " the full checkpoint is written once at end of run")
 
+    # ── inline sampling (FT arm; FT_INLINE_SAMPLING_PLAN_2026-07-08, #2) ─────
+    # Fires after global step k when k % sample_every == 0 (never at k=0).
+    # v1 does NOT save-before-sample (the FT arm saves at run end only —
+    # documented delta vs ot_should_save_before_sample). Sampling reads the
+    # LIVE RESIDENT weights (the optimizer mutates them in place — they ARE
+    # the current model); conditioning = cached captions (no live TE).
+    var sample_cfg = SamplePromptConfig()
+    var sample_every = train_cfg.sample_every
+    var sample_enabled = sample_every > 0
+    if sample_enabled:
+        if train_cfg.validation_prompts_file == String(""):
+            raise Error("zimage full-FT inline sampler requires validation_prompts_file")
+        sample_cfg = read_sample_prompt_config(train_cfg.validation_prompts_file)
+        print("[zimage-ft-sample] enabled every", sample_every,
+              "steps; prompts=", len(sample_cfg.prompts),
+              " file=", train_cfg.validation_prompts_file)
+        print("[zimage-ft-sample] v1: LIVE resident weights, training-bucket",
+              "geometry, cached-caption conditioning (prompt text advisory),")
+        print("[zimage-ft-sample]     CFG=1 cond-only, NO save-before-sample",
+              "(the FT arm saves at run end)")
+
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
     var total_upd_l1 = 0.0
@@ -2396,6 +2696,20 @@ def _zimage_full_ft_main(
         if k == start_k:
             first_loss = loss
         last_loss = loss
+
+        # ── inline sampler: sample the LIVE resident weights, no save/reload ─
+        if sample_enabled and k % sample_every == 0:
+            ctx.synchronize()
+            cu_mempool_trim_current(0)   # release pool blocks before the render
+            try:
+                _zimage_ft_run_inline_samples(
+                    cache, nr_blocks, cr_blocks, main_blocks, zero_dev, aux,
+                    final_lin_w, final_lin_b, x_pad_h, cap_pad_h,
+                    train_cfg, sample_cfg, k, out_dir, ctx,
+                )
+            except e:
+                print("[zimage-ft-sample] sample FAILED (training continues):", e)
+            ctx.synchronize()
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
