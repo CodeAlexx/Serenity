@@ -942,7 +942,8 @@ def _hidream_full_ft_run() raises:
             )
     makedirs(out_dir, exist_ok=True)
 
-    print("==== hidream-o1 FULL FINETUNE (v1: 36 layers x 7 matmuls ~6.95B, device adafactor) ====")
+    print("==== hidream-o1 FULL FINETUNE (v2 full surface: 36 layers x 11 params")
+    print("     [7 matmuls + 4 rms scales] ~6.946B, device adafactor 2D+1D) ====")
     print(
         "lr=", lr, " steps=", steps,
         " SR=on  optimizer=torch-adafactor (b2d=-0.8 eps2=1e-3 d=1.0 wd=0)",
@@ -1083,8 +1084,8 @@ def _hidream_full_ft_run() raises:
         var noisy = Tensor.from_host(noisy_h.copy(), [1, IMG_L, PATCH_VEC], STDtype.BF16, ctx)
 
         # ── embed: ALL heads FROZEN (the inference helpers; the LoRA loop
-        # inlines these ONLY to train head adapters — v1 FT surface is the 36
-        # blocks' matmuls, heads stay frozen like krea2/ideogram4 v1) ─────────
+        # inlines these ONLY to train head adapters — the v2 FT surface is the
+        # 36 layers' 11 per-layer params; heads/embedders are Phase C scope) ──
         var text_emb = dit._embed(samp.text_ids, ctx)
         var model_t = Float32(1.0) - sigma
         var t_emb = dit._t_embed(model_t, ctx)
@@ -1197,12 +1198,13 @@ def _hidream_full_ft_run() raises:
         full_ft_sidecar_path_for_overlay(out_path), ctx,
     )
     print("[hidream-ft] DONE —", steps, "full-FT steps; weights:", out_path)
-    print("[hidream-ft] v1 notes: surface = 36x7 block matmuls (in_ln/post_ln/")
-    print("  q_norm/k_norm/embed_tokens/heads/final norm+linear frozen); RESUME:")
-    print("  pass the saved overlay as argv 9 (adafactor sidecar derived from")
-    print("  it); inline sampling: argv 10 sample_every > 0 (samples the LIVE")
-    print("  store at 512, in-process caption-0 cond + ' ' uncond, no")
-    print("  save-before-sample).")
+    print("[hidream-ft] v2 notes: surface = 36x11 per-layer params (7 matmuls +")
+    print("  in_ln/q_norm/k_norm/post_ln rms scales; embed_tokens/heads/final")
+    print("  norm+linear stay frozen — Phase C scope); RESUME: pass the saved")
+    print("  overlay as argv 9 (adafactor sidecar derived from it; v1 252-tensor")
+    print("  overlays/sidecars fail loud); inline sampling: argv 10 sample_every")
+    print("  > 0 (samples the LIVE store at 512, in-process caption-0 cond +")
+    print("  ' ' uncond, no save-before-sample).")
 
 
 def main() raises:
