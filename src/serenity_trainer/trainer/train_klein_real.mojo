@@ -48,7 +48,9 @@ from std.time import perf_counter_ns
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
-from serenitymojo.io.cap_cache import validate_klein_cap_cache_header
+from serenitymojo.io.cap_cache import (
+    validate_klein_cap_cache_header, save_tensor_bin,
+)
 from serenitymojo.io.safetensors import SafeTensors
 from serenitymojo.scratch_ring import ScratchRingAllocator
 
@@ -161,6 +163,15 @@ from serenitymojo.training.full_ft_sidecar import (
     full_ft_sidecar_save, full_ft_sidecar_load,
     full_ft_sidecar_path_for_overlay,
 )
+# FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #3):
+# denoise from the LIVE pinned-host store via the FT streamed forward; the
+# schedule + decode helpers are the LoRA sampler's parity-gated pieces.
+from serenitymojo.models.klein.klein_stack import KleinStackBase
+from serenitymojo.models.klein.weights import KleinStepModWeights
+from serenitymojo.ops.random import randn
+from serenitymojo.sampling.flux2_klein import build_flux2_sigma_schedule
+from serenitymojo.sampling.klein_sample_resident import klein_decode_latent_to_png
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 
 
 comptime TArc = ArcPointer[Tensor]
@@ -726,6 +737,189 @@ def _do_sample_all(
         board.log_text(String("prompts/") + p.label, step, p.prompt)
 
 
+# ── FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #3) ───
+# CFG Euler denoise whose transformer forward is the FT arm's OWN streamed
+# forward (klein_stack_ft_forward_streamed) reading the LIVE pinned-host bf16
+# store — base weights = the current model, NO LoRA, NO reload — so sampling
+# reuses the training memory footprint by construction. The schedule/step/CFG
+# math is 1:1 with the parity-gated LoRA sampler (_denoise_lora_from_initial):
+#   sigmas = build_flux2_sigma_schedule(steps, N_IMG)      # steps+1, descending
+#   per step: mods from THIS sigma (final_shift/scale onto base), BF16 model
+#   feed of the F32 latent carrier, v = neg + cfg*(pos-neg) (flux2_cfg),
+#   x = x + dt*v (direct-velocity Euler, dt<0), Euler arithmetic in F32.
+# No parity claim: smoke + artifact evidence only (the denoise forward is the
+# already-gated training forward). Returns latent TOKENS [N_IMG, out_ch] F32.
+def _klein_ft_sample_store_latent(
+    mut base: KleinStackBase,
+    store: KleinHostBf16,
+    mod_weights: KleinStepModWeights,
+    cos_dev: Tensor, sin_dev: Tensor,
+    pos_txt: TArc,            # [N_TXT, joint] cond caption embedding (caps bin)
+    neg_txt: TArc,            # [N_TXT, joint] uncond caption embedding
+    cfg: TrainConfig,
+    num_steps: Int,
+    cfg_scale: Float32,
+    seed: UInt64,
+    ctx: DeviceContext,
+) raises -> Tensor:
+    if num_steps < 1:
+        raise Error("klein FT inline sampler: steps must be >= 1")
+    # t=1 initial noise tokens, F32 carrier (klein_sampler._initial_noise_tokens
+    # product convention: randn NCHW [1,in_ch,LH,LW] -> NHWC -> [N_IMG,in_ch]).
+    # `seed` is the sampler's OWN stream (caller) — randn is a pure function of
+    # it; NO training RNG state is consumed/advanced.
+    var nchw = List[Int]()
+    nchw.append(1); nchw.append(cfg.in_channels); nchw.append(LH); nchw.append(LW)
+    var noise = randn(nchw^, seed, STDtype.F32, ctx)
+    var perm = List[Int]()
+    perm.append(0); perm.append(2); perm.append(3); perm.append(1)
+    var nhwc = permute(noise, perm^, ctx)
+    var tok_sh = List[Int]()
+    tok_sh.append(N_IMG); tok_sh.append(cfg.in_channels)
+    var x_dev = reshape_owned(nhwc^, tok_sh^)
+    var x = x_dev.to_host(ctx)          # F32 latent accumulator (host)
+
+    var sigmas = build_flux2_sigma_schedule(num_steps, N_IMG)
+    var n_out = N_IMG * cfg.out_channels
+    print("[klein-ft-sample] steps=", num_steps, " cfg=", cfg_scale,
+          " seed=", seed)
+    for i in range(num_steps):
+        var sigma = sigmas[i]
+        var dt = sigmas[i + 1] - sigma
+        # per-step modulation for THIS sigma (1:1 with klein_sampler.mojo:363
+        # and the FT training step); mods[3]/mods[4] overwrite the final-layer
+        # adaLN — the next TRAINING step rebuilds them from its own sigma.
+        var mods = build_klein_step_mods_device_cached(
+            mod_weights, sigma, cfg.timestep_dim, cfg.d_model, ctx
+        )
+        var img_mod = mods[0].copy()
+        var txt_mod = mods[1].copy()
+        var single_mod = mods[2].copy()
+        base.final_shift = mods[3].copy()
+        base.final_scale = mods[4].copy()
+
+        # BF16 DiT feed of the F32 carrier (MJ-1059 boundary).
+        var x_t = TArc(Tensor.from_host(
+            x.copy(), [N_IMG, cfg.in_channels], STDtype.BF16, ctx
+        ))
+        var fwd_pos = klein_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
+            x_t, pos_txt, base, store,
+            img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+            cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+            cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx,
+        )
+        var v = fwd_pos.out.copy()
+        if len(v) != n_out:
+            raise Error("klein FT inline sampler: velocity length mismatch")
+        # DROP the cond forward struct before the uncond forward — its 32 saved
+        # block inputs are dead weight here (no backward runs on samples).
+        _ = fwd_pos^
+        if cfg_scale != Float32(1.0):
+            ctx.synchronize()   # land the async frees before the uncond fwd
+            var fwd_neg = klein_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
+                x_t, neg_txt, base, store,
+                img_mod, txt_mod, single_mod, cos_dev, sin_dev,
+                cfg.d_model, cfg.mlp_hidden, cfg.in_channels,
+                cfg.joint_attention_dim, cfg.out_channels, cfg.eps, ctx,
+            )
+            # flux2_cfg convention: v = neg + s*(pos - neg), F32 host math.
+            for j in range(n_out):
+                v[j] = fwd_neg.out[j] + cfg_scale * (v[j] - fwd_neg.out[j])
+            _ = fwd_neg^
+        # direct-velocity Euler on the F32 carrier: x += dt*v (dt<0 walks down).
+        for j in range(n_out):
+            x[j] = x[j] + dt * v[j]
+        ctx.synchronize()
+        if i == 0 or i + 1 == num_steps or (i + 1) % 5 == 0:
+            print("[klein-ft-sample] step", i + 1, "/", num_steps,
+                  " sigma=", sigma)
+    return Tensor.from_host(x^, [N_IMG, cfg.out_channels], STDtype.F32, ctx)
+
+
+# FT-arm cadence body (called from `_klein_full_ft_run` behind KLEIN_FULL_FT).
+# Conditioning = the LoRA arm's exact precached-caps contract (load_caps on
+# prompt.caps_pos/caps_neg — validated at setup by _validate_precached_caps;
+# NO live text encoder). Sample-noise seed = its OWN deterministic stream
+# derived from (SEED_BASE, completed_step, prompt idx) — DISJOINT from all
+# three training streams (SEED_BASE+k / SEED_BASE*7919+k /
+# SEED_BASE*2654435761+k); sampling consumes NO training RNG, so the
+# BYTE-EQUAL loss/resume class is untouched.
+def _klein_ft_run_inline_samples(
+    mut base: KleinStackBase,
+    store: KleinHostBf16,
+    mod_weights: KleinStepModWeights,
+    cos_dev: Tensor, sin_dev: Tensor,
+    cfg: TrainConfig,
+    read sample_cfg: SamplePromptConfig,
+    completed_step: Int,
+    ctx: DeviceContext,
+) raises:
+    _ = sys_system(String("mkdir -p ") + SAMPLE_DIR)
+    for pi in range(len(sample_cfg.prompts)):
+        var p = sample_cfg.prompts[pi].copy()
+        if not p.enabled:
+            continue
+        if p.frames != 1:
+            raise Error("klein FT inline sampler: only single-frame image samples are supported")
+        if p.random_seed:
+            raise Error("klein FT inline sampler: random_seed is not supported; the sampler derives its own (seed, step) stream")
+        if (
+            p.sample_inpainting
+            or p.base_image_path.byte_length() > 0
+            or p.mask_image_path.byte_length() > 0
+        ):
+            raise Error("klein FT inline sampler: init image/inpaint/mask sampling is not supported")
+        if p.width != LW * 16 or p.height != LH * 16:
+            raise Error(
+                String("klein FT inline sampler: prompt ") + String(pi)
+                + " requests " + String(p.width) + "x" + String(p.height)
+                + " but the FT arm samples at the training geometry "
+                + String(LW * 16) + "x" + String(LH * 16)
+            )
+        # the LoRA sampler's caps plumbing (_do_sample_prompt): [N_TXT, joint].
+        var caps = load_caps(p.caps_pos, p.caps_neg, ctx)
+        var txt_sh = List[Int]()
+        txt_sh.append(N_TXT)
+        txt_sh.append(cfg.joint_attention_dim)
+        var pos_txt = TArc(reshape(caps.pos, txt_sh.copy(), ctx))
+        var neg_txt = TArc(reshape(caps.neg, txt_sh^, ctx))
+
+        # OWN sample-noise stream (the shipped krea2/zimage derivation):
+        # (SEED_BASE XOR "SAMPLE") folded with the global step + prompt index.
+        var sample_seed = (
+            (SEED_BASE ^ UInt64(0x53414D504C45))          # "SAMPLE"
+            + UInt64(completed_step) * UInt64(1000003)
+            + UInt64(pi)
+        )
+        print("[klein-ft-sample] step", completed_step, " prompt", pi,
+              " label=", p.label, " steps=", p.steps, " cfg=", p.cfg,
+              " seed=", sample_seed)
+        var latent = _klein_ft_sample_store_latent(
+            base, store, mod_weights, cos_dev, sin_dev, pos_txt, neg_txt,
+            cfg, p.steps, p.cfg, sample_seed, ctx,
+        )
+        var out_png = (
+            String(SAMPLE_DIR) + String("/ft_sample_step")
+            + String(completed_step) + String("_") + p.label + String(".png")
+        )
+        # Persist the LATENT first so a process-separated decode
+        # (klein_decode_latent CLI, fresh GPU pool) can ALWAYS produce the PNG,
+        # then attempt the in-process 512 tiled decode; failure is non-fatal.
+        var lat_bin = out_png + String(".lat.bin")
+        save_tensor_bin(latent, lat_bin, ctx)
+        ctx.synchronize()
+        cu_mempool_trim_current(0)   # release denoise transients pre-decode
+        try:
+            klein_decode_latent_to_png[LH, LW](latent, cfg.vae, out_png, ctx)
+            print("[klein-ft-sample] wrote", out_png,
+                  " (", LW * 16, "x", LH * 16, ")")
+        except e:
+            print("[klein-ft-sample] in-process decode failed (latent saved):",
+                  lat_bin, " err:", String(e))
+            print("[klein-ft-sample] decode offline (fresh GPU pool): ",
+                  "klein_decode_latent ", lat_bin, " ", cfg.vae, " ", out_png)
+
+
 # ── FULL-FT run (self-contained; called from main behind KLEIN_FULL_FT) ──────
 # Mirrors _krea2_full_ft_run: cache fetch → klein's own sigma policy →
 # flow-match → per-step mods → streamed FT forward from the pinned-host bf16
@@ -743,7 +937,8 @@ def _klein_full_ft_run(
     cfg: TrainConfig, run_steps: Int, cache_dir: String,
     resume_overlay: String, resume_start_arg: Int,
 ) raises:
-    # fail-loud guards (v1 scope: b1 only, no accum/EMA/dropout/levers/sampling)
+    # fail-loud guards (v1 scope: b1 only, no accum/EMA/dropout/levers;
+    # inline sampling wired 2026-07-08 — cfg.sample_every > 0 enables it)
     if cfg.batch_size != 1:
         raise Error("klein full-FT v1: batch_size must be 1")
     if cfg.grad_accum_steps > 1:
@@ -831,6 +1026,28 @@ def _klein_full_ft_run(
         cached_txt_tokens.append(TArc(txt_tok^))
     print("  preloaded cache tensors:", len(cached_img_tokens), "samples")
 
+    # ── inline sampling (FT arm; FT_INLINE_SAMPLING_PLAN_2026-07-08, #3) ─────
+    # Fires after global step k when k % sample_every == 0 (never at k=0).
+    # v1 does NOT save-before-sample (the FT arm saves at run end only —
+    # documented delta vs ot_should_save_before_sample). Sampling reads the
+    # LIVE pinned-host store (the optimizer writes back into it every block —
+    # it IS the current model); conditioning = the LoRA arm's precached caps.
+    var sample_cfg = SamplePromptConfig()
+    var sample_every = cfg.sample_every
+    var sample_enabled = sample_every > 0
+    if sample_enabled:
+        if cfg.validation_prompts_file == String(""):
+            raise Error("klein full-FT inline sampler requires validation_prompts_file")
+        sample_cfg = read_sample_prompt_config(cfg.validation_prompts_file)
+        _validate_precached_caps(sample_cfg, cfg.joint_attention_dim)
+        print("[klein-ft-sample] enabled every", sample_every,
+              "steps; prompts=", len(sample_cfg.prompts),
+              " file=", cfg.validation_prompts_file)
+        print("[klein-ft-sample] v1: LIVE host-store weights, sample res",
+              LW * 16, "x", LH * 16, ", precached caps conditioning,")
+        print("[klein-ft-sample]     NO save-before-sample (the FT arm saves",
+              "at run end)")
+
     print("")
     print("step  loss  (full-FT; sigma policy = klein's own timestep_distribution dispatch)")
     var train_start = perf_counter_ns()
@@ -910,6 +1127,19 @@ def _klein_full_ft_run(
             "| vram_used_gb", used_gb,
         )
 
+        # ── inline sampler: sample the LIVE host store, no save/reload ──────
+        if sample_enabled and k % sample_every == 0:
+            ctx.synchronize()
+            cu_mempool_trim_current(0)   # release pool blocks before the render
+            try:
+                _klein_ft_run_inline_samples(
+                    base, store, mod_weights, cos_dev[], sin_dev[],
+                    cfg, sample_cfg, k, ctx,
+                )
+            except e:
+                print("[klein-ft-sample] sample FAILED (training continues):", e)
+            ctx.synchronize()
+
     # Save the trained surface (host bytes -> safetensors overlay, no GPU).
     _ = sys_system(String("mkdir -p ") + LORA_DIR)
     var out_path = (
@@ -926,8 +1156,9 @@ def _klein_full_ft_run(
     print("[klein-ft] DONE —", run_steps, "full-FT steps; weights:", out_path)
     print("[klein-ft] v1 notes: surface = block matmuls (norms/mods/embedders/")
     print("  final layer frozen); RESUME: pass the saved overlay as the resume")
-    print("  arg (adafactor sidecar derived from it); inline sampling still not")
-    print("  wired (overlay the saved file on the base ckpt to sample).")
+    print("  arg (adafactor sidecar derived from it); inline sampling: set")
+    print("  sample_every>0 + validation_prompts_file w/ precached caps (samples")
+    print("  the LIVE store at 512, no save-before-sample).")
 
 
 def main() raises:
