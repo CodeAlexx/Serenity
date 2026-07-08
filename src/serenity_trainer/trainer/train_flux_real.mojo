@@ -137,6 +137,14 @@ from serenitymojo.training.full_ft_sidecar import (
     full_ft_sidecar_path_for_overlay,
 )
 from serenitymojo.training.levers import levers_optimizer_active
+# FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #5):
+# denoise from the LIVE pinned-host bf16 store via the FT streamed forward;
+# schedule + decode are the LoRA sampler's parity-gated pieces
+# (flux_decode_packed_to_png is already imported above for the LoRA arm).
+from serenitymojo.models.flux.flux_stack import FluxStackBase
+from serenitymojo.io.cap_cache import save_tensor_bin
+from serenitymojo.sampling.flux1_dev import build_flux1_sigma_schedule
+from serenitymojo.offload.vmm_cuda import cu_mempool_trim_current
 
 # FULL FINETUNE arm (build with -D FLUX_FULL_FT=1): trains the block matmul
 # surface (19 double x 8 mats + 38 single x 2 mats, ~8.6B params, ~17.2GB bf16)
@@ -158,6 +166,14 @@ comptime FLUX_FULL_FT = get_defined_int["FLUX_FULL_FT", 0]() != 0
 # above points at a dead EriDiffusion path and is NOT used by the FT arm.
 comptime FT_CACHE_DIR = "/home/alex/mojodiffusion/output/cache/boxjana_flux_512"
 comptime FT_OUT_DIR = "/home/alex/mojodiffusion/output/flux_boxjana"
+
+# FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #5): denoise
+# length by ckpt class — dev (guidance_in present) = the LoRA sampler's 20-step
+# default; schnell (the on-box bytes under the dev name) = 4-step distilled,
+# no guidance vector. SAME parity-gated flux1 sigma schedule helper either way
+# (plan point 4: the model's existing sampler helpers, no new schedule code).
+comptime FT_SAMPLE_STEPS_DEV = 20
+comptime FT_SAMPLE_STEPS_SCHNELL = 4
 
 
 # ── arch (flux1-dev; H/Dh/D fixed comptime, verified vs the checkpoint) ──────
@@ -513,6 +529,166 @@ def _validate_flux_full_ft_config(cfg: TrainConfig) raises:
         )
 
 
+# ── FULL-FT inline sampling (FT_INLINE_SAMPLING_PLAN_2026-07-08, model #5) ───
+# Rectified-flow Euler denoise whose transformer forward is the FT arm's OWN
+# streamed forward (flux_stack_ft_forward_streamed) reading the LIVE
+# pinned-host bf16 store — base+updates already merged = the current model,
+# NO LoRA, NO reload — so sampling reuses the training memory footprint by
+# construction. Schedule/step math is 1:1 with the parity-gated LoRA sampler
+# (training/flux_sample_resident.mojo):
+#   sigmas = build_flux1_sigma_schedule(n_steps, N_IMG)   # n_steps+1, 1->0
+#   per step: pred = DiT(img, txt, t*1000, [g*1000], clip_pool)
+#             img += dt*pred (dt<0), host F32 math.
+# FLUX is GUIDANCE-DISTILLED: ONE forward per step, NO CFG / uncond pass (the
+# load-bearing delta vs the chroma FT sampler — flux_sample_resident.mojo:28).
+# Guidance-aware: the guidance vector is fed ONLY when the ckpt has
+# guidance_in (the FT arm's has_guidance dispatch) — the on-box ckpt is
+# SCHNELL bytes (no guidance_in, few-step distilled), and a real dev ckpt
+# drop-in auto-feeds GUIDANCE*1000 + the 20-step default with no code change.
+# No parity claim: smoke + artifact evidence only (the denoise forward is the
+# already-gated training forward). Returns the denoised PACKED latent
+# [N_IMG*IN_CH] host floats in trainer-scaled space (the FLUX VAE decode's
+# internal z/scale+shift inverts the trainer's (latent-SHIFT)*SCALE).
+def _flux_ft_sample_store_latent(
+    base: FluxStackBase,
+    store: FluxHostBf16,
+    txt_tokens: List[Float32],    # [N_TXT*TXT_CH] cached caption T5 (padded)
+    clip_pool: List[Float32],     # [VEC_DIM] cached caption CLIP-L pool
+    init_noise: List[Float32],    # [N_IMG*IN_CH] t=1 packed noise (own stream)
+    cos: List[Float32],
+    sin: List[Float32],
+    has_guidance: Bool,
+    n_steps: Int,
+    ctx: DeviceContext,
+) raises -> List[Float32]:
+    if n_steps < 1:
+        raise Error("flux FT inline sampler: steps must be >= 1")
+    var sigmas = build_flux1_sigma_schedule(n_steps, N_IMG)
+    var img = init_noise.copy()   # [N_IMG*IN_CH], evolves in place each step
+    var n = len(img)
+
+    # guidance vec (dev only): pre-scaled *1000 (BFL time_factor) — the FT
+    # arm's OWN training dispatch. Schnell: None (and the streamed forward
+    # ignores it when base.has_guidance=False anyway).
+    var guidance = Optional[List[Float32]](None)
+    if has_guidance:
+        var gl = List[Float32]()
+        gl.append(GUIDANCE * Float32(1000.0))
+        guidance = Optional[List[Float32]](gl^)
+
+    print("[flux-ft-sample] steps=", n_steps,
+          " (guidance-distilled single fwd, no CFG) has_guidance=", has_guidance)
+    for step in range(n_steps):
+        var t_curr = sigmas[step]
+        var t_next = sigmas[step + 1]
+        var dt = t_next - t_curr   # < 0 (down the schedule)
+
+        # timestep pre-scaled *1000 (BFL time_factor; the trainer convention).
+        var timestep = List[Float32]()
+        timestep.append(t_curr * Float32(1000.0))
+
+        # single forward: streamed FT fwd from the LIVE host store.
+        var fwd = flux_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
+            img, txt_tokens, timestep, guidance, clip_pool,
+            base, store, cos, sin,
+            D, FMLP, IN_CH, TXT_CH, OUT_CH, T_DIM, VEC_DIM, EPS, ctx,
+        )
+        var v = fwd.out.copy()
+        if len(v) != n:
+            raise Error("flux FT inline sampler: velocity length mismatch")
+        # DROP the forward tape before the Euler update — its 57 saved block
+        # inputs are dead weight here (no backward runs on samples).
+        _ = fwd^
+        # Euler: img += dt*pred (flux_sample_resident.mojo:152-155).
+        for i in range(n):
+            img[i] = img[i] + dt * v[i]
+        ctx.synchronize()
+        if step == 0 or step + 1 == n_steps or (step + 1) % 5 == 0:
+            print("[flux-ft-sample] step", step + 1, "/", n_steps,
+                  " sigma=", t_curr)
+    return img^
+
+
+# FT-arm cadence body (called from `_flux_full_ft_run` behind FLUX_FULL_FT).
+# Conditioning = the model's existing resident-sampler contract
+# (flux_sample_resident.mojo header): the CURRENT step's cached caption
+# t5_embed (padded to [N_TXT,4096]) + clip_pool [768] — no live text encoder.
+# Sample-noise seed = its OWN deterministic stream derived from
+# (SEED_BASE, completed_step) — DISJOINT from all three training streams
+# (SEED_BASE+k / SEED_BASE*7919+k / SEED_BASE*2654435761+k); _host_noise is a
+# pure function of its seed, so sampling consumes NO training RNG and the
+# wobble-class resume gate (BYTE-EQUAL sigmas) is untouched.
+def _flux_ft_run_inline_samples(
+    base: FluxStackBase,
+    store: FluxHostBf16,
+    txt_tokens: List[Float32],   # [N_TXT*TXT_CH] this step's cached caption T5
+    clip_pool: List[Float32],    # [VEC_DIM]      this step's cached CLIP pool
+    cos: List[Float32],
+    sin: List[Float32],
+    cfg: TrainConfig,
+    completed_step: Int,
+    has_guidance: Bool,
+    ctx: DeviceContext,
+) raises:
+    var samples_dir = String(FT_OUT_DIR) + String("/samples")
+    makedirs(samples_dir, exist_ok=True)
+
+    # schnell (the on-box bytes) = 4-step distilled; dev = the LoRA sampler's
+    # 20-step default. Same parity-gated flux1 sigma schedule either way.
+    var n_steps = FT_SAMPLE_STEPS_DEV if has_guidance else FT_SAMPLE_STEPS_SCHNELL
+
+    # OWN sample-noise stream (the shipped krea2/klein/zimage/chroma
+    # derivation): (SEED_BASE XOR "SAMPLE") folded with the global step
+    # (+ prompt idx = 0 — flux samples ONE image per event, the cached-caption
+    # conditioning).
+    var sample_seed = (
+        (SEED_BASE ^ UInt64(0x53414D504C45))          # "SAMPLE"
+        + UInt64(completed_step) * UInt64(1000003)
+        + UInt64(0)
+    )
+    print("[flux-ft-sample] step", completed_step, " steps=", n_steps,
+          " has_guidance=", has_guidance, " seed=", sample_seed)
+    var init_noise = _host_noise(N_IMG * IN_CH, sample_seed)
+
+    var latent = _flux_ft_sample_store_latent(
+        base, store, txt_tokens, clip_pool, init_noise,
+        cos, sin, has_guidance, n_steps, ctx,
+    )
+
+    var out_png = (
+        samples_dir + String("/ft_sample_step") + String(completed_step)
+        + String(".png")
+    )
+    # Persist the LATENT first so a process-separated decode can ALWAYS
+    # produce the PNG, then attempt the in-process 512 decode; its failure is
+    # non-fatal. The flux pack is byte-compatible with chroma's ([N_IMG,64]
+    # flux-VAE trainer-scaled packing, same unpack permute + same
+    # load_flux1_ldm_decoder) — chroma_decode_latent is the offline CLI.
+    var lat_bin = out_png + String(".lat.bin")
+    var lat_t = Tensor.from_host(
+        latent.copy(), [N_IMG, IN_CH], STDtype.F32, ctx
+    )
+    save_tensor_bin(lat_t, lat_bin, ctx)
+    ctx.synchronize()
+    cu_mempool_trim_current(0)   # release denoise transients pre-decode
+    # FLUX VAE (ae.safetensors) — the LoRA sampler's decode contract; cfg.vae
+    # overrides when set (must be the BFL flux VAE layout).
+    var vae_path = String(VAE_PATH)
+    if cfg.vae.byte_length() > 0:
+        vae_path = cfg.vae.copy()
+    try:
+        flux_decode_packed_to_png[N_IMG, HT, WT, LAT_H, LAT_W, LAT_C](
+            latent, vae_path, out_png, ctx
+        )
+        print("[flux-ft-sample] wrote", out_png,
+              " (", LAT_W * 8, "x", LAT_H * 8, ")")
+    except e:
+        print("[flux-ft-sample] in-process decode failed (latent saved):",
+              lat_bin, " err:", String(e))
+        print("[flux-ft-sample] decode offline (fresh GPU pool): ",
+              "chroma_decode_latent ", lat_bin, " ", vae_path, " ", out_png)
+
+
 # resume_overlay ("" = fresh run): a prior FT run's saved overlay; the adafactor
 # sidecar is derived from it (full_ft_sidecar_path_for_overlay). Resume = base
 # ckpt store build THEN overlay bytes THEN sidecar states/t_step/seed; the loop
@@ -593,6 +769,27 @@ def _flux_full_ft_run(
 
     var files = _list_cache(cache_dir)
     print("[cache] samples:", len(files))
+
+    # ── inline sampling (FT arm; FT_INLINE_SAMPLING_PLAN_2026-07-08, #5) ─────
+    # Fires after global step k when k % sample_every == 0 (never at k=0).
+    # v1 does NOT save-before-sample (the FT arm saves at run end only —
+    # documented delta vs ot_should_save_before_sample). Sampling reads the
+    # LIVE pinned-host store (the optimizer writes back into it every block —
+    # it IS the current model); conditioning = the model's resident-sampler
+    # contract (cached caption t5_embed + clip_pool, no live TE).
+    var sample_every = cfg.sample_every
+    var sample_enabled = sample_every > 0
+    if sample_enabled:
+        var banner_steps = (
+            FT_SAMPLE_STEPS_DEV if has_guidance else FT_SAMPLE_STEPS_SCHNELL
+        )
+        print("[flux-ft-sample] enabled every", sample_every,
+              "steps (steps=", banner_steps,
+              " guidance-distilled single fwd, no CFG)")
+        print("[flux-ft-sample] v1: LIVE host-store weights, sample res",
+              LAT_W * 8, "x", LAT_H * 8, ", cached-caption t5+clip cond,")
+        print("[flux-ft-sample]     NO save-before-sample (the FT arm saves",
+              "at run end)")
 
     print("")
     print("step  loss  (full-FT; sigma policy = flux's own logit-normal shift dispatch)")
@@ -694,6 +891,19 @@ def _flux_full_ft_run(
             "| vram_used_gb", used_gb,
         )
 
+        # ── inline sampler: sample the LIVE host store, no save/reload ──────
+        if sample_enabled and k % sample_every == 0:
+            ctx.synchronize()
+            cu_mempool_trim_current(0)   # release pool blocks before the render
+            try:
+                _flux_ft_run_inline_samples(
+                    base, store, txt_tokens, clip_pool,
+                    cos, sin, cfg, k, has_guidance, ctx,
+                )
+            except e:
+                print("[flux-ft-sample] sample FAILED (training continues):", e)
+            ctx.synchronize()
+
     # Save the trained surface (host bytes -> safetensors overlay, no GPU).
     makedirs(String(FT_OUT_DIR), exist_ok=True)
     var out_path = (
@@ -711,9 +921,10 @@ def _flux_full_ft_run(
     print("[flux-ft] v1 notes: surface = block matmuls (biases/norms/mod.lins/")
     print("  embedders/final layer frozen — OT trains those too, documented delta);")
     print("  RESUME: pass the saved overlay as the arg after steps (adafactor")
-    print("  sidecar derived from it); inline sampling not wired (overlay the")
-    print("  saved file on the base ckpt); the base ckpt is SCHNELL bytes under")
-    print("  the dev name.")
+    print("  sidecar derived from it); inline sampling: set sample_every>0")
+    print("  (samples the LIVE store at 512, cached-caption t5+clip cond,")
+    print("  guidance-distilled single fwd, NO save-before-sample); the base")
+    print("  ckpt is SCHNELL bytes under the dev name.")
 
 
 def main() raises:
