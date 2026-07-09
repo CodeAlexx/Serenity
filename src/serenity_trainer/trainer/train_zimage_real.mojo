@@ -323,6 +323,14 @@ comptime ZIMAGE_FT_ADAFACTOR = get_defined_int["ZIMAGE_FT_ADAFACTOR", 0]() != 0
 # adafactor_device parity-gate mode); default = per-step/slot stochastic
 # rounding (the OT bf16 full-FT contract).
 comptime ZIMAGE_FT_RNE = get_defined_int["ZIMAGE_FT_RNE", 0]() != 0
+# -D ZIMAGE_FULL_SURFACE=1 (afd arm ONLY): Phase B full transformer surface —
+# extends the trained set from the 210 main-block matmuls to ALSO train, per
+# main block, the 6 rms scales (n1/q_norm/k_norm/n2/ffn1/ffn2) and the per-block
+# adaLN_modulation.0 Linear (weight [4D,t_dim] + bias [4D]). Refiners / embedders
+# / t_embedder / final layer stay FROZEN (Phase C). When 0 the afd arm is the
+# v1 (matmul-only) 210-slot arm, BYTE-IDENTICAL. Has NO effect on the default
+# host-adam8bit arm (which never reaches the surf paths). 450 af-states when set.
+comptime ZIMAGE_FULL_SURFACE = get_defined_int["ZIMAGE_FULL_SURFACE", 0]() != 0
 # SimpleTuner/torch-adafactor scalars (the fleet full-FT values: krea2/chroma/
 # klein all pass b2d=-0.8, eps2=1e-3, d=1.0; lr/wd come from the config).
 comptime ZIMAGE_FT_AF_BETA2_DECAY = Float64(-0.8)
@@ -2110,7 +2118,7 @@ def _full_ft_step[
         # arm (rationale: _afd driver header / the comptime flag comment).
         var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
         var st_afd = zimage_stack_lora_backward_main_device_fullft_afd[
-            H, Dh, N_IMG_B, N_TXT_B, S_B
+            H, Dh, N_IMG_B, N_TXT_B, S_B, ZIMAGE_FULL_SURFACE
         ](
             d_loss, main_blocks, mvall.per_block, zero_dev,
             f_scale.copy(), final_lin_w,
@@ -2118,7 +2126,8 @@ def _full_ft_step[
             D, F, OUT_CH, EPS, FINAL_EPS,
             af_states, k, Float64(step_lr),
             ZIMAGE_FT_AF_BETA2_DECAY, ZIMAGE_FT_AF_EPS2, ZIMAGE_FT_AF_D,
-            Float64(train_cfg.weight_decay), sr_seed, ctx,
+            Float64(train_cfg.weight_decay), sr_seed,
+            adaln, aux.main_mod_w, aux.main_mod_b, ctx,
         )
         var t_bwdopt = perf_counter_ns()
         var gn_afd = st_afd.grad_norm
@@ -2556,7 +2565,10 @@ def _zimage_full_ft_main(
     var af_states: List[AdafactorDeviceState]
     comptime if ZIMAGE_FT_ADAFACTOR:
         ft_opt = zimage_full_ft_opt_empty(ctx)
-        af_states = zimage_full_ft_afd_states_init(main_blocks, D, F, ctx)
+        af_states = zimage_full_ft_afd_states_init(
+            main_blocks, D, F, ctx,
+            ZIMAGE_FULL_SURFACE, aux.main_mod_w, aux.main_mod_b,
+        )
     else:
         ft_opt = zimage_full_ft_opt_init(main_blocks, D, F, ctx)
         af_states = List[AdafactorDeviceState]()
@@ -2723,7 +2735,8 @@ def _zimage_full_ft_main(
                   "->", last_loss,
                   (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
             zimage_full_ft_save_checkpoint_device(
-                transformer_dir, out_dir, main_blocks, D, F, ctx
+                transformer_dir, out_dir, main_blocks, D, F, ctx,
+                ZIMAGE_FULL_SURFACE, aux.main_mod_w, aux.main_mod_b,
             )
             # Resume sidecar NEXT TO the checkpoint: adafactor row/col states
             # + t_step (= completed global steps) + config seed (the stream
