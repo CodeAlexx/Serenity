@@ -729,16 +729,17 @@ def _flux_full_ft_run(
 
     # The pinned-host bf16 store = the live model (~17.2GB host RAM).
     var store = build_flux_host_bf16(st, NUM_DOUBLE, NUM_SINGLE, ctx)
-    # Adafactor factored states, device-resident, flat (doubles*8 then singles*2).
-    var af_states = build_flux_ft_adafactor_states(store, ctx)
+    # Adafactor states, device-resident, flat: block states (doubles then
+    # singles, FT_*_SLOT order) THEN mod.lin states (doubles then singles).
+    var af_states = build_flux_ft_adafactor_states(store, base, ctx)
 
     # ── RESUME (base store built above; now overlay + sidecar) ───────────────
     var start_k = 1
     if resume_overlay != String(""):
-        flux_host_bf16_overlay_resume(store, resume_overlay)
+        flux_host_bf16_overlay_resume(store, base, resume_overlay, ctx)
         var exp_rows = List[Int]()
         var exp_cols = List[Int]()
-        flux_ft_state_shapes(store, exp_rows, exp_cols)
+        flux_ft_state_shapes(store, base, exp_rows, exp_cols)
         var sc = full_ft_sidecar_load(
             full_ft_sidecar_path_for_overlay(resume_overlay),
             exp_rows, exp_cols, ctx,
@@ -910,7 +911,7 @@ def _flux_full_ft_run(
         String(FT_OUT_DIR) + String("/flux_full_ft_") + String(run_steps)
         + String(".safetensors")
     )
-    flux_host_bf16_save(store, out_path)
+    flux_host_bf16_save(store, base, out_path, ctx)
     # Resume sidecar NEXT TO the overlay: adafactor row/col states + t_step
     # (= completed global steps) + SEED_BASE (the stream continuity contract).
     full_ft_sidecar_save(
