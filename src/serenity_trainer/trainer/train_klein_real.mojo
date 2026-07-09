@@ -81,6 +81,7 @@ from serenitymojo.models.klein.weights import (
     load_klein_stack_base_training,
     build_klein_double_modvecs, build_klein_single_modvecs,
     load_klein_step_mod_weights, build_klein_step_mods_device_cached,
+    build_klein_vec_silu_device,
 )
 from serenitymojo.training.klein_dataset import KleinCache, KleinSample
 from serenitymojo.training.schedule import (
@@ -155,6 +156,7 @@ from serenitymojo.models.klein.klein_full_ft import (
     klein_stack_ft_forward_streamed, klein_stack_ft_backward_streamed,
     klein_host_bf16_save,
     klein_host_bf16_overlay_resume, klein_ft_state_shapes,
+    klein_ft_surf_save, klein_ft_surf_overlay_resume,
 )
 from serenitymojo.training.adafactor_device import AdafactorDeviceState
 # FULL-FT resume sidecar (the fleet helper): adafactor row/col states + t_step
@@ -197,6 +199,11 @@ comptime KLEIN_V2_GRAPH_PATH = KLEIN_V2_ENGINE and KLEIN_V2_GRAPH
 # through the pinned-host bf16 both-ways store + fused device Adafactor + SR.
 # Default 0 = every LoRA path below byte-unchanged (C13 gate-don't-fork).
 comptime KLEIN_FULL_FT = get_defined_int["KLEIN_FULL_FT", 0]() != 0
+# FULL-SURFACE Phase B (-D KLEIN_FULL_SURFACE=1, requires KLEIN_FULL_FT): ADD
+# the frozen q/k rms scales (80) + the 3 SHARED double/single modulation.lin
+# Linears to the trained surface. Default 0 = the v1 112-matmul surface is
+# byte-identical (gate-don't-fork). Final-layer adaLN + embedders stay Phase C.
+comptime KLEIN_FULL_SURFACE = get_defined_int["KLEIN_FULL_SURFACE", 0]() != 0
 
 from serenitymojo.training.lora_adamw_ot_fused import (
     LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
@@ -967,16 +974,23 @@ def _klein_full_ft_run(
 
     # The pinned-host bf16 store = the live model (~17.4GB host RAM).
     var store = build_klein_host_bf16(st, cfg.num_double, cfg.num_single, ctx)
-    # Adafactor factored states, device-resident, flat (doubles*8 then singles*2).
-    var af_states = build_klein_ft_adafactor_states(store, ctx)
+    # Adafactor states, device-resident, flat. v1: doubles*8 then singles*2
+    # (factored). SURF appends 80 q/k (1D unfactored) + 3 mod.lin (factored).
+    var af_states = build_klein_ft_adafactor_states[KLEIN_FULL_SURFACE](store, ctx)
 
     # ── RESUME (base store built above; now overlay + sidecar) ───────────────
     var start_k = 1
     if resume_overlay != String(""):
-        klein_host_bf16_overlay_resume(store, resume_overlay)
+        comptime if KLEIN_FULL_SURFACE:
+            klein_ft_surf_overlay_resume(
+                store, mod_weights.img_mod, mod_weights.txt_mod,
+                mod_weights.single_mod, resume_overlay, ctx,
+            )
+        else:
+            klein_host_bf16_overlay_resume(store, resume_overlay)
         var exp_rows = List[Int]()
         var exp_cols = List[Int]()
-        klein_ft_state_shapes(store, exp_rows, exp_cols)
+        klein_ft_state_shapes[KLEIN_FULL_SURFACE](store, exp_rows, exp_cols)
         var sc = full_ft_sidecar_load(
             full_ft_sidecar_path_for_overlay(resume_overlay),
             exp_rows, exp_cols, ctx,
@@ -1095,6 +1109,18 @@ def _klein_full_ft_run(
         base.final_shift = mods[3].copy()
         base.final_scale = mods[4].copy()
 
+        # SURF: the SHARED modulation feature silu(vec) [1,D] F32 that produced
+        # THIS step's modvecs — the backward matmuls it against the summed mod
+        # grads to form the mod.lin dW. Deterministic from sigma (recompute is
+        # byte-identical to the one inside build_klein_step_mods_device_cached).
+        var ts_vals = List[Float32]()
+        ts_vals.append(sigma * Float32(1000.0))
+        var ts_sh = List[Int](); ts_sh.append(1)
+        var ts_t = Tensor.from_host(ts_vals, ts_sh^, STDtype.F32, ctx)
+        var vec_silu_t = TArc(build_klein_vec_silu_device(
+            mod_weights, ts_t, cfg.timestep_dim, ctx
+        ))
+
         var fwd = klein_stack_ft_forward_streamed[H, Dh, N_IMG, N_TXT, S](
             x_t_dev, txt_tokens_t, base, store,
             img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
@@ -1104,7 +1130,7 @@ def _klein_full_ft_run(
         var lg = _klein_loss_grad(fwd.out, target, sigma, cfg)
         var loss = lg.loss
 
-        var wrote = klein_stack_ft_backward_streamed[H, Dh, N_IMG, N_TXT, S](
+        var wrote = klein_stack_ft_backward_streamed[H, Dh, N_IMG, N_TXT, S, KLEIN_FULL_SURFACE](
             lg.d_loss.copy(), base, store,
             img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
             cfg.d_model, cfg.mlp_hidden, cfg.out_channels, cfg.eps,
@@ -1113,6 +1139,8 @@ def _klein_full_ft_run(
             Float64(1.0), Float64(0.0),
             SEED_BASE * UInt64(2654435761) + UInt64(k),
             ctx,
+            vec_silu_t,
+            mod_weights.img_mod, mod_weights.txt_mod, mod_weights.single_mod,
         )
         _ = wrote.grad_count
 
@@ -1146,7 +1174,13 @@ def _klein_full_ft_run(
         String(LORA_DIR) + String("/klein_full_ft_") + String(run_steps)
         + String(".safetensors")
     )
-    klein_host_bf16_save(store, out_path)
+    comptime if KLEIN_FULL_SURFACE:
+        klein_ft_surf_save(
+            store, mod_weights.img_mod, mod_weights.txt_mod,
+            mod_weights.single_mod, out_path, ctx,
+        )
+    else:
+        klein_host_bf16_save(store, out_path)
     # Resume sidecar NEXT TO the overlay: adafactor row/col states + t_step
     # (= completed global steps) + SEED_BASE (the stream continuity contract).
     full_ft_sidecar_save(
