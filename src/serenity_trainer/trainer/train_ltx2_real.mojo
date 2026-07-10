@@ -59,6 +59,9 @@ from std.gpu.host import DeviceContext
 from std.math import sqrt, log as flog, cos as fcos, sin as fsin, exp as fexp
 from std.time import perf_counter_ns
 from std.os import listdir
+from std.ffi import external_call
+from std.memory import alloc, UnsafePointer
+from std.builtin.type_aliases import MutExternalOrigin
 
 from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
@@ -71,6 +74,17 @@ from serenitymojo.models.ltx2.ltx2_stack_lora import (
     LTX2LoraSet, LTX2LoraGradSet, build_ltx2_lora_set, total_ltx2_adapters,
     ltx2_adaln_delta, ltx2_stack_lora_forward_offload,
     ltx2_stack_lora_backward_offload, ltx2_lora_adamw_step, save_ltx2_lora,
+    ltx2_lora_adamw_state_init, ltx2_lora_adamw_step_resident,
+    save_ltx2_lora_state, load_ltx2_lora_state, load_ltx2_lora_resume,
+)
+from serenitymojo.training.lora_adamw_plain_fused import (
+    LoraAdamWPlainDeviceState,
+    lora_adamw_plain_device_state_sync_params,
+    lora_adamw_plain_device_state_sync_moments,
+)
+from serenitymojo.training.lora_save import lora_train_state_has_moments
+from serenitymojo.training.trainer_core import (
+    trainer_resolve_resume_path, trainer_warn_warm_resume,
 )
 from serenitymojo.models.dit.ltx2_rope import build_ltx2_rope
 from serenitymojo.offload.ltx2_plan import build_ltx2_block_plan
@@ -78,6 +92,7 @@ from serenitymojo.offload.plan import OffloadConfig
 from serenitymojo.offload.turbo_planned_loader import TurboPlannedLoader
 from serenitymojo.training.schedule import sample_timestep_logit_normal
 from serenitymojo.training.progress_display import print_trainer_progress
+from serenitymojo.io.ffi import sys_mkdirs
 
 
 # ── arch (LTX-2 video DiT; from configs/ltx2.json) ───────────────────────────
@@ -113,9 +128,38 @@ comptime FIXED_SIGMA = Float32(0.5)
 # ── adaln timestep embedding dim (adaln_single.emb.timestep_embedder in_dim) ──
 comptime TEMB_DIM = 256
 
-comptime CKPT = "/home/alex/.serenity/models/checkpoints/ltx2_video_bf16.safetensors"
-comptime CACHE_DIR = "/home/alex/datasets/ltx2_cache_512"
-comptime LORA_DIR = "/home/alex/mojodiffusion/output/ltx2_lora"
+# Runtime-resolvable paths (env override; defaults point at the REAL 13B file so
+# there is NO symlink dependency — the old comptime CKPT pointed at a
+# ltx2_video_bf16.safetensors symlink, that indirection is removed). Override with
+# env vars LTX2_CKPT / LTX2_CACHE / LTX2_LORA_DIR.
+comptime CKPT_DEFAULT = "/home/alex/.serenity/models/checkpoints/ltx-video/ltxv-13b-0.9.8-dev.safetensors"
+comptime CACHE_DEFAULT = "/home/alex/datasets/ltx2_cache_512"
+comptime LORA_DIR_DEFAULT = "/home/alex/mojodiffusion/output/ltx2_lora"
+
+comptime _EnvPtr = UnsafePointer[UInt8, MutExternalOrigin]
+
+
+# Read env var `name` as a string; return `default` when unset or empty.
+def _env_str(name: String, default: String) -> String:
+    var n = name.byte_length()
+    var buf = alloc[UInt8](n + 1)
+    var src = name.as_bytes()
+    for i in range(n):
+        buf[i] = src[i]
+    buf[n] = 0
+    var cname = _EnvPtr(unsafe_from_address=Int(buf))
+    var ret = external_call["getenv", _EnvPtr](cname)
+    buf.free()
+    if Int(ret) == 0:
+        return default
+    var out = String("")
+    var i = 0
+    while ret[i] != UInt8(0):
+        out += chr(Int(ret[i]))
+        i += 1
+    if len(out) == 0:
+        return default
+    return out^
 
 
 # ── deterministic host gaussian noise (Box-Muller PCG; per-step seed) ─────────
@@ -219,6 +263,25 @@ def _load_host(st: SafeTensors, name: String, ctx: DeviceContext) raises -> List
     return cast_tensor(t, STDtype.F32, ctx).to_host(ctx)
 
 
+# ── FULL-state resume resolution + loud warm-resume guard (MJ-1088 / MJ-1077) ──
+# Probe the `<ckpt>.state` sidecar so a user who passes the PEFT weights still gets
+# a FULL (moment-preserving) resume; only warm-restart (loud warning) when there is
+# genuinely no moment state. The probe prefix matches _ltx2_lora_prefixes[0].
+def _ltx2_resolve_resume_path(path: String) raises -> String:
+    # Thin wrapper → shared trainer_core (binds ltx2's first-adapter probe prefix;
+    # keeps krea2's default `.state` sidecar naming). Probe order + return logic are
+    # the trainer_core skeleton, byte-identical to the pre-extraction path.
+    var probe = String("transformer_blocks.0.attn1.to_q")
+    return trainer_resolve_resume_path(path, probe)
+
+
+def _ltx2_warn_warm_resume(path: String):
+    # Thin wrapper → shared trainer_core (binds the ltx2 log tag; keeps krea2's
+    # default `.safetensors.state` FULL-resume sidecar hint). Every banner line is
+    # byte-identical to the pre-extraction ltx2 output.
+    trainer_warn_warm_resume(String("ltx2"), path)
+
+
 def main() raises:
     var ctx = DeviceContext()
     var a = argv()
@@ -242,6 +305,21 @@ def main() raises:
             raise Error("train_ltx2_real: steps must be a positive integer")
         run_steps = v
 
+    # Optional argv[3]: resume checkpoint. Pass either the `<ckpt>.safetensors.state`
+    # sidecar (FULL moment resume) or the plain PEFT `.safetensors` (WARM start —
+    # the .state sibling is auto-probed first so the PEFT path still full-resumes).
+    var resume_path = String("")
+    if len(a) >= 4:
+        resume_path = String(a[3])
+
+    # ── resolve runtime paths (env override; defaults = real 13B file, no symlink) ─
+    var ckpt_path = _env_str(String("LTX2_CKPT"), String(CKPT_DEFAULT))
+    var cache_dir = _env_str(String("LTX2_CACHE"), String(CACHE_DEFAULT))
+    var lora_dir = _env_str(String("LTX2_LORA_DIR"), String(LORA_DIR_DEFAULT))
+    # Ensure the LoRA output dir exists BEFORE training so the end-of-run save can
+    # never fail with "failed to open for write" (the previous crash).
+    _ = sys_mkdirs(lora_dir)
+
     print("=== LTX-2 LEGACY video-only LoRA training loop (block-swap offload) ===")
     print("  WARNING: legacy stack; not production full-AV LTX2 training")
     print("  arch: D=", D, " H=", H, " Dh=", Dh, " FF=", FF, " in_ch=", IN_CH, " out_ch=", OUT_CH)
@@ -250,19 +328,20 @@ def main() raises:
     print("  recipe: rank=", RANK, " alpha=", ALPHA, " lr=", LR, " shift=", TIMESTEP_SHIFT)
     print("  fixed_sigma_smoke=", FIXED_SIGMA_SMOKE)
     print("  hot loop note: legacy smoke uses host noise/loss; not production AV device-loop training")
-    print("  ckpt:", CKPT)
-    print("  cache:", CACHE_DIR)
+    print("  ckpt:", ckpt_path)
+    print("  cache:", cache_dir)
+    print("  lora_out:", lora_dir)
 
     # ── stack-level base (frozen; patchify_proj/proj_out/adaln_single) ────────
     print("[load] LTX2StackBase (patchify_proj, proj_out, adaln_single)")
-    var base_st = SafeTensors.open(String(CKPT))
+    var base_st = SafeTensors.open(ckpt_path)
     var base = load_ltx2_stack_base(base_st, NUM_LAYERS, D, IN_CH, OUT_CH, ctx)
     print("[load] base resident")
 
     # ── block-swap offload loader ─────────────────────────────────────────────
     var plan = build_ltx2_block_plan(NUM_LAYERS)
     var cfg = OffloadConfig.synchronous_single()
-    var loader = TurboPlannedLoader.open(String(CKPT), plan^, cfg, ctx)
+    var loader = TurboPlannedLoader.open(ckpt_path, plan^, cfg, ctx)
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
 
     # ── split-rope tables [S*H, Dh//2] (built once, BF16 storage) ─────────────
@@ -279,7 +358,7 @@ def main() raises:
     var n_adapters = total_ltx2_adapters(lora)
     print("[lora] adapters:", n_adapters, " (4 x", NUM_LAYERS, "blocks: q,k,v,out)")
 
-    var files = _list_cache(String(CACHE_DIR))
+    var files = _list_cache(cache_dir)
     print("[cache] samples:", len(files))
 
     var b_absum_init = Float32(0.0)
@@ -289,6 +368,28 @@ def main() raises:
 
     var first_loss = Float32(0.0)
     var last_loss = Float32(0.0)
+
+    # MJ-1085: resident fused AdamW (persistent device P/M/V, one-time pinned
+    # staging). The per-step fused arm allocates fresh pinned staging every step
+    # and can hit the MJ-1070 unmapped-buffer segfault under pinned pressure.
+    var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    var adamw_state_ready = False
+
+    # ── optional resume: reload A/B (+ AdamW moments if a FULL `.state` exists) ──
+    # BEFORE the loop so the lazy resident-AdamW init (ltx2_lora_adamw_state_init)
+    # seeds dev_m/dev_v from the restored moments — full-moment fidelity (MJ-1088).
+    if resume_path != String(""):
+        var resolved = _ltx2_resolve_resume_path(resume_path)
+        var is_full = lora_train_state_has_moments(
+            resolved, String("transformer_blocks.0.attn1.to_q")
+        )
+        if is_full:
+            lora = load_ltx2_lora_state(NUM_LAYERS, D, RANK, ALPHA, resolved, ctx)
+            print("[ltx2-resume] FULL resume (A/B + AdamW moments) from", resolved)
+        else:
+            _ltx2_warn_warm_resume(resolved)
+            lora = load_ltx2_lora_resume(NUM_LAYERS, D, RANK, ALPHA, resolved, ctx)
+        print("[ltx2-resume] reloaded", total_ltx2_adapters(lora), "adapters")
 
     var train_start = perf_counter_ns()
     for k in range(1, run_steps + 1):
@@ -362,8 +463,17 @@ def main() raises:
         # ── grad norm + clip(1.0) ──
         var gn_before = _clip(grads, CLIP_GRAD_NORM)
 
-        # ── AdamW ──
-        ltx2_lora_adamw_step(lora, grads, k, LR, ctx)
+        # ── AdamW (resident fused arm; MJ-1085) ──
+        if not adamw_state_ready:
+            adamw_dev_state = Optional[LoraAdamWPlainDeviceState](
+                ltx2_lora_adamw_state_init(lora, ctx)
+            )
+            adamw_state_ready = True
+            print("[ltx2-adamw] resident fused state initialized (",
+                  total_ltx2_adapters(lora), "adapters )")
+        ltx2_lora_adamw_step_resident(
+            adamw_dev_state.value(), lora, grads, k, LR, ctx,
+        )
 
         var t1 = perf_counter_ns()
         var secs = Float64(t1 - t0) / 1.0e9
@@ -385,6 +495,23 @@ def main() raises:
         print("RESULT: REAL run OK — LoRA-B grew 0 ->", b_absum_final,
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
-        _ = save_ltx2_lora(lora, String(LORA_DIR) + String("/ltx2_lora_smoke.safetensors"), ctx)
+        var peft_path = lora_dir + String("/ltx2_lora_smoke.safetensors")
+        _ = save_ltx2_lora(lora, peft_path, ctx)
+        # MJ-1088: also write the moment-carrying `.state` sidecar so a resume does
+        # NOT zero AdamW momentum. Pull the resident device m/v back to host first —
+        # the resident step syncs params every step but moments only on demand.
+        if adamw_state_ready:
+            lora_adamw_plain_device_state_sync_params(
+                adamw_dev_state.value(), lora.ad, ctx
+            )
+            lora_adamw_plain_device_state_sync_moments(
+                adamw_dev_state.value(), lora.ad, ctx
+            )
+        var meta = List[Float32]()
+        meta.append(Float32(run_steps))
+        meta.append(Float32(Int(SEED_BASE)))
+        var state_path = peft_path + String(".state")
+        _ = save_ltx2_lora_state(lora, state_path, ctx, meta^)
+        print("[ltx2] save_state (A/B + AdamW moments) path=", state_path)
     else:
         print("RESULT: FAIL trains=", trains)
