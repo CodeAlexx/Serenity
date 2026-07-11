@@ -71,10 +71,16 @@ from serenitymojo.models.klein.klein_stack_lora import (
     klein_stack_lora_backward_offload_turbo_moddev_rope_scratch,
     klein_stack_lora_backward_graph,
     klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch,
+    klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch_devgrads,
+    KleinLoraTensorGrads, klein_lora_tensor_grads_flat_pairs,
+    klein_lora_adamw_step_resident_devgrads,
     klein_lora_adamw_step, save_klein_lora, load_klein_lora_resume,
     save_klein_lora_state, load_klein_lora_state, save_klein_lora_ema,
     klein_lora_set_to_device_resident, klein_lora_adamw_step_resident,
     DBL_SLOTS,
+)
+from serenitymojo.training.on_device_global_norm import (
+    on_device_per_tensor_sumsq, on_device_scale_tensors_f32,
 )
 from serenitymojo.models.klein.weights import (
     load_double_block_weights, load_single_block_weights,
@@ -1441,6 +1447,43 @@ def main() raises:
             " layer_offload_fraction=", Float32(cfg.layer_offload_fraction),
         )
 
+    # ── KLEIN_RESIDENT_GRADS (default 1): LoRA grads stay on DEVICE end-to-end.
+    # The tape backward returns device grad tensors (KleinLoraTensorGrads), the
+    # grad-norm/dead-adapter/clip run as device reductions (one small D2H), and
+    # the resident OT-AdamW step gathers the grads into its persistent dev_g on
+    # device — killing the per-block grad D2H syncs, the host grad-norm over
+    # ~80MB of F32 grads, and the ~80MB H2D grad re-upload (nsys ~74ms/step).
+    # Set =0 for the proven host-grads path (bit-identical optimizer math).
+    var resident_grads = env_int("KLEIN_RESIDENT_GRADS", 1) != 0
+    if resident_grads and klein_save_activations:
+        # KLEIN_SAVE_ACTIVATIONS stays a host-tape experiment path.
+        print("[Klein-lora] KLEIN_SAVE_ACTIVATIONS=1 -> KLEIN_RESIDENT_GRADS disabled (host grads)")
+        resident_grads = False
+    if resident_grads and not use_activation_tape_offload:
+        # Only the offloaded-tape backward has a devgrads mirror; the resident/
+        # graph backwards keep host grads.
+        print("[Klein-lora] activation offload off -> KLEIN_RESIDENT_GRADS disabled (host grads)")
+        resident_grads = False
+    if resident_grads and lokr_active:
+        raise Error(
+            "KLEIN_RESIDENT_GRADS=1 does not support adapter_algo=4 (LoKr):"
+            " the master chain rule consumes HOST carrier grads. Set"
+            " KLEIN_RESIDENT_GRADS=0."
+        )
+    if resident_grads and levers_optimizer_active(cfg):
+        raise Error(
+            "KLEIN_RESIDENT_GRADS=1 does not support the levers host optimizer"
+            " (adafactor/schedule-free consume HOST grads). Set"
+            " KLEIN_RESIDENT_GRADS=0."
+        )
+    if resident_grads and cfg.grad_accum_steps > 1:
+        raise Error(
+            "KLEIN_RESIDENT_GRADS=1 does not support grad_accum_steps > 1"
+            " (the accumulation buffers are HOST lists). Set"
+            " KLEIN_RESIDENT_GRADS=0."
+        )
+    print("  resident grads (KLEIN_RESIDENT_GRADS):", resident_grads)
+
     # ── adapter algo selector (Wave 2B item 2j; default 0 = plain LoRA) ───────
     # adapter_algo==1 selects LyCORIS Full (full-shape weight delta). The Full
     # PRIMITIVE + .diff.weight save convention ship in training/full_adapter.mojo
@@ -1904,6 +1947,13 @@ def main() raises:
         var empty_txt = List[Float32]()
         var loss: Float32
         var g: KleinLoraGrads
+        # KLEIN_RESIDENT_GRADS: device grad carrier (empty when host grads).
+        var gdev = KleinLoraTensorGrads(
+            List[TArc](), List[TArc](), List[TArc](), List[TArc](),
+            List[Float32](), List[Float32](), List[Float32](), List[Float32](),
+            List[Float32](), List[Float32](), List[Float32](), List[Float32](),
+            List[Float32](), List[Float32](),
+        )
         var t_bwd0 = UInt(0)
         if runtime_profile:
             print("PROG_STAGE step=", k, " total=", run_steps, " phase=forward_begin")
@@ -1930,12 +1980,31 @@ def main() raises:
             if runtime_profile:
                 print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
             t_bwd0 = perf_counter_ns()
-            g = klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
-                lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
-                loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
-                cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
-                cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
-            )
+            if resident_grads:
+                # devgrads mirror: same tape restores, same block math (exact
+                # sdpa singles / flash doubles, int8 dX GEMMs), LoRA d_A/d_B
+                # stay on device — no per-block D2H.
+                gdev = klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch_devgrads[H, Dh, N_IMG, N_TXT, S](
+                    lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
+                    loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                )
+                g = KleinLoraGrads(
+                    List[List[Float32]](), List[List[Float32]](),
+                    List[List[Float32]](), List[List[Float32]](),
+                    List[Float32](), List[Float32](), List[Float32](),
+                    List[Float32](), List[Float32](), List[Float32](),
+                    List[Float32](), List[Float32](), List[Float32](),
+                    List[Float32](),
+                )
+            else:
+                g = klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
+                    lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
+                    loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
+                    cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
+                    cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                )
         else:
             var fwd = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
                 x_t_dev, txt_tokens_t, base,
@@ -2046,25 +2115,47 @@ def main() raises:
         # grad_norm = L2 of ALL LoRA d_A/d_B
         var gsum = 0.0
         var nd = cfg.num_double * DBL_SLOTS
-        for i in range(nd):
-            var a = _l2(g.dbl_d_a[i]); var b = _l2(g.dbl_d_b[i])
-            gsum += a * a + b * b
         var ns = cfg.num_single * 2
-        for i in range(ns):
-            var a = _l2(g.sgl_d_a[i]); var b = _l2(g.sgl_d_b[i])
-            gsum += a * a + b * b
+        # KLEIN_RESIDENT_GRADS: per-tensor sum(g*g) reduced ON DEVICE in one
+        # launch (deterministic block-tree, no atomics) + ONE small D2H; the
+        # same per-pair values feed grad_norm, the dead-adapter warn and the
+        # clip decision — no ~80MB host readback.
+        var flat_gdev = List[TArc]()
+        var seg_ss = List[Float32]()
+        if resident_grads:
+            flat_gdev = klein_lora_tensor_grads_flat_pairs(gdev)
+            seg_ss = on_device_per_tensor_sumsq(flat_gdev, ctx)
+            for i in range(len(seg_ss)):
+                gsum += Float64(seg_ss[i])
+        else:
+            for i in range(nd):
+                var a = _l2(g.dbl_d_a[i]); var b = _l2(g.dbl_d_b[i])
+                gsum += a * a + b * b
+            for i in range(ns):
+                var a = _l2(g.sgl_d_a[i]); var b = _l2(g.sgl_d_b[i])
+                gsum += a * a + b * b
         var grad_norm = sqrt(gsum)
 
         # ── dead-adapter warn (project's #1 silent failure) ───────────────────
         # B legitimately starts at 0, so its grad can be ~0 early; warn when an
         # adapter's TOTAL |d_A|+|d_B| == 0 at step>=1 (a truly dead branch).
         # (LoKr: untargeted slots are deliberate zero carriers — warn suppressed.)
-        for i in range(nd):
-            if (not lokr_active) and _abs_sum(g.dbl_d_a[i]) + _abs_sum(g.dbl_d_b[i]) == 0.0:
-                print("[Klein-lora] dead_adapter step=", k, " idx=", i, " kind=double")
-        for i in range(ns):
-            if (not lokr_active) and _abs_sum(g.sgl_d_a[i]) + _abs_sum(g.sgl_d_b[i]) == 0.0:
-                print("[Klein-lora] dead_adapter step=", k, " idx=", nd + i, " kind=single")
+        if resident_grads:
+            # sum-of-squares == 0  <=>  abs-sum == 0 (finite grads); resident
+            # grads excludes LoKr at startup so no suppression needed.
+            for i in range(nd):
+                if Float64(seg_ss[2 * i]) + Float64(seg_ss[2 * i + 1]) == 0.0:
+                    print("[Klein-lora] dead_adapter step=", k, " idx=", i, " kind=double")
+            for i in range(ns):
+                if Float64(seg_ss[2 * (nd + i)]) + Float64(seg_ss[2 * (nd + i) + 1]) == 0.0:
+                    print("[Klein-lora] dead_adapter step=", k, " idx=", nd + i, " kind=single")
+        else:
+            for i in range(nd):
+                if (not lokr_active) and _abs_sum(g.dbl_d_a[i]) + _abs_sum(g.dbl_d_b[i]) == 0.0:
+                    print("[Klein-lora] dead_adapter step=", k, " idx=", i, " kind=double")
+            for i in range(ns):
+                if (not lokr_active) and _abs_sum(g.sgl_d_a[i]) + _abs_sum(g.sgl_d_b[i]) == 0.0:
+                    print("[Klein-lora] dead_adapter step=", k, " idx=", nd + i, " kind=single")
 
         # ── global-norm grad clip across ALL LoRA grads (EDv2 default-ON) ──────
         # (LoKr clips on the MASTER grads inside its optimizer branch below —
@@ -2073,12 +2164,17 @@ def main() raises:
         var clip_scale = Float32(1.0)
         if (not lokr_active) and grad_norm > Float64(cfg.max_grad_norm):
             clip_scale = cfg.max_grad_norm / Float32(grad_norm)
-            for i in range(nd):
-                _scale_inplace(g.dbl_d_a[i], clip_scale)
-                _scale_inplace(g.dbl_d_b[i], clip_scale)
-            for i in range(ns):
-                _scale_inplace(g.sgl_d_a[i], clip_scale)
-                _scale_inplace(g.sgl_d_b[i], clip_scale)
+            if resident_grads:
+                # same per-element F32 multiply as _scale_inplace, in place on
+                # the device grad tensors the optimizer will gather.
+                on_device_scale_tensors_f32(flat_gdev, clip_scale, ctx)
+            else:
+                for i in range(nd):
+                    _scale_inplace(g.dbl_d_a[i], clip_scale)
+                    _scale_inplace(g.dbl_d_b[i], clip_scale)
+                for i in range(ns):
+                    _scale_inplace(g.sgl_d_a[i], clip_scale)
+                    _scale_inplace(g.sgl_d_b[i], clip_scale)
 
         # AdamW step (on clipped grads)
         if runtime_profile:
@@ -2146,11 +2242,26 @@ def main() raises:
                 levers_optimizer_sync_resident_ot(sgl_state, lora.sgl, ctx)
         else:
             comptime if KLEIN_V2_ENGINE:
-                klein_lora_adamw_step_resident(
-                    dbl_state, sgl_state, lora, g, optimizer_step, step_lr, ctx,
-                    cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
-                )
+                if resident_grads:
+                    # DEVICE grads: gather kernel into the persistent dev_g +
+                    # the identical OT-AdamW kernel — no host pack, no ~80MB
+                    # H2D grad upload. Same scalars, same SR stream.
+                    klein_lora_adamw_step_resident_devgrads(
+                        dbl_state, sgl_state, lora, gdev, optimizer_step, step_lr, ctx,
+                        cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                    )
+                else:
+                    klein_lora_adamw_step_resident(
+                        dbl_state, sgl_state, lora, g, optimizer_step, step_lr, ctx,
+                        cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+                    )
             else:
+                if resident_grads:
+                    raise Error(
+                        "KLEIN_RESIDENT_GRADS=1 requires KLEIN_V2_ENGINE"
+                        " (persistent resident OT-AdamW state); set"
+                        " KLEIN_RESIDENT_GRADS=0"
+                    )
                 klein_lora_adamw_step(
                     lora, g, optimizer_step, step_lr, ctx, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay
                 )
