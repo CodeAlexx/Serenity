@@ -1414,10 +1414,21 @@ def main() raises:
         " budget_bytes=", resident_budget_bytes,
     )
     var use_activation_tape_offload = cfg.activation_offload_enabled()
+    # KLEIN_SAVE_ACTIVATIONS (default 0 = classic recompute path unchanged): when
+    # set, the offloaded-tape forward saves each block's full activation set to
+    # host and the backward consumes it directly instead of recomputing.
+    var klein_save_activations = env_int("KLEIN_SAVE_ACTIVATIONS", 0) != 0
+    if klein_save_activations and not use_activation_tape_offload:
+        raise Error(
+            "KLEIN_SAVE_ACTIVATIONS=1 requires the activation-offload tape path"
+            + " (gradient_checkpointing=CPU_OFFLOADED + enable_activation_offloading)."
+            + " Unsupported combo."
+        )
     if cfg.gradient_checkpointing_offload():
         print(
             "  cpu_offloaded:",
             " activation_offload=", use_activation_tape_offload,
+            " klein_save_activations=", klein_save_activations,
             " layer_offload_fraction=", Float32(cfg.layer_offload_fraction),
         )
 
@@ -1894,6 +1905,7 @@ def main() raises:
                 loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[],
                 cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
                 cfg.out_channels, cfg.eps, ctx, scratch_fwd,
+                klein_save_activations,
             )
             var t_fwd1 = perf_counter_ns()
             if runtime_profile:
@@ -1901,6 +1913,7 @@ def main() raises:
                     "PROG_STAGE step=", k, " total=", run_steps, " phase=forward",
                     " secs=", Float32(Float64(t_fwd1 - t_fwd0) / 1.0e9),
                     " activation_tape_host_bytes=", fwd_tape.total_host_bytes(),
+                    " saved_activation_host_bytes=", fwd_tape.saved_host_bytes(),
                 )
             var lg = _klein_loss_grad(fwd_tape.out, target, sigma, cfg)
             loss = lg.loss
