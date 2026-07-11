@@ -151,6 +151,7 @@ from serenitymojo.io.ffi import sys_system, sys_open, sys_close, O_RDONLY
 # ── FULL FINETUNE (-D KLEIN_FULL_FT=1; FULL_FINETUNE_ROLLOUT_PLAN_2026-07-07,
 # klein card — the krea2 `ot-mojo-full-finetune` blueprint) ───────────────────
 from std.sys.defines import get_defined_int
+from serenitymojo.io.env import env_int
 from serenitymojo.models.klein.klein_full_ft import (
     KleinHostBf16, build_klein_host_bf16, build_klein_ft_adafactor_states,
     klein_stack_ft_forward_streamed, klein_stack_ft_backward_streamed,
@@ -1344,7 +1345,11 @@ def main() raises:
     # Byte-identical weights (same pinned block store bytes) → loss unchanged.
     # T2.G: LoKr runs pin NOTHING — the carrier adapter set takes the VRAM
     # headroom the pinned blocks would use (full_matrix carriers especially).
-    var resident_budget_bytes = 0 if lokr_active else RESIDENT_BUDGET_BYTES
+    # RESIDENT_BUDGET_BYTES (9 GiB) was measured on a 24.5 GiB card. Env override
+    # KLEIN_RESIDENT_BYTES lets a smaller card (16 GB 5080) pin fewer blocks —
+    # default keeps the 24 GB behavior unchanged.
+    var resident_budget_bytes = 0 if lokr_active else env_int(
+        String("KLEIN_RESIDENT_BYTES"), RESIDENT_BUDGET_BYTES)
     var pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
     print(
         "  resident blocks pinned:", pinned_blocks, "of",
