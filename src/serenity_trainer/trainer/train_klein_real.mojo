@@ -1424,11 +1424,20 @@ def main() raises:
             + " (gradient_checkpointing=CPU_OFFLOADED + enable_activation_offloading)."
             + " Unsupported combo."
         )
+    # KLEIN_DEVICE_TAPE (default 1): park the block-input tape as DEVICE TArc
+    # refs (~838MB VRAM at 512px/b2, zero copies/syncs) instead of the host
+    # round-trip — the measured ~0.6s/step residual tape stall. Set =0 to fall
+    # back to host offload (e.g. bigger resolutions where the tape won't fit).
+    var klein_device_tape = env_int("KLEIN_DEVICE_TAPE", 1) != 0
+    if klein_save_activations:
+        # the save-activations experiment stays a pure host-tape path
+        klein_device_tape = False
     if cfg.gradient_checkpointing_offload():
         print(
             "  cpu_offloaded:",
             " activation_offload=", use_activation_tape_offload,
             " klein_save_activations=", klein_save_activations,
+            " klein_device_tape=", klein_device_tape,
             " layer_offload_fraction=", Float32(cfg.layer_offload_fraction),
         )
 
@@ -1906,6 +1915,7 @@ def main() raises:
                 cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
                 cfg.out_channels, cfg.eps, ctx, scratch_fwd,
                 klein_save_activations,
+                klein_device_tape,
             )
             var t_fwd1 = perf_counter_ns()
             if runtime_profile:
