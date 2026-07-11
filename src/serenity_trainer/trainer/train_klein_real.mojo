@@ -1393,6 +1393,19 @@ def main() raises:
             " once at load, int8×int8→int32 GEMM per step; norms/LoRA stay bf16)"
         )
         pinned_blocks = loader.pin_residents_int8(resident_budget_bytes, ctx)
+        # int8-W8A8 slice 6 — HOST-pin the NON-resident tail as int8 too, so the
+        # remaining blocks stream int8 from pinned host RAM (HALF the bf16 H2D
+        # bytes, ZERO disk) instead of bf16-from-disk. Nothing streams bf16 now.
+        # KLEIN_INT8_HOST_BUDGET_BYTES caps host pinned bytes (default ~48 GB =
+        # pin the entire tail; the whole int8 DiT is ~13 GB host-side).
+        var int8_host_budget = env_int(
+            String("KLEIN_INT8_HOST_BUDGET_BYTES"), 48_000_000_000)
+        var host_pinned = loader.pin_residents_int8_host(int8_host_budget, ctx)
+        print(
+            "  int8 host-streamed tail blocks:", host_pinned,
+            " (bf16-streamed remainder:",
+            cfg.num_double + cfg.num_single - pinned_blocks - host_pinned, ")",
+        )
     else:
         pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
     print(
