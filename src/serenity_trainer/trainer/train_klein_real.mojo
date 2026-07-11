@@ -1242,6 +1242,15 @@ def main() raises:
     # bypasses the entire LoRA machinery below. Gate-don't-fork (C13).
     comptime if KLEIN_FULL_FT:
         _ = runtime_profile
+        # int8 fail-loud (mirror krea2): quantized-resident is a LoRA-only path;
+        # full-FT trains the base matmul surface bf16 and cannot run on int8
+        # frozen-base weights. Do NOT silently ignore the request.
+        if cfg.quantized_resident == String("int_w8a8"):
+            raise Error(
+                "quantized_resident=int_w8a8 is a LoRA-only path; the KLEIN_FULL_FT "
+                "arm trains the bf16 base matmul surface and is incompatible with an "
+                "int8 frozen base. Build without -D KLEIN_FULL_FT for int8 LoRA."
+            )
         # resume arg (args[4]) = a prior FT run's OVERLAY (.safetensors); the
         # adafactor sidecar path is derived from it. args[3] start_step, when
         # given, must equal the sidecar's t_step (checked inside).
@@ -1350,7 +1359,42 @@ def main() raises:
     # default keeps the 24 GB behavior unchanged.
     var resident_budget_bytes = 0 if lokr_active else env_int(
         String("KLEIN_RESIDENT_BYTES"), RESIDENT_BUDGET_BYTES)
-    var pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
+    # int8-W8A8 resident path (Klein int8 slice 5): quantize the frozen base
+    # matmul weights TENSORWISE at load and pin them int8-resident, so the block
+    # scratch fwd/bwd run int8×int8→int32 GEMM (int8_linear_fwd/bwd_nn) with no
+    # per-step dequant. The int8 sidecar rides on StreamWeights.int8 /
+    # SingleBlockWeights.int8 and is threaded into the hand-chain scratch stack
+    # (both the resident and the CPU_OFFLOADED activation-tape variants). bf16
+    # path (quantized_resident != "int_w8a8") pins bf16 blocks exactly as before.
+    var quant_tag = cfg.quantized_resident.copy()
+    if quant_tag == String("OFF"):
+        quant_tag = String("")
+    if quant_tag != String("") and quant_tag != String("int_w8a8"):
+        raise Error(
+            "train_klein: unsupported quantized_resident '" + quant_tag
+            + "' (supported: OFF, int_w8a8)"
+        )
+    var int8_resident = quant_tag == String("int_w8a8")
+    # int8 fail-loud guards (mirror krea2): LoRA-only. LoKr routes the adapter
+    # set through the per-step carrier path and pins NO base blocks (the int8
+    # store IS the pinned base), so the two are mutually exclusive. Full-FT is a
+    # separate comptime arm (KLEIN_FULL_FT) that returns before this point and
+    # is guarded there. Do NOT silently fall back to bf16.
+    if int8_resident and lokr_active:
+        raise Error(
+            "quantized_resident=int_w8a8 requires plain LoRA (adapter_algo=0); "
+            "LoKr (adapter_algo=4) pins no base blocks and is incompatible with "
+            "the int8-resident base store."
+        )
+    var pinned_blocks: Int
+    if int8_resident:
+        print(
+            "[quant] int8-W8A8-resident base matmuls (tensorwise scale, quantize"
+            " once at load, int8×int8→int32 GEMM per step; norms/LoRA stay bf16)"
+        )
+        pinned_blocks = loader.pin_residents_int8(resident_budget_bytes, ctx)
+    else:
+        pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
     print(
         "  resident blocks pinned:", pinned_blocks, "of",
         cfg.num_double + cfg.num_single,
@@ -1881,7 +1925,14 @@ def main() raises:
                 # T2.G: LoKr keeps the C13-gated hand-chain (per-step fresh
                 # carrier device sets; the graph arm is validated on the
                 # resident plain-LoRA set only).
-                if lokr_active:
+                # int8 (Klein int8 slice 5): the autograd_v2 graph has NO int8 op
+                # kinds, so an int8 run MUST take the hand-chain scratch backward
+                # (which carries the int8 payload) even when KLEIN_V2_GRAPH_PATH
+                # is comptime-True. Runtime branch — both fns are compiled in this
+                # arm, so no -D KLEIN_V2_GRAPH=0 build is needed. (The product int8
+                # config runs activation-offload, i.e. the tape backward above, so
+                # this only matters if int8 is run without activation offload.)
+                if lokr_active or int8_resident:
                     g = klein_stack_lora_backward_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
                         lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
                         loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd,
