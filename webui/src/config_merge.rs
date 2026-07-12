@@ -112,7 +112,7 @@ const TIME_UNITS: &[&str] = &[
 const EMA_MODES: &[&str] = &["OFF", "off", "GPU", "gpu", "CPU", "cpu", "EMA", "ema"];
 // quantized_resident (l.832) — "" is accepted (default/unset)
 const QUANT_RESIDENT: &[&str] =
-    &["", "OFF", "fp8_e4m3", "fp8_e4m3_host", "streamed_base_opt_in"];
+    &["", "OFF", "fp8_e4m3", "fp8_e4m3_host", "int_w8a8", "streamed_base_opt_in"];
 // _training_method_int (l.626)
 const TRAINING_METHODS: &[&str] = &[
     "LORA", "lora", "LoRA", "FINE_TUNE", "fine_tune", "FineTune", "finetune",
