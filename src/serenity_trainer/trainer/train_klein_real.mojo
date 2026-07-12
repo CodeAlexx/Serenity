@@ -1981,9 +1981,9 @@ def main() raises:
                 print("PROG_STAGE step=", k, " total=", run_steps, " phase=backward_begin", " loss=", loss)
             t_bwd0 = perf_counter_ns()
             if resident_grads:
-                # devgrads mirror: same tape restores, same block math (exact
-                # sdpa singles / flash doubles, int8 dX GEMMs), LoRA d_A/d_B
-                # stay on device — no per-block D2H.
+                # devgrads mirror: same tape restores, same block math (flash
+                # sdpa singles AND doubles under KLEIN_SDPA_FLASH, int8 dX
+                # GEMMs), LoRA d_A/d_B stay on device — no per-block D2H.
                 gdev = klein_stack_lora_backward_offloaded_tape_turbo_moddev_rope_scratch_devgrads[H, Dh, N_IMG, N_TXT, S](
                     lg.d_loss.copy(), empty_img.copy(), empty_txt.copy(), base,
                     loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
