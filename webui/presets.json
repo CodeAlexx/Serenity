@@ -23,6 +23,26 @@
     "save_every": 500,
     "sample_every": 500,
     "quantized_resident": "fp8_e4m3"
+   },
+   "prepare": {
+    "steps": [
+     {
+      "interp": "/home/alex/ai-toolkit/venv/bin/python",
+      "cwd": "/home/alex/mojodiffusion",
+      "argv": ["serenitymojo/training/krea2_stage_images.py", "{stage_dir}", "{staged}", "{size}"],
+      "produces": "{staged}/images.safetensors",
+      "_note": "Stage A (CPU): raw <dir>/N.jpg+N.txt -> images.safetensors + prompt.i.txt"
+     },
+     {
+      "bin": "/home/alex/mojodiffusion/output/bin/krea2_prepare_cache",
+      "cwd": "/home/alex/mojodiffusion",
+      "env": {"LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"},
+      "argv": ["{staged}", "{out}", "{n}", "{size}"],
+      "produces": "{out}",
+      "_note": "Stage B (GPU): VAE + Qwen3-VL encode -> cache.safetensors (context/text_len/clean x n)"
+     }
+    ],
+    "default_size": 512
    }
   },
   {
@@ -48,6 +68,19 @@
     "save_every": 500,
     "sample_every": 500,
     "quantized_resident": "streamed_base_opt_in"
+   },
+   "prepare": {
+    "steps": [
+     {
+      "bin": "/home/alex/mojodiffusion/output/bin/klein9b_prepare_cache",
+      "cwd": "/home/alex/mojodiffusion",
+      "env": {"LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"},
+      "argv": ["{stage_dir}", "{out}", "{n}", "{size}"],
+      "produces": "{out}"
+     }
+    ],
+    "default_size": 512,
+    "_note": "DATA ONLY — bin not built yet; /api/prepare/run 422s 'prepare binary not built' until it exists"
    }
   },
   {
@@ -145,6 +178,19 @@
     "save_every": 500,
     "sample_every": 0,
     "quantized_resident": "OFF"
+   },
+   "prepare": {
+    "steps": [
+     {
+      "bin": "/home/alex/mojodiffusion/output/bin/zimage_prepare_cache",
+      "cwd": "/home/alex/mojodiffusion",
+      "env": {"LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"},
+      "argv": ["{stage_dir}", "{out}", "{n}", "{size}"],
+      "produces": "{out}"
+     }
+    ],
+    "default_size": 512,
+    "_note": "DATA ONLY — bin not built yet; /api/prepare/run 422s 'prepare binary not built' until it exists"
    }
   },
   {
@@ -220,7 +266,20 @@
     "sample_every": 0,
     "quantized_resident": "fp8_e4m3"
    },
-   "_unwired_note": "WIRED (18-arg shape 4) \u2014 dry-run verified; not yet run-gated on GPU"
+   "_unwired_note": "WIRED (18-arg shape 4) \u2014 dry-run verified; not yet run-gated on GPU",
+   "prepare": {
+    "steps": [
+     {
+      "bin": "/home/alex/mojodiffusion/output/bin/ideogram4_prepare_cache",
+      "cwd": "/home/alex/mojodiffusion",
+      "env": {"LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"},
+      "argv": ["{stage_dir}", "{out}", "{n}", "{size}"],
+      "produces": "{out}"
+     }
+    ],
+    "default_size": 512,
+    "_note": "DATA ONLY \u2014 bin not built yet; /api/prepare/run 422s 'prepare binary not built' until it exists"
+   }
   },
   {
    "id": "sdxl",

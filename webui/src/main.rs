@@ -26,6 +26,7 @@ use tokio::{
 };
 
 mod captioner;
+mod prepare;
 mod board;
 // validate_config_enums is exercised by the config_smoke bin (shared file); in
 // the server bin only build_merged_config is called, so allow the rest.
@@ -33,7 +34,8 @@ mod board;
 mod config_merge;
 
 const REPO_ROOT: &str = "/home/alex/serenity-trainer";
-const CUDA_LD: &str = "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib";
+// pub(crate) so captioner/prepare spawn Mojo binaries with the SAME loader path.
+pub(crate) const CUDA_LD: &str = "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib";
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Preset {
@@ -1119,6 +1121,9 @@ async fn main() {
         .route("/api/captioner/run", post(captioner::run))
         .route("/api/captioner/status", get(captioner::status))
         .route("/api/captioner/abort", post(captioner::abort))
+        .route("/api/prepare/run", post(prepare::run))
+        .route("/api/prepare/status", get(prepare::status))
+        .route("/api/prepare/abort", post(prepare::abort))
         .route("/api/validations", get(validations_get).put(validations_put))
         .route("/api/runs/history", get(runs_history))
         .route("/api/ui/state", get(ui_state_get).put(ui_state_put))

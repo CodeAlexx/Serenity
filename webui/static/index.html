@@ -247,6 +247,19 @@
           <div class="row nw"><label>Clear cache before <span class="nwtag">not wired</span></label><input type="checkbox"></div>
         </div></div>
       </div>
+      <div class="panel"><h3>PREPARE CACHE <span class="wtag">wired</span></h3><div class="sub">Encode a staged raw-image folder into the training CACHE (latents + text conditioning) with the preset's prepare binary. On success the produced .safetensors is written into the Cache path above — closing raw folder → caption → cache → launch.</div>
+        <div class="grid2"><div>
+          <div class="row"><label>Stage dir</label><input id="prep_stage" placeholder="/home/alex/… raw staged images"></div>
+          <div class="row"><label>Out cache</label><input id="prep_out" placeholder="&lt;stage&gt;/cache.safetensors"></div>
+        </div><div>
+          <div class="row"><label>Image count (n)</label><input id="prep_n" type="number" value="0"></div>
+          <div class="row"><label>Size</label><select id="prep_size"><option>512</option><option>1024</option></select></div>
+        </div></div>
+        <button id="prep_run" class="btnp" style="margin-top:8px" onclick="runPrepare()">Prepare cache</button>
+        <button id="prep_abort" style="background:var(--bad);color:#fff;border:0;border-radius:6px;padding:7px 16px;font-weight:600;cursor:pointer;margin-top:8px;display:none" onclick="abortPrepare()">Abort</button>
+        <span id="prep_msg" style="color:var(--dim);font-size:12px;margin-left:10px"></span>
+        <div id="prep_prog" class="sub" style="margin-top:8px"></div>
+      </div>
       <div class="panel"><h3>MEDIA <span id="ds_count" style="color:var(--dim);font-weight:400"></span></h3>
         <div id="ds_stats" class="dschips" style="display:none"></div>
         <div id="ds_grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px"></div>
@@ -265,7 +278,10 @@
       <div class="panel"><h3>CAPTIONER</h3><div class="sub">Qwen3-VL vision captioner — writes a .txt sidecar next to each image in the folder (ai-toolkit venv, GPU). Edit results in the Dataset tab.</div>
         <div class="grid2"><div>
           <div class="row"><label>Image folder</label><input id="cap_folder" placeholder="/home/alex/1_giger/gigerver3"></div>
-          <div class="row"><label>Model</label><select id="cap_model">
+          <div class="row"><label>Engine</label><select id="cap_engine">
+            <option value="python">Python (ai-toolkit venv — any Qwen3-VL below)</option>
+            <option value="mojo">Mojo (pure-Mojo qwen3vl_caption — fixed Qwen3-VL-4B)</option></select></div>
+          <div class="row"><label>Model <span class="nwtag" id="cap_model_note" style="display:none">ignored in Mojo engine</span></label><select id="cap_model">
             <option value="Qwen/Qwen3-VL-4B-Instruct">Qwen3-VL-4B-Instruct (fast)</option>
             <option value="Qwen/Qwen3-VL-8B-Instruct">Qwen3-VL-8B-Instruct</option>
             <option value="prithivMLmods/Qwen3-VL-8B-Abliterated-Caption-it">Qwen3-VL-8B-Abliterated-Caption</option>
@@ -697,6 +713,7 @@ async function scanDataset() {
   DS_ITEMS = j.items; DS_RES = {}; DS_RES_SEEN = 0;
   $("ds_count").textContent = `— ${j.count} images`;
   renderDsGrid(); updateDsStats();
+  prepDefaultsFromDataset();
 }
 function renderDsGrid() {
   $("ds_grid").innerHTML = DS_ITEMS.map((it, i) => {
@@ -767,9 +784,10 @@ function capEsc(s) { return (s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;
 async function runCaptioner() {
   const folder = $("cap_folder").value.trim();
   if (!folder) { $("cap_msg").textContent = "✗ set an image folder"; return; }
+  const engine = $("cap_engine").value;
   const model = capModelId();
-  if (!model) { $("cap_msg").textContent = "✗ set a custom model id"; return; }
-  const body = { folder, model,
+  if (engine === "python" && !model) { $("cap_msg").textContent = "✗ set a custom model id"; return; }
+  const body = { folder, model, engine,
     prompt: $("cap_prompt").value || null,
     max_tokens: parseInt($("cap_maxtok").value || "512"),
     skip_existing: $("cap_skip").checked,
@@ -777,7 +795,7 @@ async function runCaptioner() {
   const r = await fetch("/api/captioner/run", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
   const j = await r.json();
   if (!r.ok) { $("cap_msg").textContent = "✗ " + (j.error || r.status); return; }
-  $("cap_msg").textContent = "▶ loading " + model + " …";
+  $("cap_msg").textContent = engine === "mojo" ? "▶ pure-Mojo captioner …" : "▶ loading " + model + " …";
   $("cap_run").style.display = "none"; $("cap_abort").style.display = "inline-block";
   $("cap_prog_panel").style.display = "block";
   $("cap_results").innerHTML = ""; $("cap_barfill").style.width = "0%";
@@ -820,6 +838,72 @@ function capOpenInDataset(folder) {
   const a = document.querySelector('nav a[data-sec="dataset"]');
   if (a) a.click();
   if (typeof scanDataset === "function") scanDataset();
+}
+$("cap_engine").onchange = () => {
+  $("cap_model_note").style.display = $("cap_engine").value === "mojo" ? "inline" : "none";
+};
+
+/* ── prepare cache runner (polled status) — closes raw folder → cache → launch ── */
+let PREP_POLL = null;
+// keep prep_out in sync with prep_stage until the user hand-edits the out path
+let PREP_OUT_AUTO = true;
+$("prep_out").addEventListener("input", () => { PREP_OUT_AUTO = false; });
+$("prep_stage").addEventListener("input", () => {
+  if (PREP_OUT_AUTO) $("prep_out").value = defaultPrepOut($("prep_stage").value.trim());
+});
+function defaultPrepOut(stage) {
+  return stage ? stage.replace(/\/+$/, "") + "/cache.safetensors" : "";
+}
+/** Default the prepare inputs from the current dataset scan (stage=folder, n=count). */
+function prepDefaultsFromDataset() {
+  const folder = $("ds_folder").value.trim();
+  if (folder && !$("prep_stage").value.trim()) {
+    $("prep_stage").value = folder;
+    if (PREP_OUT_AUTO) $("prep_out").value = defaultPrepOut(folder);
+  }
+  if (DS_ITEMS.length && (!$("prep_n").value || $("prep_n").value === "0")) {
+    $("prep_n").value = DS_ITEMS.length;
+  }
+}
+async function runPrepare() {
+  const stage_dir = $("prep_stage").value.trim();
+  const out = $("prep_out").value.trim() || defaultPrepOut(stage_dir);
+  const n = parseInt($("prep_n").value || "0");
+  const size = parseInt($("prep_size").value || "512");
+  if (!stage_dir) { $("prep_msg").textContent = "✗ set a stage dir"; return; }
+  if (!out) { $("prep_msg").textContent = "✗ set an out cache path"; return; }
+  if (!n) { $("prep_msg").textContent = "✗ image count (n) must be > 0"; return; }
+  const body = { preset_id: $("preset").value, stage_dir, out, n, size };
+  const r = await fetch("/api/prepare/run", {method:"POST", headers:{"content-type":"application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) { $("prep_msg").textContent = "✗ " + (j.error || r.status); return; }
+  $("prep_msg").textContent = "▶ preparing cache …";
+  $("prep_run").style.display = "none"; $("prep_abort").style.display = "inline-block";
+  if (PREP_POLL) clearInterval(PREP_POLL);
+  PREP_POLL = setInterval(pollPrepare, 1000);
+  pollPrepare();
+}
+async function abortPrepare() {
+  await fetch("/api/prepare/abort", {method:"POST"});
+  $("prep_msg").textContent = "aborting…";
+}
+async function pollPrepare() {
+  let s;
+  try { s = (await (await fetch("/api/prepare/status")).json()).status; } catch (e) { return; }
+  const prog = s.total ? `${s.done} / ${s.total}` : "";
+  $("prep_prog").textContent = s.fatal ? ("✗ " + s.fatal)
+    : (s.running ? ((prog ? prog + " · " : "") + (s.current || "working…"))
+                 : (s.error || ""));
+  if (!s.running) {
+    if (PREP_POLL) { clearInterval(PREP_POLL); PREP_POLL = null; }
+    $("prep_run").style.display = "inline-block"; $("prep_abort").style.display = "none";
+    if (s.fatal) { $("prep_msg").textContent = "✗ " + s.fatal; }
+    else if (s.aborted) { $("prep_msg").textContent = "aborted"; }
+    else if (s.finished && s.cache) {
+      $("cache").value = s.cache;                 // ← close the loop: launch reads this
+      $("prep_msg").textContent = "✓ cache ready — set as Cache path: " + s.cache;
+    } else { $("prep_msg").textContent = "done"; }
+  }
 }
 
 /* ── validations / sample-prompt structured editor (serenity.sample_prompts.v1) ── */
