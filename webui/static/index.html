@@ -187,7 +187,7 @@
             <div class="row"><label>Base Model</label><input id="checkpoint"></div>
             <div class="row"><label>VAE (override) <span class="wtag">wired</span></label><input id="vae_override" placeholder="preset default"></div>
             <div class="row"><label>Quantized base <span class="wtag">wired</span></label>
-              <select id="quantized_resident"><option value="OFF">off (bf16)</option><option value="fp8_e4m3">fp8_e4m3 (device)</option><option value="fp8_e4m3_host">fp8_e4m3_host</option><option value="streamed_base_opt_in">streamed_base_opt_in</option></select></div>
+              <select id="quantized_resident"><option value="OFF">off (bf16)</option><option value="fp8_e4m3">fp8_e4m3 (device)</option><option value="int_w8a8">int_w8a8 (int8 W8A8 — ~2x, 3090+)</option><option value="fp8_e4m3_host">fp8_e4m3_host</option><option value="streamed_base_opt_in">streamed_base_opt_in</option></select></div>
           </div>
           <div>
             <div class="row"><label>Destination</label><input id="workspace_dir" disabled></div>
