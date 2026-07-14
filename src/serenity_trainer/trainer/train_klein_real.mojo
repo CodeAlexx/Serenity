@@ -82,6 +82,14 @@ from serenitymojo.models.klein.klein_stack_lora import (
 from serenitymojo.training.on_device_global_norm import (
     on_device_per_tensor_sumsq, on_device_scale_tensors_f32,
 )
+# ── img-EDIT reference-conditioning projection (task #4b; opt-in KLEIN_EDIT=1).
+# The compute + param + save/resume ship in serenitymojo (parity-green); this
+# trainer only WIRES them. Default-off (KLEIN_EDIT unset) never touches these.
+from serenitymojo.models.klein.klein_img_in_ref_param import (
+    KleinImgInRefParam, make_klein_img_in_ref_param,
+    klein_img_in_ref_adamw_step, save_klein_img_in_ref,
+    load_klein_img_in_ref_resume,
+)
 from serenitymojo.models.klein.weights import (
     load_double_block_weights, load_single_block_weights,
     load_klein_stack_base_training,
@@ -591,6 +599,16 @@ def _ema_path_for_lora(lora_path: String) -> String:
     if lora_path.endswith(suffix):
         return lora_path.removesuffix(suffix) + String("_ema.safetensors")
     return lora_path + String("_ema.safetensors")
+
+
+# img-EDIT reference projection sibling checkpoint (task #4b; only written/read
+# when KLEIN_EDIT=1): alina_lora_step100.safetensors ->
+# alina_lora_step100_img_in_ref.safetensors. Byte-exact BF16 weight + F32 moments.
+def _img_in_ref_path_for_lora(lora_path: String) -> String:
+    var suffix = String(".safetensors")
+    if lora_path.endswith(suffix):
+        return lora_path.removesuffix(suffix) + String("_img_in_ref.safetensors")
+    return lora_path + String("_img_in_ref.safetensors")
 
 
 def _lora_path_for_step(base_path: String, step: Int, max_steps: Int) -> String:
@@ -1276,6 +1294,49 @@ def main() raises:
     print("  checkpoint:", cfg.checkpoint)
     print("  output_lora:", klein_output_lora_path_from_train_config(cfg, run_steps))
 
+    # ── img-EDIT mode (task #4b; opt-in KLEIN_EDIT=1; default 0 = byte-identical
+    # text-to-image LoRA training). When enabled, the trainer ALSO trains the
+    # img_in_ref reference-conditioning projection alongside the LoRA set:
+    # preloads the cached reference latents, passes them through the parity-green
+    # ref hook in the fwd/bwd, and steps KleinImgInRefParam with the same AdamW
+    # scalars/step-count as the LoRA step. Every edit-mode action below is under
+    # `if edit_mode:` — off => zero new work, byte-identical current path.
+    var edit_mode = env_int("KLEIN_EDIT", 0) != 0
+    if edit_mode:
+        print("  KLEIN_EDIT=1: img-EDIT reference-conditioning ENABLED",
+              " (img_in_ref [D=", cfg.d_model, ", in_ch=", cfg.in_channels, "])")
+        # Honest scope: the img_in_ref grad is stepped in the plain-AdamW branch
+        # only, and its host grad is not woven into the LoRA grad-accum buffers.
+        if lokr_active:
+            raise Error(
+                "KLEIN_EDIT=1 (img-EDIT) is not wired for adapter_algo=4 (LoKr);"
+                " the img_in_ref AdamW step lives in the plain-LoRA AdamW branch."
+                " Use adapter_algo=0 (plain LoRA) for edit training."
+            )
+        if levers_optimizer_active(cfg):
+            raise Error(
+                "KLEIN_EDIT=1 (img-EDIT) is not wired for the levers host"
+                " optimizer; the img_in_ref step uses the plain AdamW leg."
+                " Use optimizer=ADAMW for edit training."
+            )
+        if cfg.grad_accum_steps > 1:
+            raise Error(
+                "KLEIN_EDIT=1 (img-EDIT) is not wired for grad_accum_steps > 1"
+                " (the img_in_ref host grad is not accumulated across"
+                " micro-steps). Set grad_accum_steps=1 for edit training."
+            )
+        # The ref hook is wired on the CPU_OFFLOADED activation-tape fwd/bwd pair
+        # (+ its resident-devgrads sibling) — the product Klein path. The non-tape
+        # and CUDA-graph backward variants are NOT ref-wired (deferred), so refuse
+        # rather than silently train text-to-image while claiming edit mode.
+        if not cfg.activation_offload_enabled():
+            raise Error(
+                "KLEIN_EDIT=1 (img-EDIT) requires the CPU_OFFLOADED activation-tape"
+                " path (gradient_checkpointing=CPU_OFFLOADED +"
+                " enable_activation_offloading); the non-tape/graph backwards are"
+                " not reference-wired. Enable activation offload for edit training."
+            )
+
     if cfg.only_cache:
         print("[Klein] only_cache requested; no CUDA context or train steps will run in this trainer")
         return
@@ -1654,6 +1715,33 @@ def main() raises:
         board.log_text(String("events/resume"), start_step, resume_lora)
     print("  LoRA set:", len(lora.dbl), "double-slot +", len(lora.sgl), "single-slot")
 
+    # ── img-EDIT reference projection param (task #4b; KLEIN_EDIT only) ─────────
+    # Zero-init KleinImgInRefParam [D=d_model, in_ch=in_channels]: host BF16
+    # weight + F32 AdamW moments (the SAME storage as one LoRA leg). Off => a
+    # tiny 1x1 placeholder (no [D,in_ch] allocation). The resident device weight
+    # `img_in_ref_dev` (BF16 [D,in_ch]) is uploaded once here and re-uploaded
+    # after each AdamW step; None when off (=> the fwd/bwd ref hook is skipped).
+    var img_in_ref_param = make_klein_img_in_ref_param(1, 1)
+    var img_in_ref_dev = Optional[TArc](None)
+    if edit_mode:
+        img_in_ref_param = make_klein_img_in_ref_param(cfg.d_model, cfg.in_channels)
+        if resume_lora != String(""):
+            var ref_resume = _img_in_ref_path_for_lora(resume_lora)
+            if _path_exists(ref_resume):
+                print("[Klein-edit] loading resume img_in_ref:", ref_resume)
+                img_in_ref_param = load_klein_img_in_ref_resume(
+                    cfg.d_model, cfg.in_channels, ref_resume, ctx,
+                )
+                board.log_text(String("events/resume_img_in_ref"), start_step, ref_resume)
+            else:
+                print("[Klein-edit] no img_in_ref sidecar at", ref_resume,
+                      "-> zero-init (fresh ref projection)")
+        img_in_ref_dev = Optional[TArc](TArc(
+            Tensor.from_host_bf16(
+                img_in_ref_param.w.copy(), [cfg.d_model, cfg.in_channels], ctx
+            )
+        ))
+
     # ── T2.G LoKr masters + carrier set (adapter_algo==4 only) ────────────────
     # The plain-LoRA `lora` set built above is REPLACED by the LoKr carrier
     # set: same KleinLoraSet type, same stack forward/backward, but every
@@ -1762,6 +1850,9 @@ def main() raises:
     print("  preloading compatible cache tensors:", len(compatible))
     var cached_img_tokens = List[TArc]()
     var cached_txt_tokens = List[TArc]()
+    # img-EDIT (task #4b): resident REFERENCE image tokens, same slot index as
+    # cached_img_tokens. Stays empty (no allocation, no cache reads) when off.
+    var cached_ref_tokens = List[TArc]()
     var preload_txt_sh = List[Int]()
     preload_txt_sh.append(N_TXT); preload_txt_sh.append(cfg.joint_attention_dim)
     for ci in range(len(compatible)):
@@ -1770,7 +1861,24 @@ def main() raises:
         var txt_tok = reshape(sample.text_embedding, preload_txt_sh.copy(), ctx)
         cached_img_tokens.append(TArc(img_tok^))
         cached_txt_tokens.append(TArc(txt_tok^))
+        # Reference latent -> ref img_tokens via the SAME NCHW->NHWC pack the
+        # target uses (img_in_ref sees [N_IMG, in_ch], same as noise_tokens).
+        # Fail loud if edit mode is on but this sample carries no control_latent.
+        if edit_mode:
+            if not cache.has_control(compatible[ci]):
+                raise Error(
+                    String("KLEIN_EDIT=1 but cache sample index ")
+                    + String(compatible[ci])
+                    + String(" has no 'control_latent' (reference) tensor;")
+                    + String(" re-run the edit prepare (klein_prepare with the")
+                    + String(" 4th ref_stage_dir arg) to write reference latents.")
+                )
+            var ref_lat = cache.load_control(compatible[ci], ctx)
+            var ref_tok = _latent_to_img_tokens_device(ref_lat, cfg.in_channels, ctx)
+            cached_ref_tokens.append(TArc(ref_tok^))
     print("  preloaded cache tensors:", len(cached_img_tokens), "samples")
+    if edit_mode:
+        print("  preloaded img-EDIT reference tensors:", len(cached_ref_tokens), "samples")
 
     # ── caption-dropout uncond embedding (Wave 2B item 2d; default-off) ───────
     # Default-off must not allocate an unconditional tensor. When enabled, use a
@@ -1957,6 +2065,11 @@ def main() raises:
         var t_bwd0 = UInt(0)
         if runtime_profile:
             print("PROG_STAGE step=", k, " total=", run_steps, " phase=forward_begin")
+        # img-EDIT (task #4b): this step's resident REFERENCE tokens (same slot).
+        # None when off => the fwd/bwd ref hook is skipped (byte-identical path).
+        var ref_tok_opt = Optional[TArc](None)
+        if edit_mode:
+            ref_tok_opt = Optional[TArc](cached_ref_tokens[cache_slot].copy())
         var t_fwd0 = perf_counter_ns()
         if use_activation_tape_offload:
             var fwd_tape = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch_offloaded_tape[H, Dh, N_IMG, N_TXT, S](
@@ -1966,6 +2079,8 @@ def main() raises:
                 cfg.out_channels, cfg.eps, ctx, scratch_fwd,
                 klein_save_activations,
                 klein_device_tape,
+                ref_tokens_t=ref_tok_opt.copy(),
+                img_in_ref_w=img_in_ref_dev.copy(),
             )
             var t_fwd1 = perf_counter_ns()
             if runtime_profile:
@@ -1989,6 +2104,7 @@ def main() raises:
                     loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
                     cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
                     cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                    ref_tokens_t=ref_tok_opt.copy(),
                 )
                 g = KleinLoraGrads(
                     List[List[Float32]](), List[List[Float32]](),
@@ -2004,6 +2120,7 @@ def main() raises:
                     loader, lora_dev, img_mod, txt_mod, single_mod, cos_dev[], sin_dev[], fwd_tape,
                     cfg.d_model, cfg.mlp_hidden, cfg.in_channels, cfg.joint_attention_dim,
                     cfg.out_channels, cfg.eps, ctx, scratch_bwd, False, False,
+                    ref_tokens_t=ref_tok_opt.copy(),
                 )
         else:
             var fwd = klein_stack_lora_forward_device_inputs_offload_turbo_moddev_rope_scratch[H, Dh, N_IMG, N_TXT, S](
@@ -2064,6 +2181,24 @@ def main() raises:
                 "PROG_STAGE step=", k, " total=", run_steps, " phase=backward",
                 " secs=", Float32(Float64(t_bwd1 - t_bwd0) / 1.0e9),
             )
+
+        # img-EDIT (task #4b): pull the img_in_ref grad [D, in_ch] out of the
+        # backward result. It rides KleinLoraTensorGrads.d_img_in_ref on the
+        # resident-grads path and KleinLoraGrads.d_img_in_ref on the host path
+        # (both HOST lists). Empty when off => the AdamW step below is skipped.
+        var d_img_in_ref = List[Float32]()
+        if edit_mode:
+            if resident_grads:
+                d_img_in_ref = gdev.d_img_in_ref.copy()
+            else:
+                d_img_in_ref = g.d_img_in_ref.copy()
+            if len(d_img_in_ref) != cfg.d_model * cfg.in_channels:
+                raise Error(
+                    String("KLEIN_EDIT=1: img_in_ref grad len ")
+                    + String(len(d_img_in_ref)) + String(" != D*in_ch ")
+                    + String(cfg.d_model * cfg.in_channels)
+                    + String(" (ref hook did not emit d_img_in_ref)")
+                )
 
         # ── gradient accumulation (Wave 2B item 2h; default-off when N==1) ─────
         # Fast path: accum_steps==1 uses `g` directly and avoids zero-cloning,
@@ -2175,6 +2310,10 @@ def main() raises:
                 for i in range(ns):
                     _scale_inplace(g.sgl_d_a[i], clip_scale)
                     _scale_inplace(g.sgl_d_b[i], clip_scale)
+            # img-EDIT: scale the img_in_ref grad by the SAME global-norm clip
+            # factor (its host list is stepped separately below). Off => empty.
+            if edit_mode:
+                _scale_inplace(d_img_in_ref, clip_scale)
 
         # AdamW step (on clipped grads)
         if runtime_profile:
@@ -2265,6 +2404,23 @@ def main() raises:
                 klein_lora_adamw_step(
                     lora, g, optimizer_step, step_lr, ctx, cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay
                 )
+        # ── img-EDIT: img_in_ref AdamW step (task #4b; KLEIN_EDIT only) ────────
+        # Same optimizer_step (bias-correction), lr and betas/eps/wd as the LoRA
+        # step above (OneTrainer AdamW + stochastic BF16 rounding). Then re-upload
+        # the updated BF16 weight to the resident device tensor for the next step.
+        # edit_mode co-occurs only with the plain-AdamW branch (lokr/levers are
+        # rejected at startup), so the LoRA params were just stepped by AdamW too.
+        if edit_mode:
+            klein_img_in_ref_adamw_step(
+                img_in_ref_param, d_img_in_ref, optimizer_step, step_lr, ctx,
+                cfg.beta1, cfg.beta2, cfg.eps, cfg.weight_decay,
+            )
+            img_in_ref_dev = Optional[TArc](TArc(
+                Tensor.from_host_bf16(
+                    img_in_ref_param.w.copy(), [cfg.d_model, cfg.in_channels], ctx
+                )
+            ))
+
         # ── EMA shadow update post-AdamW (Wave 2B item 2i; default-off skip) ──
         # decay schedule returns 0.0 before update_after_step (skip). Off =>
         # shadows empty => loop body never runs => baseline unchanged.
@@ -2343,6 +2499,14 @@ def main() raises:
                 var nstate = save_klein_lora_state(lora, state_path, ctx)
                 print("[Klein-lora] save_state step=", k, " path=", state_path, " pairs=", nstate)
                 board.log_text(String("events/save_state"), k, state_path)
+                # img-EDIT (task #4b): sibling byte-exact img_in_ref checkpoint
+                # (BF16 weight + F32 moments). Only written in edit mode => the
+                # non-edit checkpoint format is byte-unchanged.
+                if edit_mode:
+                    var ref_ckpt = _img_in_ref_path_for_lora(ckpt)
+                    var nref = save_klein_img_in_ref(img_in_ref_param, ref_ckpt, ctx)
+                    print("[Klein-edit] save_img_in_ref step=", k, " path=", ref_ckpt, " tensors=", nref)
+                    board.log_text(String("events/save_img_in_ref"), k, ref_ckpt)
             # ── EMA shadow checkpoint (Wave 2B item 2i) ──────────────────────
             # When ema_enabled, the EMA shadow is the smoothed weight average and
             # is the checkpoint you sample/deploy from. Write it as a SIBLING file
