@@ -29,15 +29,27 @@
      {
       "interp": "/home/alex/ai-toolkit/venv/bin/python",
       "cwd": "/home/alex/mojodiffusion",
-      "argv": ["serenitymojo/training/krea2_stage_images.py", "{stage_dir}", "{staged}", "{size}"],
+      "argv": [
+       "serenitymojo/training/krea2_stage_images.py",
+       "{stage_dir}",
+       "{staged}",
+       "{size}"
+      ],
       "produces": "{staged}/images.safetensors",
       "_note": "Stage A (CPU): raw <dir>/N.jpg+N.txt -> images.safetensors + prompt.i.txt"
      },
      {
       "bin": "/home/alex/mojodiffusion/output/bin/krea2_prepare_cache",
       "cwd": "/home/alex/mojodiffusion",
-      "env": {"LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"},
-      "argv": ["{staged}", "{out}", "{n}", "{size}"],
+      "env": {
+       "LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"
+      },
+      "argv": [
+       "{staged}",
+       "{out}",
+       "{n}",
+       "{size}"
+      ],
       "produces": "{out}",
       "_note": "Stage B (GPU): VAE + Qwen3-VL encode -> cache.safetensors (context/text_len/clean x n)"
      }
@@ -74,13 +86,20 @@
      {
       "bin": "/home/alex/mojodiffusion/output/bin/klein9b_prepare_cache",
       "cwd": "/home/alex/mojodiffusion",
-      "env": {"LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"},
-      "argv": ["{stage_dir}", "{out}", "{n}", "{size}"],
+      "env": {
+       "LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"
+      },
+      "argv": [
+       "{stage_dir}",
+       "{out}",
+       "{n}",
+       "{size}"
+      ],
       "produces": "{out}"
      }
     ],
     "default_size": 512,
-    "_note": "DATA ONLY — bin not built yet; /api/prepare/run 422s 'prepare binary not built' until it exists"
+    "_note": "DATA ONLY \u2014 bin not built yet; /api/prepare/run 422s 'prepare binary not built' until it exists"
    }
   },
   {
@@ -184,13 +203,20 @@
      {
       "bin": "/home/alex/mojodiffusion/output/bin/zimage_prepare_cache",
       "cwd": "/home/alex/mojodiffusion",
-      "env": {"LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"},
-      "argv": ["{stage_dir}", "{out}", "{n}", "{size}"],
+      "env": {
+       "LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"
+      },
+      "argv": [
+       "{stage_dir}",
+       "{out}",
+       "{n}",
+       "{size}"
+      ],
       "produces": "{out}"
      }
     ],
     "default_size": 512,
-    "_note": "DATA ONLY — bin not built yet; /api/prepare/run 422s 'prepare binary not built' until it exists"
+    "_note": "DATA ONLY \u2014 bin not built yet; /api/prepare/run 422s 'prepare binary not built' until it exists"
    }
   },
   {
@@ -272,8 +298,15 @@
      {
       "bin": "/home/alex/mojodiffusion/output/bin/ideogram4_prepare_cache",
       "cwd": "/home/alex/mojodiffusion",
-      "env": {"LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"},
-      "argv": ["{stage_dir}", "{out}", "{n}", "{size}"],
+      "env": {
+       "LD_LIBRARY_PATH": "/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib"
+      },
+      "argv": [
+       "{stage_dir}",
+       "{out}",
+       "{n}",
+       "{size}"
+      ],
       "produces": "{out}"
      }
     ],
@@ -359,6 +392,31 @@
    "save_filename_prefix": "wan22",
    "recipe": {},
    "_unwired_note": "no live trainer runner wired (matches Mojo UI)"
+  },
+  {
+   "id": "acestep",
+   "label": "ACE-Step-1.5 xl-base (audio)",
+   "backend": "acestep",
+   "wired": true,
+   "argv_shape": "acestep",
+   "binary": "/home/alex/mojodiffusion/output/bin/train_acestep",
+   "base_config": "",
+   "checkpoint": "/home/alex/ACE-Step-1.5/checkpoints/acestep-v15-xl-base",
+   "cache": "",
+   "run_name": "acestep_xlbase_lora",
+   "workspace_dir": "/home/alex/mojodiffusion/output/acestep_xlbase_lora",
+   "save_filename_prefix": "acestep_xlbase_lora",
+   "_note": "pure-Mojo ACE-Step-1.5 xl-base (4B) audio LoRA trainer; all-argv contract (base_config empty). cache empty -> oracle-dump smoke; set cache to a Mojo acestep_pt_to_cache dir for real data. cfg_ratio_pct 0=CFG off.",
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "grad_accum": 4,
+    "cfg_ratio_pct": 0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "seed": 42
+   }
   }
  ]
 }

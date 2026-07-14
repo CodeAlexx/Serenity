@@ -573,6 +573,24 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             "-".into(),
             "512".into(),
         ],
+        // ACE-Step-1.5 xl-base audio LoRA (train_acestep.mojo main() argv contract):
+        // [1]=checkpoint [2]=cache(-=oracle) [3]=output_dir(-=default) [4]=run_name
+        // [5]=steps [6]=grad_accum [7]=lr [8]=rank [9]=alpha [10]=save_every
+        // [11]=cfg_ratio_pct [12]=seed. base_config empty (all-argv contract).
+        "acestep" => vec![
+            p.checkpoint.clone(),
+            if cache.is_empty() { "-".into() } else { cache.clone() },
+            "-".into(),
+            run_name.clone(),
+            steps.to_string(),
+            format!("{}", getu("grad_accum", 4)),
+            format!("{}", getf("learning_rate", 1e-4)),
+            format!("{}", getu("lora_rank", 8)),
+            format!("{}", getf("lora_alpha", 16.0)),
+            format!("{}", getu("save_every", 500)),
+            format!("{}", getu("cfg_ratio_pct", 0)),
+            format!("{}", getu("seed", 42)),
+        ],
         other => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("argv shape {other} not wired")}))),
     };
     // finding #1: resume argv order is PER-BACKEND, not per argv-shape. The
