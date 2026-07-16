@@ -1241,8 +1241,13 @@ def main() raises:
         run_steps = RUN_STEPS
     if len(a) >= 3:
         run_steps = _parse_nonnegative_int(String(a[2]))
+    # UNIFIED STEPS CONTRACT (audit #6): the argv steps are AUTHORITATIVE across
+    # all trainers — /v1/train's steps=N must run N steps everywhere. The old
+    # silent clamp-to-max_steps made klein behave differently from
+    # zimage/chroma/flux for the identical POST. Note loudly instead.
     if run_steps > cfg.max_steps:
-        run_steps = cfg.max_steps
+        print("[klein] NOTE: argv steps", run_steps, "> config max_steps",
+              cfg.max_steps, "— argv is authoritative (steps contract)")
     var start_step = 0
     if len(a) >= 4:
         start_step = _parse_nonnegative_int(String(a[3]))

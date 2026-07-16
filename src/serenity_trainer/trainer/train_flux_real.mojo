@@ -1073,7 +1073,10 @@ def main() raises:
         # are only loaded once the loop starts. First real sample fires at the
         # first completed step that hits the cadence (see the in-loop callsite).
         print("[cadence] step-0 sample skipped (untrained LoRA); first sample at next cadence step")
-    var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
+    # UNIFIED STEPS CONTRACT (audit #6): anchor cadence to the ACTUAL run
+    # length, not config max_steps — with run_steps < max_steps, percent-unit
+    # cadence anchored to max_steps could silently never fire.
+    var next_sample = next_sample_completed_step(sample_cadence, 0, run_steps)
     print("[cadence] next sample completed_step=", next_sample)
 
     var first_loss = Float32(0.0)

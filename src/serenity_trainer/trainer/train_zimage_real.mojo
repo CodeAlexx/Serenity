@@ -3543,7 +3543,10 @@ def main() raises:
 
     if sample_enabled and should_sample_completed_step(sample_cadence, 0):
         print("[cadence] step 0 sample due; Z-Image uses split-process sampler requests")
-    var next_sample = next_sample_completed_step(sample_cadence, 0, train_cfg.max_steps)
+    # UNIFIED STEPS CONTRACT (audit #6): anchor cadence to the ACTUAL run
+    # length, not config max_steps — with run_steps < max_steps, percent-unit
+    # cadence anchored to max_steps could silently never fire.
+    var next_sample = next_sample_completed_step(sample_cadence, 0, run_steps)
     print("[cadence] next sample completed_step=", next_sample)
 
     # batch-2 bucket-aware pairing: the b2 path requires both samples in a pair
