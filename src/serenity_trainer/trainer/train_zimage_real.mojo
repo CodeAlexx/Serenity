@@ -66,7 +66,7 @@ from serenitymojo.tensor import Tensor
 from serenitymojo.io.dtype import STDtype
 from serenitymojo.io.sharded import ShardedSafeTensors
 from serenitymojo.io.ffi import (
-    sys_system, sys_open, sys_close, sys_pwrite, BytePtr,
+    sys_system, sys_open, sys_close, sys_pwrite, sys_pread, O_RDONLY, BytePtr,
     O_WRONLY, O_CREAT, O_TRUNC,
 )
 
@@ -3221,6 +3221,62 @@ def _zimage_controlnet_main(
         print("RESULT: FAIL (controlnet gates above)")
 
 
+# ── D5 on-demand inline sampling trigger (audit Phase D5) ─────────────────────
+# The server (POST /v1/train/sample) and the GUI's TrainerRuntimeBridge append
+# {"action":"sample","prompt":...} lines to target/serenity_trainer_commands.jsonl.
+# This poll runs at the step boundary (top of the cadence check, AFTER the step's
+# weights/optimizer update, BEFORE any next-step work): offset-tracked tail, so
+# each command fires exactly once. FAIL-SAFE: a missing/unreadable file is False —
+# a broken command channel must never kill a training run. The render invoked is
+# the SAME in-process resident render the cadence path uses (live LoRA + frozen
+# base, its own fixed seed 42) — per-step training seeds derive from k, so an
+# extra render cannot perturb the training trajectory.
+comptime TRAINER_COMMANDS_JSONL = "target/serenity_trainer_commands.jsonl"
+
+
+def _poll_trainer_sample_command(mut offset: Int, silent: Bool = False) -> Int:
+    """Returns the NUMBER of new {"action":"sample"} lines since `offset`,
+    advancing offset to true EOF (loops sys_pread until short read — audit
+    finding #2: a single 64KB chunk both replayed stale lines and starved new
+    ones on a grown file). Detection is per-LINE adjacency of the action:sample
+    tokens (audit #9: separate substring finds false-positived on filenames
+    like sample_prompts.json inside start/save events). silent=True for the
+    startup stale-skip (audit #11: don't print "received" for discarded lines).
+    FAIL-SAFE: any error returns 0 — a broken channel never kills training."""
+    try:
+        var fd = sys_open(String(TRAINER_COMMANDS_JSONL), O_RDONLY, Int32(0))
+        if fd < 0:
+            return 0
+        comptime CHUNK = 65536
+        var buf = alloc[UInt8](CHUNK)
+        var bytes = List[UInt8]()
+        while True:
+            var nread = sys_pread(fd, BytePtr(unsafe_from_address=Int(buf)), CHUNK, offset)
+            if nread <= 0:
+                break
+            for i in range(nread):
+                bytes.append(buf[i])
+            offset += nread
+            if nread < CHUNK:
+                break
+        buf.free()
+        _ = sys_close(fd)
+        if len(bytes) == 0:
+            return 0
+        var s = String(unsafe_from_utf8=bytes)
+        var count = 0
+        for ref line in s.split(String("\n")):
+            var l = String(line)
+            if (l.find(String("\"action\":\"sample\"")) >= 0
+                or l.find(String("\"action\": \"sample\"")) >= 0):
+                count += 1
+                if not silent:
+                    print("[on-demand] sample command received:", l.strip())
+        return count
+    except:
+        return 0
+
+
 def main() raises:
     var a = argv()
     var cfg_path = String(DEFAULT_CONFIG)
@@ -3302,6 +3358,10 @@ def main() raises:
     var cache_dir = zimage_cache_dir_from_train_config(train_cfg)
     var sample_cadence = zimage_sample_cadence_from_train_config(cfg_path, train_cfg)
     var sample_enabled = zimage_sampling_enabled(sample_cadence)
+    # D5 on-demand trigger: start the tail at the CURRENT end of the command
+    # file so stale pre-run commands never fire; a fresh poll below advances it.
+    var cmd_offset = 0
+    _ = _poll_trainer_sample_command(cmd_offset, silent=True)
 
     print("=== Z-Image REAL LoRA training loop ===")
     print("  config:", cfg_path)
@@ -3684,7 +3744,16 @@ def main() raises:
             levers_optimizer_train_after_save(train_cfg, lev_opt)
             saved_this_step = True
             print("[ZImage-lora] save_state step=", k, " path=", state_path)
-        if sample_enabled and should_sample_completed_step(sample_cadence, k):
+        var cadence_due = sample_enabled and should_sample_completed_step(sample_cadence, k)
+        # D5: poll the command channel at the step boundary (weights/optimizer
+        # for step k are final; no next-step RNG has been drawn).
+        var on_demand_n = _poll_trainer_sample_command(cmd_offset)
+        var on_demand_due = on_demand_n > 0
+        if on_demand_due:
+            if on_demand_n > 1:
+                print("[on-demand]", on_demand_n, "requests coalesced into one render (audit #10)")
+            print("[on-demand] rendering live sample at completed_step=", k)
+        if cadence_due:
             if zimage_should_save_before_sample(sample_cadence, k, saved_this_step):
                 # T1.C schedule-free save contract (validation sampling reads
                 # the saved files; eval-bracket the save itself).
@@ -3723,6 +3792,7 @@ def main() raises:
             print(
                 "[cadence] Z-Image sampler is split-process; run request after trainer memory is released",
             )
+        if cadence_due or on_demand_due:
             # ── TRUE in-process sample render DURING training ──
             # Renders a PNG inline from the live LoRA + frozen base (NO second
             # model load), reusing the cached eri sample's REAL `vrtlEri2, ...`
@@ -3851,9 +3921,21 @@ def main() raises:
                     slab = StepSlab(ctx, slab_bytes, slab_count, 256)
                     fwd_slab = StepSlab(ctx, fwd_slab_bytes, fwd_slab_count, 256)
             except e:
-                # NO fallback — gen 1024 or fail loud. Surface the real error and
-                # stop the run; do not mask it with a downgraded 512 render.
-                raise Error(String("[cadence] in-process 1024 sample render FAILED: ") + String(e))
+                # Restore the training slabs freed for the render FIRST — a
+                # failed render must never leave the trainer slab-less (the next
+                # step would crash on the missing StepSlab regardless of policy).
+                slab = StepSlab(ctx, slab_bytes, slab_count, 256)
+                fwd_slab = StepSlab(ctx, fwd_slab_bytes, fwd_slab_count, 256)
+                if on_demand_due and not cadence_due:
+                    # D5 on-demand preview: a preview must NEVER kill a training
+                    # run (a UI "sample now" against an hours-long run). Log loud,
+                    # keep training. (Gate-observed 2026-07-16: 1024 render OOMs
+                    # on the 16GB box mid-LoRA-run; the run must survive that.)
+                    print("[on-demand] render FAILED (run continues):", String(e))
+                else:
+                    # Cadence sampling keeps its fail-loud contract:
+                    # gen 1024 or stop the run; no downgraded 512 masking.
+                    raise Error(String("[cadence] in-process 1024 sample render FAILED: ") + String(e))
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
