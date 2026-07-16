@@ -41,6 +41,9 @@ klein-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/a
 # recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
 # given driver doesn't pull every symbol.
 chroma-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_chroma_real.mojo -o target/serenity_chroma_live_trainer"
+# OneTrainer "#chroma LoRA 24GB" recipe variant of the chroma driver (train_chroma_ot.mojo);
+# -O2 per the measured -O3 mojo-build OOM trap. Same link recipe as the live trainer.
+chroma-ot-trainer-build = "mkdir -p target && mojo build -O2 -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_chroma_ot.mojo -o target/serenity_chroma_ot_trainer"
 # Pulled into serenity-trainer (2026-06-23): the ernie trainer DRIVER now lives
 # here (src/serenity_trainer/trainer/train_ernie_real.mojo) and uses serenitymojo
 # ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
