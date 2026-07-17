@@ -105,12 +105,12 @@ l2p-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/ale
 # recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
 # given driver doesn't pull every symbol.
 hidream-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_hidream_o1_real.mojo -o target/serenity_hidream_live_trainer"
-# Pulled into serenity-trainer (2026-06-23): the ltx2 trainer DRIVER now lives
-# here (src/serenity_trainer/trainer/train_ltx2_real.mojo) and uses serenitymojo
-# ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
-# recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths) — harmless if a
-# given driver doesn't pull every symbol.
-ltx2-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib src/serenity_trainer/trainer/train_ltx2_real.mojo -o target/serenity_ltx2_live_trainer"
+# WIRED to the Phase A production trainer (2026-07-16): the launch binary now
+# builds serenitymojo/training/train_ltx2_av.mojo (musubi-parity video trainer:
+# resume + config-JSON levers) instead of the retired fail-closed train_ltx2_real.
+# It uses serenitymojo as the shared numeric/model lib via -I /home/alex/mojodiffusion;
+# full link recipe mirrors zimage (flash-SDPA shim + cuda mempool rpaths).
+ltx2-live-trainer-build = "mkdir -p target && mojo build -O2 -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib /home/alex/mojodiffusion/serenitymojo/training/train_ltx2_av.mojo -o target/serenity_ltx2_live_trainer"
 # Pulled into serenity-trainer (2026-06-23): the wan22 trainer DRIVER now lives
 # here (src/serenity_trainer/trainer/train_wan22_real.mojo) and uses serenitymojo
 # ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link

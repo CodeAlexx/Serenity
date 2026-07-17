@@ -539,6 +539,27 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
     let mut args: Vec<String> = match p.argv_shape.as_str() {
         "krea2" => vec![cache.clone(), steps.to_string(), cfg_path.clone()],
         "config_runner" => vec![cfg_path.clone(), steps.to_string()],
+        // ltx2 (serenitymojo train_ltx2_av.mojo, Phase A musubi video trainer):
+        // FLAG argv (not positional). --config carries the emitted TrainConfig
+        // (arch dims + loss/LR levers + optimizer); cache/out/mode/steps/save/seed
+        // are flags. The checkpoint is the trainer's DEFAULT_CKPT (== the preset
+        // checkpoint, fp8 dev). Resume (--resume <state>) is appended per-backend.
+        "ltx2" => vec![
+            "--config".into(),
+            cfg_path.clone(),
+            "--dataset_cache_dir".into(),
+            cache.clone(),
+            "--output_dir".into(),
+            workspace.clone(),
+            "--ltx_mode".into(),
+            "video".into(),
+            "--max_steps".into(),
+            steps.to_string(),
+            "--save_every".into(),
+            format!("{}", getu("save_every", 0)),
+            "--seed".into(),
+            format!("{}", getu("seed", 42)),
+        ],
         // shape 3: <stage_dir> <steps> <lr> <rank> <out_dir> - <config.json>
         // (argv wins for steps/lr/rank/out_dir; "-" keeps EMA config-owned)
         "hidream" => vec![
@@ -619,6 +640,12 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             }
             "sd35" => {
                 // sd35 has no start_step slot; a 3rd extra arg makes it fail loud.
+                args.push(state.clone());
+            }
+            "ltx2" => {
+                // train_ltx2_av: --resume <state>; the start step is auto-inferred
+                // from the .state __meta__ (Phase A), so no start_step arg.
+                args.push("--resume".into());
                 args.push(state.clone());
             }
             other => {

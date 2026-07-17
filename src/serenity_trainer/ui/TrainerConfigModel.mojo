@@ -948,16 +948,24 @@ def trainer_ui_apply_model_preset(mut cfg: TrainerUIConfig, prefer_model_type: B
         cfg.lora_alpha = 16.0
         cfg.timestep_shift = 3.0
     elif arch == 9:
-        # LTX-2 AV (video+audio) — NO production trainer yet. The legacy
-        # video-only train_ltx2_real is fail-closed by design; train_ltx2_av is
-        # a readiness contract. Routed to an unwired backend so launch fails
-        # loudly instead of silently running a legacy/unfaithful path.
+        # LTX-2 video — WIRED to serenitymojo train_ltx2_av.mojo (Phase A:
+        # musubi-parity video-mode LoRA trainer with resume + config-JSON levers).
+        # The legacy fail-closed train_ltx2_real is retired from the launch path.
         cfg.backend_target = String("ltx2")
         cfg.model_type_index = 9
         cfg.architecture_index = 9
-        cfg.base_model_name = String("")
+        cfg.base_model_name = String(
+            "/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors")
         cfg.model_arch = String("ltx2_av")
         cfg.frames = String("25")
+        cfg.learning_rate = 0.0001
+        cfg.lora_rank = 32.0
+        cfg.lora_alpha = 32.0
+        cfg.timestep_shift = 1.0
+        # musubi LR default is CONSTANT; the UI scheduler dropdown otherwise
+        # defaults to COSINE. scheduler_options = [COSINE(0), CONSTANT(1),
+        # LINEAR(2)] -> index 1 keeps the ltx2 default-off path constant (C13).
+        cfg.scheduler_index = Int32(1)
     elif arch == 10:
         # Wan2.2-T2V 14B — train_wan22_real exists but its RoPE tables are
         # placeholders ("TODO: replace with wan22_build_rope for real
@@ -1415,6 +1423,35 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
             + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
             + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("ltx2"):
+        # LTX-2 video — serenitymojo train_ltx2_av.mojo (Phase A). Arch dims
+        # verbatim from serenitymojo/configs/ltx2.json (the trainer re-validates
+        # against its comptime geometry). Loss levers (loss_fn/huber_delta/
+        # smooth_l1_beta/min_snr_gamma_flow) mirror klein/zimage; ltx2 ALSO emits
+        # the LR levers lr_scheduler/lr_warmup_steps (which train_ltx2_av routes
+        # through transformers_lr_for_step) — other backends do NOT emit these, so
+        # their JSON stays byte-identical. Defaults (mse / constant / adamw / 0)
+        # keep every lever OFF = C13 byte-identical to the argv-default path.
+        return (
+            String("{\n  \"model_type\": \"ltx2\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
+            + String("  \"validation_prompts_file\": \"\",\n")
+            + String("  \"inner_dim\": 4096,\n  \"in_channels\": 128,\n")
+            + String("  \"joint_attention_dim\": 3840,\n  \"out_channels\": 128,\n")
+            + String("  \"num_double\": 0,\n  \"num_single\": 48,\n")
+            + String("  \"num_heads\": 32,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 16384,\n  \"timestep_dim\": 256,\n")
+            + String("  \"rope_theta\": 10000,\n")
+            + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
+            + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
+            + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
+            + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
+            + String("  \"lr_scheduler\": \"") + trainer_ui_json_escape(cfg.scheduler_label()) + String("\",\n")
+            + String("  \"lr_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
+            + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
             + _runner_recipe_json(cfg)
             + String("}\n")
         )

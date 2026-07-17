@@ -16,11 +16,12 @@ from serenity_trainer.ui.TrainerConfigModel import (
 )
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import (
-    LOSS_FN_MSE, LOSS_FN_HUBER, LOSS_FN_SMOOTH_L1,
+    LOSS_FN_MSE, LOSS_FN_HUBER, LOSS_FN_SMOOTH_L1, LOSS_FN_MAE,
     TRAIN_OPTIMIZER_ADAMW, TRAIN_OPTIMIZER_ADAFACTOR,
     TRAIN_OPTIMIZER_SCHEDULE_FREE_ADAMW, TRAIN_OPTIMIZER_ADAMW_8BIT,
     TRAIN_OPTIMIZER_AUTOMAGIC3,
 )
+from serenitymojo.training.lr_schedule import LR_CONSTANT, LR_COSINE
 
 
 def _check(name: String, cond: Bool, detail: String) raises:
@@ -718,6 +719,110 @@ def _gate_capability_warnings() raises:
                String("token '") + token + String("' absent"))
 
 
+def _gate_ltx2() raises:
+    # LTX-2 video lever delivery (Phase B): ltx2 is config-driven via
+    # serenitymojo train_ltx2_av.mojo, which CONSUMES loss_fn/huber_delta/
+    # smooth_l1_beta/min_snr_gamma_flow + lr_scheduler/lr_warmup_steps +
+    # optimizer from the emitted --config JSON. Default emission keeps every
+    # lever OFF (mse / constant / adamw / 0 = C13); flipped widgets land in
+    # TrainConfig; an ADAFACTOR optimizer is EMITTED + PARSED (present in JSON) so
+    # the trainer's own guard rejects it loudly at launch — the gate asserts
+    # emission+parse, the trainer asserts policy.
+    var ui = TrainerUIConfig()
+    ui.model_type_index = 9  # LTX_2_VIDEO -> ltx2 preset
+    trainer_ui_apply_model_preset(ui, True)
+    _check(String("ltx2-preset"), ui.backend_target == String("ltx2"),
+           String("backend_target=") + ui.backend_target.copy())
+
+    var json0 = trainer_ui_runner_train_config_json(ui)
+    var p0 = String("/tmp/serenity_ui_ltx2_levers_default_gate.json")
+    var f0 = open(p0.copy(), "w")
+    f0.write(json0)
+    f0.close()
+    var c0 = read_model_config(p0.copy())
+    _check(String("ltx2-default"), c0.name == String("ltx2"),
+           String("model_type=") + c0.name.copy())
+    _check(String("ltx2-default"), c0.loss_fn == LOSS_FN_MSE,
+           String("loss_fn=") + String(c0.loss_fn))
+    _check(String("ltx2-default"), _close32(c0.huber_delta, Float32(1.0)),
+           String("huber_delta=") + String(c0.huber_delta))
+    _check(String("ltx2-default"), _close32(c0.smooth_l1_beta, Float32(1.0)),
+           String("smooth_l1_beta=") + String(c0.smooth_l1_beta))
+    _check(String("ltx2-default"), _close32(c0.min_snr_gamma_flow, Float32(0.0)),
+           String("min_snr_gamma_flow=") + String(c0.min_snr_gamma_flow))
+    _check(String("ltx2-default"), c0.optimizer == TRAIN_OPTIMIZER_ADAMW,
+           String("optimizer=") + String(c0.optimizer))
+    # LR lever default OFF: constant + warmup 0 (preset sets scheduler CONSTANT;
+    # the UI dropdown otherwise defaults to COSINE).
+    _check(String("ltx2-default"), c0.lr_scheduler == LR_CONSTANT,
+           String("lr_scheduler=") + String(c0.lr_scheduler))
+    _check(String("ltx2-default"), c0.lr_warmup_steps == 0,
+           String("lr_warmup_steps=") + String(c0.lr_warmup_steps))
+    # arch dims verbatim from serenitymojo/configs/ltx2.json
+    _check(String("ltx2-default"), c0.d_model == 4096,
+           String("inner_dim=") + String(c0.d_model))
+    _check(String("ltx2-default"), c0.num_single == 48,
+           String("num_single=") + String(c0.num_single))
+    _check(String("ltx2-default"), c0.n_heads == 32 and c0.head_dim == 128,
+           String("heads=") + String(c0.n_heads) + String(" head_dim=") + String(c0.head_dim))
+    _check(String("ltx2-default"), c0.in_channels == 128 and c0.out_channels == 128,
+           String("in/out=") + String(c0.in_channels) + String("/") + String(c0.out_channels))
+    _check(String("ltx2-default"), c0.joint_attention_dim == 3840,
+           String("joint_attention_dim=") + String(c0.joint_attention_dim))
+
+    # flipped LOSS lever: mae -> LOSS_FN_MAE
+    ui.loss_fn = String("mae")
+    var jm = trainer_ui_runner_train_config_json(ui)
+    var pm = String("/tmp/serenity_ui_ltx2_mae_gate.json")
+    var fm = open(pm.copy(), "w")
+    fm.write(jm)
+    fm.close()
+    var cm = read_model_config(pm.copy())
+    _check(String("ltx2-mae"), cm.loss_fn == LOSS_FN_MAE,
+           String("loss_fn=") + String(cm.loss_fn))
+
+    # flipped LOSS lever: smooth_l1 with beta (== musubi-huber semantics)
+    ui.loss_fn = String("smooth_l1")
+    ui.smooth_l1_beta = 0.5
+    var js = trainer_ui_runner_train_config_json(ui)
+    var ps = String("/tmp/serenity_ui_ltx2_sl1_gate.json")
+    var fs = open(ps.copy(), "w")
+    fs.write(js)
+    fs.close()
+    var cs = read_model_config(ps.copy())
+    _check(String("ltx2-sl1"), cs.loss_fn == LOSS_FN_SMOOTH_L1,
+           String("loss_fn=") + String(cs.loss_fn))
+    _check(String("ltx2-sl1"), _close32(cs.smooth_l1_beta, Float32(0.5)),
+           String("smooth_l1_beta=") + String(cs.smooth_l1_beta))
+
+    # flipped LR lever: cosine + warmup (reset loss to isolate)
+    ui.loss_fn = String("mse")
+    ui.scheduler_index = Int32(0)  # COSINE
+    ui.learning_rate_warmup_steps = 10.0
+    var jl = trainer_ui_runner_train_config_json(ui)
+    var pl = String("/tmp/serenity_ui_ltx2_cosine_gate.json")
+    var fl = open(pl.copy(), "w")
+    fl.write(jl)
+    fl.close()
+    var cl = read_model_config(pl.copy())
+    _check(String("ltx2-lr-cosine"), cl.lr_scheduler == LR_COSINE,
+           String("lr_scheduler=") + String(cl.lr_scheduler))
+    _check(String("ltx2-lr-cosine"), cl.lr_warmup_steps == 10,
+           String("lr_warmup_steps=") + String(cl.lr_warmup_steps))
+
+    # flipped OPTIMIZER lever: adafactor is EMITTED + PARSED (present); the
+    # trainer's own guard rejects it at launch (policy is the trainer's job).
+    ui.optimizer_index = 3  # ADAFACTOR
+    var jo = trainer_ui_runner_train_config_json(ui)
+    var po = String("/tmp/serenity_ui_ltx2_adafactor_gate.json")
+    var fo = open(po.copy(), "w")
+    fo.write(jo)
+    fo.close()
+    var co = read_model_config(po.copy())
+    _check(String("ltx2-optimizer-adafactor"), co.optimizer == TRAIN_OPTIMIZER_ADAFACTOR,
+           String("optimizer=") + String(co.optimizer))
+
+
 def main() raises:
     print("== runner train config gate ==")
     # model_type option indices: 4=CHROMA_1, 5=ERNIE_IMAGE, 6=ANIMA, 2=SDXL,
@@ -732,6 +837,7 @@ def main() raises:
     _gate_target(1, String("klein"), String("klein"), 4096, 24, 32)
     _gate_klein_levers()
     _gate_zimage_loss_levers()
+    _gate_ltx2()
     _gate_caption_dropout_prob()
     _gate_ema()
     _gate_optimizer_runner()
