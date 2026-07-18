@@ -303,6 +303,19 @@ pub fn validate_config_enums(cfg: &Value) -> Vec<String> {
             out.push(format!("first_frame_conditioning_p = {n} rejected (must be in [0,1])"));
         }
     }
+    // ── LTX2 intrinsic-conditioning set (P5.5) ──────────────────────────────────
+    for k in ["prefix_conditioning_p", "suffix_conditioning_p", "spatial_crop_conditioning_p"] {
+        if let Some(n) = cfg.get(k).and_then(|v| v.as_f64()) {
+            if !(0.0..=1.0).contains(&n) {
+                out.push(format!("{k} = {n} rejected (must be in [0,1])"));
+            }
+        }
+    }
+    if let Some(n) = cfg.get("temporal_boundary").and_then(|v| v.as_i64()) {
+        if n < 1 {
+            out.push(format!("temporal_boundary = {n} rejected (int must be >= 1)"));
+        }
+    }
 
     // nested optimizer object: the reader reads optimizer.optimizer as the tag,
     // and structurally REQUIRES an object (a bare string fails cur.expect('{')).

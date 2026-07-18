@@ -855,6 +855,42 @@ def _gate_ltx2() raises:
     _check(String("ltx2-v2v"), cv.val_reference_cache_dir == String("/tmp/vrefc"),
            String("val_reference_cache_dir=") + cv.val_reference_cache_dir.copy())
 
+    # ── P5.5 intrinsic-conditioning set: default emission OMITS keys (C13 ->
+    #    reader defaults temporal_boundary=8, probs 0); flipped keys round-trip. ──
+    _check(String("ltx2-p55-default"), c0.temporal_boundary == 8,
+           String("temporal_boundary=") + String(c0.temporal_boundary))
+    _check(String("ltx2-p55-default"), c0.prefix_conditioning_p == Float32(0.0),
+           String("prefix_conditioning_p=") + String(c0.prefix_conditioning_p))
+    var uip = TrainerUIConfig()
+    uip.model_type_index = 9
+    trainer_ui_apply_model_preset(uip, True)
+    uip.prefix_conditioning_p = Float32(1.0)
+    uip.suffix_conditioning_p = Float32(0.5)
+    uip.spatial_crop_conditioning_p = Float32(0.25)
+    uip.temporal_boundary = 2
+    uip.spatial_crop_y1 = 64
+    uip.spatial_crop_x1 = 32
+    uip.spatial_crop_y2 = 192
+    uip.spatial_crop_x2 = 256
+    var jp = trainer_ui_runner_train_config_json(uip)
+    var pp = String("/tmp/serenity_ui_ltx2_p55_gate.json")
+    var fp = open(pp.copy(), "w")
+    fp.write(jp)
+    fp.close()
+    var cp = read_model_config(pp.copy())
+    _check(String("ltx2-p55"), _close32(cp.prefix_conditioning_p, Float32(1.0)),
+           String("prefix_conditioning_p=") + String(cp.prefix_conditioning_p))
+    _check(String("ltx2-p55"), _close32(cp.suffix_conditioning_p, Float32(0.5)),
+           String("suffix_conditioning_p=") + String(cp.suffix_conditioning_p))
+    _check(String("ltx2-p55"), _close32(cp.spatial_crop_conditioning_p, Float32(0.25)),
+           String("spatial_crop_conditioning_p=") + String(cp.spatial_crop_conditioning_p))
+    _check(String("ltx2-p55"), cp.temporal_boundary == 2,
+           String("temporal_boundary=") + String(cp.temporal_boundary))
+    _check(String("ltx2-p55"), cp.spatial_crop_y1 == 64 and cp.spatial_crop_x1 == 32
+           and cp.spatial_crop_y2 == 192 and cp.spatial_crop_x2 == 256,
+           String("rect=") + String(cp.spatial_crop_y1) + String(",") + String(cp.spatial_crop_x1)
+           + String(",") + String(cp.spatial_crop_y2) + String(",") + String(cp.spatial_crop_x2))
+
 
 def main() raises:
     print("== runner train config gate ==")

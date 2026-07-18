@@ -283,6 +283,15 @@ struct TrainerUIConfig(Movable):
     var first_frame_conditioning_p: Float32 # 0.0 = off (musubi 0.1)
     var reference_cache_dir: String
     var val_reference_cache_dir: String
+    # LTX2 intrinsic-conditioning set (P5.5); all default-off.
+    var prefix_conditioning_p: Float32
+    var suffix_conditioning_p: Float32
+    var spatial_crop_conditioning_p: Float32
+    var temporal_boundary: Int
+    var spatial_crop_y1: Int
+    var spatial_crop_x1: Int
+    var spatial_crop_y2: Int
+    var spatial_crop_x2: Int
     # T2.B quantized-resident base weights (hidream emission carries it).
     # "OFF" | "fp8_e4m3". Fixed "OFF" default — TODO: dropdown widget; the
     # seam (runner JSON emission) already delivers it end-to-end.
@@ -634,6 +643,14 @@ struct TrainerUIConfig(Movable):
         self.first_frame_conditioning_p = 0.0
         self.reference_cache_dir = String("")
         self.val_reference_cache_dir = String("")
+        self.prefix_conditioning_p = 0.0         # P5.5 intrinsic — all default-off
+        self.suffix_conditioning_p = 0.0
+        self.spatial_crop_conditioning_p = 0.0
+        self.temporal_boundary = 8
+        self.spatial_crop_y1 = 0
+        self.spatial_crop_x1 = 0
+        self.spatial_crop_y2 = 0
+        self.spatial_crop_x2 = 0
         self.quantized_resident = String("OFF")  # T2.B default-off (C13)
         self.loss_scaler = String("NONE")
         self.offset_noise_weight = 0.0
@@ -1485,6 +1502,24 @@ def _ltx2_v2v_json(cfg: TrainerUIConfig) -> String:
         s += String("  \"reference_cache_dir\": \"") + trainer_ui_json_escape(cfg.reference_cache_dir) + String("\",\n")
     if cfg.val_reference_cache_dir != String(""):
         s += String("  \"val_reference_cache_dir\": \"") + trainer_ui_json_escape(cfg.val_reference_cache_dir) + String("\",\n")
+    # P5.5 intrinsic-conditioning set — emit only non-default (C13). temporal_boundary
+    # default is 8 (== the trainer/reader default), so emit only when it differs.
+    if cfg.prefix_conditioning_p != Float32(0.0):
+        s += String("  \"prefix_conditioning_p\": ") + String(cfg.prefix_conditioning_p) + String(",\n")
+    if cfg.suffix_conditioning_p != Float32(0.0):
+        s += String("  \"suffix_conditioning_p\": ") + String(cfg.suffix_conditioning_p) + String(",\n")
+    if cfg.spatial_crop_conditioning_p != Float32(0.0):
+        s += String("  \"spatial_crop_conditioning_p\": ") + String(cfg.spatial_crop_conditioning_p) + String(",\n")
+    if cfg.temporal_boundary != 8:
+        s += String("  \"temporal_boundary\": ") + String(cfg.temporal_boundary) + String(",\n")
+    if cfg.spatial_crop_y1 != 0:
+        s += String("  \"spatial_crop_y1\": ") + String(cfg.spatial_crop_y1) + String(",\n")
+    if cfg.spatial_crop_x1 != 0:
+        s += String("  \"spatial_crop_x1\": ") + String(cfg.spatial_crop_x1) + String(",\n")
+    if cfg.spatial_crop_y2 != 0:
+        s += String("  \"spatial_crop_y2\": ") + String(cfg.spatial_crop_y2) + String(",\n")
+    if cfg.spatial_crop_x2 != 0:
+        s += String("  \"spatial_crop_x2\": ") + String(cfg.spatial_crop_x2) + String(",\n")
     return s
 
 
