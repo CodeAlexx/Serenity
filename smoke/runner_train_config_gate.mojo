@@ -861,6 +861,12 @@ def _gate_ltx2() raises:
            String("temporal_boundary=") + String(c0.temporal_boundary))
     _check(String("ltx2-p55-default"), c0.prefix_conditioning_p == Float32(0.0),
            String("prefix_conditioning_p=") + String(c0.prefix_conditioning_p))
+    # P5.5 unit 2 inpaint: default emission OMITS both keys (C13 -> reader defaults
+    # mask_conditioning_p=0, mask_cache_dir="").
+    _check(String("ltx2-p55-default"), c0.mask_conditioning_p == Float32(0.0),
+           String("mask_conditioning_p=") + String(c0.mask_conditioning_p))
+    _check(String("ltx2-p55-default"), c0.mask_cache_dir == String(""),
+           String("mask_cache_dir=") + c0.mask_cache_dir.copy())
     var uip = TrainerUIConfig()
     uip.model_type_index = 9
     trainer_ui_apply_model_preset(uip, True)
@@ -872,6 +878,8 @@ def _gate_ltx2() raises:
     uip.spatial_crop_x1 = 32
     uip.spatial_crop_y2 = 192
     uip.spatial_crop_x2 = 256
+    uip.mask_conditioning_p = Float32(0.75)
+    uip.mask_cache_dir = String("/tmp/mrefc")
     var jp = trainer_ui_runner_train_config_json(uip)
     var pp = String("/tmp/serenity_ui_ltx2_p55_gate.json")
     var fp = open(pp.copy(), "w")
@@ -890,6 +898,10 @@ def _gate_ltx2() raises:
            and cp.spatial_crop_y2 == 192 and cp.spatial_crop_x2 == 256,
            String("rect=") + String(cp.spatial_crop_y1) + String(",") + String(cp.spatial_crop_x1)
            + String(",") + String(cp.spatial_crop_y2) + String(",") + String(cp.spatial_crop_x2))
+    _check(String("ltx2-p55"), _close32(cp.mask_conditioning_p, Float32(0.75)),
+           String("mask_conditioning_p=") + String(cp.mask_conditioning_p))
+    _check(String("ltx2-p55"), cp.mask_cache_dir == String("/tmp/mrefc"),
+           String("mask_cache_dir=") + cp.mask_cache_dir.copy())
 
 
 def main() raises:

@@ -292,6 +292,9 @@ struct TrainerUIConfig(Movable):
     var spatial_crop_x1: Int
     var spatial_crop_y2: Int
     var spatial_crop_x2: Int
+    # LTX2 inpaint mask-cache conditioning (P5.5 unit 2); default-off.
+    var mask_conditioning_p: Float32
+    var mask_cache_dir: String
     # T2.B quantized-resident base weights (hidream emission carries it).
     # "OFF" | "fp8_e4m3". Fixed "OFF" default — TODO: dropdown widget; the
     # seam (runner JSON emission) already delivers it end-to-end.
@@ -651,6 +654,8 @@ struct TrainerUIConfig(Movable):
         self.spatial_crop_x1 = 0
         self.spatial_crop_y2 = 0
         self.spatial_crop_x2 = 0
+        self.mask_conditioning_p = 0.0           # P5.5 u2 inpaint — default-off
+        self.mask_cache_dir = String("")
         self.quantized_resident = String("OFF")  # T2.B default-off (C13)
         self.loss_scaler = String("NONE")
         self.offset_noise_weight = 0.0
@@ -1520,6 +1525,11 @@ def _ltx2_v2v_json(cfg: TrainerUIConfig) -> String:
         s += String("  \"spatial_crop_y2\": ") + String(cfg.spatial_crop_y2) + String(",\n")
     if cfg.spatial_crop_x2 != 0:
         s += String("  \"spatial_crop_x2\": ") + String(cfg.spatial_crop_x2) + String(",\n")
+    # P5.5 unit 2 inpaint — emit only non-default (C13).
+    if cfg.mask_conditioning_p != Float32(0.0):
+        s += String("  \"mask_conditioning_p\": ") + String(cfg.mask_conditioning_p) + String(",\n")
+    if cfg.mask_cache_dir != String(""):
+        s += String("  \"mask_cache_dir\": \"") + trainer_ui_json_escape(cfg.mask_cache_dir) + String("\",\n")
     return s
 
 

@@ -304,7 +304,14 @@ pub fn validate_config_enums(cfg: &Value) -> Vec<String> {
         }
     }
     // ── LTX2 intrinsic-conditioning set (P5.5) ──────────────────────────────────
-    for k in ["prefix_conditioning_p", "suffix_conditioning_p", "spatial_crop_conditioning_p"] {
+    // mask_conditioning_p is the unit-2 inpaint prob; mask_cache_dir is a path
+    // (unvalidated, like reference_cache_dir).
+    for k in [
+        "prefix_conditioning_p",
+        "suffix_conditioning_p",
+        "spatial_crop_conditioning_p",
+        "mask_conditioning_p",
+    ] {
         if let Some(n) = cfg.get(k).and_then(|v| v.as_f64()) {
             if !(0.0..=1.0).contains(&n) {
                 out.push(format!("{k} = {n} rejected (must be in [0,1])"));
