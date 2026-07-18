@@ -822,6 +822,39 @@ def _gate_ltx2() raises:
     _check(String("ltx2-optimizer-adafactor"), co.optimizer == TRAIN_OPTIMIZER_ADAFACTOR,
            String("optimizer=") + String(co.optimizer))
 
+    # ── IC-LoRA / v2v (P5 (d)): default emission OMITS the keys (C13 -> reader
+    #    struct defaults); flipped widgets round-trip through read_model_config. ──
+    _check(String("ltx2-v2v-default"), c0.ic_lora_strategy == String("auto"),
+           String("ic_lora_strategy=") + c0.ic_lora_strategy.copy())
+    _check(String("ltx2-v2v-default"), c0.reference_downscale == 1,
+           String("reference_downscale=") + String(c0.reference_downscale))
+    _check(String("ltx2-v2v-default"), c0.reference_cache_dir == String(""),
+           String("reference_cache_dir=") + c0.reference_cache_dir.copy())
+    var uiv = TrainerUIConfig()
+    uiv.model_type_index = 9
+    trainer_ui_apply_model_preset(uiv, True)
+    uiv.ic_lora_strategy = String("v2v")
+    uiv.reference_downscale = 2
+    uiv.first_frame_conditioning_p = Float32(0.1)
+    uiv.reference_cache_dir = String("/tmp/refc")
+    uiv.val_reference_cache_dir = String("/tmp/vrefc")
+    var jv = trainer_ui_runner_train_config_json(uiv)
+    var pv = String("/tmp/serenity_ui_ltx2_v2v_gate.json")
+    var fv = open(pv.copy(), "w")
+    fv.write(jv)
+    fv.close()
+    var cv = read_model_config(pv.copy())
+    _check(String("ltx2-v2v"), cv.ic_lora_strategy == String("v2v"),
+           String("ic_lora_strategy=") + cv.ic_lora_strategy.copy())
+    _check(String("ltx2-v2v"), cv.reference_downscale == 2,
+           String("reference_downscale=") + String(cv.reference_downscale))
+    _check(String("ltx2-v2v"), _close32(cv.first_frame_conditioning_p, Float32(0.1)),
+           String("first_frame_conditioning_p=") + String(cv.first_frame_conditioning_p))
+    _check(String("ltx2-v2v"), cv.reference_cache_dir == String("/tmp/refc"),
+           String("reference_cache_dir=") + cv.reference_cache_dir.copy())
+    _check(String("ltx2-v2v"), cv.val_reference_cache_dir == String("/tmp/vrefc"),
+           String("val_reference_cache_dir=") + cv.val_reference_cache_dir.copy())
+
 
 def main() raises:
     print("== runner train config gate ==")

@@ -277,6 +277,12 @@ struct TrainerUIConfig(Movable):
     var loss_fn: String
     var smooth_l1_beta: Float32
     var min_snr_gamma_flow: Float32
+    # LTX2 IC-LoRA / v2v (P5 (d)); all default-off -> emission C13 byte-identical.
+    var ic_lora_strategy: String            # "auto"|"none"|"v2v"|"audio_ref_only_ic"
+    var reference_downscale: Int            # >=1
+    var first_frame_conditioning_p: Float32 # 0.0 = off (musubi 0.1)
+    var reference_cache_dir: String
+    var val_reference_cache_dir: String
     # T2.B quantized-resident base weights (hidream emission carries it).
     # "OFF" | "fp8_e4m3". Fixed "OFF" default — TODO: dropdown widget; the
     # seam (runner JSON emission) already delivers it end-to-end.
@@ -623,6 +629,11 @@ struct TrainerUIConfig(Movable):
         self.loss_fn = String("mse")        # T1.A default-off
         self.smooth_l1_beta = 1.0
         self.min_snr_gamma_flow = 0.0       # 0.0 = off
+        self.ic_lora_strategy = String("auto")   # P5 (d) v2v — all default-off
+        self.reference_downscale = 1
+        self.first_frame_conditioning_p = 0.0
+        self.reference_cache_dir = String("")
+        self.val_reference_cache_dir = String("")
         self.quantized_resident = String("OFF")  # T2.B default-off (C13)
         self.loss_scaler = String("NONE")
         self.offset_noise_weight = 0.0
@@ -1452,10 +1463,29 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + String("  \"lr_scheduler\": \"") + trainer_ui_json_escape(cfg.scheduler_label()) + String("\",\n")
             + String("  \"lr_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
             + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
+            + _ltx2_v2v_json(cfg)
             + _runner_recipe_json(cfg)
             + String("}\n")
         )
     raise Error(String("no runner train config template for backend ") + t)
+
+
+# LTX2 IC-LoRA / v2v (P5 (d)): emit ONLY non-default keys so a default run's JSON
+# is byte-identical (C13). ic_lora_strategy "auto" is the resolve-from-preset
+# default, so it is emitted only when explicitly set to a concrete strategy.
+def _ltx2_v2v_json(cfg: TrainerUIConfig) -> String:
+    var s = String("")
+    if cfg.ic_lora_strategy != String("auto") and cfg.ic_lora_strategy != String(""):
+        s += String("  \"ic_lora_strategy\": \"") + trainer_ui_json_escape(cfg.ic_lora_strategy) + String("\",\n")
+    if cfg.reference_downscale != 1:
+        s += String("  \"reference_downscale\": ") + String(cfg.reference_downscale) + String(",\n")
+    if cfg.first_frame_conditioning_p != Float32(0.0):
+        s += String("  \"first_frame_conditioning_p\": ") + String(cfg.first_frame_conditioning_p) + String(",\n")
+    if cfg.reference_cache_dir != String(""):
+        s += String("  \"reference_cache_dir\": \"") + trainer_ui_json_escape(cfg.reference_cache_dir) + String("\",\n")
+    if cfg.val_reference_cache_dir != String(""):
+        s += String("  \"val_reference_cache_dir\": \"") + trainer_ui_json_escape(cfg.val_reference_cache_dir) + String("\",\n")
+    return s
 
 
 def trainer_ui_ideogram4_levers_set(cfg: TrainerUIConfig) -> Bool:

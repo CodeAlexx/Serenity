@@ -279,6 +279,31 @@ pub fn validate_config_enums(cfg: &Value) -> Vec<String> {
         }
     }
 
+    // ── LTX2 IC-LoRA / v2v (P5 (d)) — mirror train_config_reader.mojo defaults ──
+    if let Some(v) = cfg.get("ic_lora_strategy") {
+        if let Some(s) = v.as_str() {
+            if !matches!(s, "auto" | "none" | "v2v" | "audio_ref_only_ic") {
+                out.push(format!(
+                    "ic_lora_strategy = {s:?} rejected (accepted: auto|none|v2v|audio_ref_only_ic)"
+                ));
+            }
+        }
+    }
+    if let Some(n) = cfg.get("reference_downscale").and_then(|v| v.as_i64()) {
+        if n < 1 {
+            out.push(format!("reference_downscale = {n} rejected (int must be >= 1)"));
+        }
+    }
+    if let Some(n) = cfg
+        .get("first_frame_conditioning_p")
+        .or_else(|| cfg.get("ltx2_first_frame_conditioning_p"))
+        .and_then(|v| v.as_f64())
+    {
+        if !(0.0..=1.0).contains(&n) {
+            out.push(format!("first_frame_conditioning_p = {n} rejected (must be in [0,1])"));
+        }
+    }
+
     // nested optimizer object: the reader reads optimizer.optimizer as the tag,
     // and structurally REQUIRES an object (a bare string fails cur.expect('{')).
     if let Some(v) = cfg.get("optimizer") {
