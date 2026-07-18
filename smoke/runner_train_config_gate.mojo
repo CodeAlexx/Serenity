@@ -867,6 +867,20 @@ def _gate_ltx2() raises:
            String("mask_conditioning_p=") + String(c0.mask_conditioning_p))
     _check(String("ltx2-p55-default"), c0.mask_cache_dir == String(""),
            String("mask_cache_dir=") + c0.mask_cache_dir.copy())
+    # P6.0 AV arm: default emission OMITS all keys (C13 -> reader musubi defaults).
+    _check(String("ltx2-p6-default"), c0.audio_loss_balance_mode == String("none"),
+           String("audio_loss_balance_mode=") + c0.audio_loss_balance_mode.copy())
+    _check(String("ltx2-p6-default"), _close32(c0.audio_loss_balance_beta, Float32(0.01)),
+           String("audio_loss_balance_beta=") + String(c0.audio_loss_balance_beta))
+    _check(String("ltx2-p6-default"), _close32(c0.audio_loss_balance_ema_decay, Float32(0.99)),
+           String("audio_loss_balance_ema_decay=") + String(c0.audio_loss_balance_ema_decay))
+    _check(String("ltx2-p6-default"), _close32(c0.uncertainty_lr, Float32(-1.0)),
+           String("uncertainty_lr=") + String(c0.uncertainty_lr))
+    _check(String("ltx2-p6-default"), c0.min_audio_batches_per_accum == 0,
+           String("min_audio_batches_per_accum=") + String(c0.min_audio_batches_per_accum))
+    _check(String("ltx2-p6-default"), _close32(c0.audio_batch_probability, Float32(-1.0)),
+           String("audio_batch_probability=") + String(c0.audio_batch_probability))
+    _check(String("ltx2-p6-default"), not c0.separate_audio_buckets, String("separate_audio_buckets default"))
     var uip = TrainerUIConfig()
     uip.model_type_index = 9
     trainer_ui_apply_model_preset(uip, True)
@@ -880,6 +894,27 @@ def _gate_ltx2() raises:
     uip.spatial_crop_x2 = 256
     uip.mask_conditioning_p = Float32(0.75)
     uip.mask_cache_dir = String("/tmp/mrefc")
+    # P6.0 AV arm — flip all keys except audio_batch_probability (XOR with the
+    # quota knob below); it is proven in isolation after the main round-trip.
+    uip.audio_loss_balance_mode = String("ema_mag")
+    uip.audio_loss_balance_beta = Float32(0.02)
+    uip.audio_loss_balance_eps = Float32(0.06)
+    uip.audio_loss_balance_min = Float32(0.1)
+    uip.audio_loss_balance_max = Float32(3.0)
+    uip.audio_loss_balance_ema_init = Float32(0.5)
+    uip.audio_loss_balance_target_ratio = Float32(0.4)
+    uip.audio_loss_balance_ema_decay = Float32(0.95)
+    uip.uncertainty_lr = Float32(0.0001)
+    uip.video_caption_dropout_rate = Float32(0.1)
+    uip.audio_caption_dropout_rate = Float32(0.2)
+    uip.separate_audio_buckets = True
+    uip.audio_bucket_strategy = String("truncate")
+    uip.audio_bucket_interval = Float32(1.5)
+    uip.min_audio_batches_per_accum = 2
+    uip.use_audio_length_mask = True
+    uip.audio_ref_use_negative_positions = True
+    uip.audio_ref_mask_cross_attention_to_reference = True
+    uip.audio_ref_mask_reference_from_text_attention = True
     var jp = trainer_ui_runner_train_config_json(uip)
     var pp = String("/tmp/serenity_ui_ltx2_p55_gate.json")
     var fp = open(pp.copy(), "w")
@@ -902,6 +937,54 @@ def _gate_ltx2() raises:
            String("mask_conditioning_p=") + String(cp.mask_conditioning_p))
     _check(String("ltx2-p55"), cp.mask_cache_dir == String("/tmp/mrefc"),
            String("mask_cache_dir=") + cp.mask_cache_dir.copy())
+    # P6.0 AV arm round-trip through the REAL mojodiffusion read_model_config.
+    _check(String("ltx2-p6"), cp.audio_loss_balance_mode == String("ema_mag"),
+           String("audio_loss_balance_mode=") + cp.audio_loss_balance_mode.copy())
+    _check(String("ltx2-p6"), _close32(cp.audio_loss_balance_beta, Float32(0.02)),
+           String("beta=") + String(cp.audio_loss_balance_beta))
+    _check(String("ltx2-p6"), _close32(cp.audio_loss_balance_eps, Float32(0.06)),
+           String("eps=") + String(cp.audio_loss_balance_eps))
+    _check(String("ltx2-p6"), _close32(cp.audio_loss_balance_min, Float32(0.1)),
+           String("min=") + String(cp.audio_loss_balance_min))
+    _check(String("ltx2-p6"), _close32(cp.audio_loss_balance_max, Float32(3.0)),
+           String("max=") + String(cp.audio_loss_balance_max))
+    _check(String("ltx2-p6"), _close32(cp.audio_loss_balance_ema_init, Float32(0.5)),
+           String("ema_init=") + String(cp.audio_loss_balance_ema_init))
+    _check(String("ltx2-p6"), _close32(cp.audio_loss_balance_target_ratio, Float32(0.4)),
+           String("target_ratio=") + String(cp.audio_loss_balance_target_ratio))
+    _check(String("ltx2-p6"), _close32(cp.audio_loss_balance_ema_decay, Float32(0.95)),
+           String("ema_decay=") + String(cp.audio_loss_balance_ema_decay))
+    _check(String("ltx2-p6"), _close32(cp.uncertainty_lr, Float32(0.0001)),
+           String("uncertainty_lr=") + String(cp.uncertainty_lr))
+    _check(String("ltx2-p6"), _close32(cp.video_caption_dropout_rate, Float32(0.1)),
+           String("video_caption_dropout_rate=") + String(cp.video_caption_dropout_rate))
+    _check(String("ltx2-p6"), _close32(cp.audio_caption_dropout_rate, Float32(0.2)),
+           String("audio_caption_dropout_rate=") + String(cp.audio_caption_dropout_rate))
+    _check(String("ltx2-p6"), cp.separate_audio_buckets, String("separate_audio_buckets set"))
+    _check(String("ltx2-p6"), cp.audio_bucket_strategy == String("truncate"),
+           String("audio_bucket_strategy=") + cp.audio_bucket_strategy.copy())
+    _check(String("ltx2-p6"), _close32(cp.audio_bucket_interval, Float32(1.5)),
+           String("audio_bucket_interval=") + String(cp.audio_bucket_interval))
+    _check(String("ltx2-p6"), cp.min_audio_batches_per_accum == 2,
+           String("min_audio_batches_per_accum=") + String(cp.min_audio_batches_per_accum))
+    _check(String("ltx2-p6"), cp.use_audio_length_mask, String("use_audio_length_mask set"))
+    _check(String("ltx2-p6"), cp.audio_ref_use_negative_positions, String("audio_ref_use_negative_positions set"))
+    _check(String("ltx2-p6"), cp.audio_ref_mask_cross_attention_to_reference, String("audio_ref_mask_cross_attention set"))
+    _check(String("ltx2-p6"), cp.audio_ref_mask_reference_from_text_attention, String("audio_ref_mask_reference_from_text set"))
+    # audio_batch_probability (XOR partner) proven in isolation — the trainer's
+    # validate() forbids co-setting it with min_audio_batches_per_accum.
+    var uix = TrainerUIConfig()
+    uix.model_type_index = 9
+    trainer_ui_apply_model_preset(uix, True)
+    uix.audio_batch_probability = Float32(0.5)
+    var jx = trainer_ui_runner_train_config_json(uix)
+    var px = String("/tmp/serenity_ui_ltx2_p6_prob.json")
+    var fx = open(px.copy(), "w")
+    fx.write(jx)
+    fx.close()
+    var cx = read_model_config(px.copy())
+    _check(String("ltx2-p6"), _close32(cx.audio_batch_probability, Float32(0.5)),
+           String("audio_batch_probability=") + String(cx.audio_batch_probability))
 
 
 def main() raises:

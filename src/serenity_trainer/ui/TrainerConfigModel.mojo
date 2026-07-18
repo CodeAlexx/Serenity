@@ -295,6 +295,27 @@ struct TrainerUIConfig(Movable):
     # LTX2 inpaint mask-cache conditioning (P5.5 unit 2); default-off.
     var mask_conditioning_p: Float32
     var mask_cache_dir: String
+    # LTX2 P6 AV (audio) arm (P6.0); musubi defaults -> C13.
+    var audio_loss_balance_mode: String
+    var audio_loss_balance_beta: Float32
+    var audio_loss_balance_eps: Float32
+    var audio_loss_balance_min: Float32
+    var audio_loss_balance_max: Float32
+    var audio_loss_balance_ema_init: Float32
+    var audio_loss_balance_target_ratio: Float32
+    var audio_loss_balance_ema_decay: Float32
+    var uncertainty_lr: Float32
+    var video_caption_dropout_rate: Float32
+    var audio_caption_dropout_rate: Float32
+    var separate_audio_buckets: Bool
+    var audio_bucket_strategy: String
+    var audio_bucket_interval: Float32
+    var min_audio_batches_per_accum: Int
+    var audio_batch_probability: Float32
+    var use_audio_length_mask: Bool
+    var audio_ref_use_negative_positions: Bool
+    var audio_ref_mask_cross_attention_to_reference: Bool
+    var audio_ref_mask_reference_from_text_attention: Bool
     # T2.B quantized-resident base weights (hidream emission carries it).
     # "OFF" | "fp8_e4m3". Fixed "OFF" default — TODO: dropdown widget; the
     # seam (runner JSON emission) already delivers it end-to-end.
@@ -656,6 +677,26 @@ struct TrainerUIConfig(Movable):
         self.spatial_crop_x2 = 0
         self.mask_conditioning_p = 0.0           # P5.5 u2 inpaint — default-off
         self.mask_cache_dir = String("")
+        self.audio_loss_balance_mode = String("none")   # P6.0 AV arm — musubi defaults
+        self.audio_loss_balance_beta = 0.01
+        self.audio_loss_balance_eps = 0.05
+        self.audio_loss_balance_min = 0.05
+        self.audio_loss_balance_max = 4.0
+        self.audio_loss_balance_ema_init = 1.0
+        self.audio_loss_balance_target_ratio = 0.33
+        self.audio_loss_balance_ema_decay = 0.99
+        self.uncertainty_lr = -1.0
+        self.video_caption_dropout_rate = 0.0
+        self.audio_caption_dropout_rate = 0.0
+        self.separate_audio_buckets = False
+        self.audio_bucket_strategy = String("")
+        self.audio_bucket_interval = 0.0
+        self.min_audio_batches_per_accum = 0
+        self.audio_batch_probability = -1.0
+        self.use_audio_length_mask = False
+        self.audio_ref_use_negative_positions = False
+        self.audio_ref_mask_cross_attention_to_reference = False
+        self.audio_ref_mask_reference_from_text_attention = False
         self.quantized_resident = String("OFF")  # T2.B default-off (C13)
         self.loss_scaler = String("NONE")
         self.offset_noise_weight = 0.0
@@ -1530,6 +1571,48 @@ def _ltx2_v2v_json(cfg: TrainerUIConfig) -> String:
         s += String("  \"mask_conditioning_p\": ") + String(cfg.mask_conditioning_p) + String(",\n")
     if cfg.mask_cache_dir != String(""):
         s += String("  \"mask_cache_dir\": \"") + trainer_ui_json_escape(cfg.mask_cache_dir) + String("\",\n")
+    # P6.0 AV (audio) arm — emit only non-default (C13); defaults match the
+    # trainer/reader (musubi: ltx2_train_network.py:6541-6776 + audio_loss_balance.py).
+    if cfg.audio_loss_balance_mode != String("none"):
+        s += String("  \"audio_loss_balance_mode\": \"") + trainer_ui_json_escape(cfg.audio_loss_balance_mode) + String("\",\n")
+    if cfg.audio_loss_balance_beta != Float32(0.01):
+        s += String("  \"audio_loss_balance_beta\": ") + String(cfg.audio_loss_balance_beta) + String(",\n")
+    if cfg.audio_loss_balance_eps != Float32(0.05):
+        s += String("  \"audio_loss_balance_eps\": ") + String(cfg.audio_loss_balance_eps) + String(",\n")
+    if cfg.audio_loss_balance_min != Float32(0.05):
+        s += String("  \"audio_loss_balance_min\": ") + String(cfg.audio_loss_balance_min) + String(",\n")
+    if cfg.audio_loss_balance_max != Float32(4.0):
+        s += String("  \"audio_loss_balance_max\": ") + String(cfg.audio_loss_balance_max) + String(",\n")
+    if cfg.audio_loss_balance_ema_init != Float32(1.0):
+        s += String("  \"audio_loss_balance_ema_init\": ") + String(cfg.audio_loss_balance_ema_init) + String(",\n")
+    if cfg.audio_loss_balance_target_ratio != Float32(0.33):
+        s += String("  \"audio_loss_balance_target_ratio\": ") + String(cfg.audio_loss_balance_target_ratio) + String(",\n")
+    if cfg.audio_loss_balance_ema_decay != Float32(0.99):
+        s += String("  \"audio_loss_balance_ema_decay\": ") + String(cfg.audio_loss_balance_ema_decay) + String(",\n")
+    if cfg.uncertainty_lr != Float32(-1.0):
+        s += String("  \"uncertainty_lr\": ") + String(cfg.uncertainty_lr) + String(",\n")
+    if cfg.video_caption_dropout_rate != Float32(0.0):
+        s += String("  \"video_caption_dropout_rate\": ") + String(cfg.video_caption_dropout_rate) + String(",\n")
+    if cfg.audio_caption_dropout_rate != Float32(0.0):
+        s += String("  \"audio_caption_dropout_rate\": ") + String(cfg.audio_caption_dropout_rate) + String(",\n")
+    if cfg.separate_audio_buckets:
+        s += String("  \"separate_audio_buckets\": true,\n")
+    if cfg.audio_bucket_strategy != String(""):
+        s += String("  \"audio_bucket_strategy\": \"") + trainer_ui_json_escape(cfg.audio_bucket_strategy) + String("\",\n")
+    if cfg.audio_bucket_interval != Float32(0.0):
+        s += String("  \"audio_bucket_interval\": ") + String(cfg.audio_bucket_interval) + String(",\n")
+    if cfg.min_audio_batches_per_accum != 0:
+        s += String("  \"min_audio_batches_per_accum\": ") + String(cfg.min_audio_batches_per_accum) + String(",\n")
+    if cfg.audio_batch_probability != Float32(-1.0):
+        s += String("  \"audio_batch_probability\": ") + String(cfg.audio_batch_probability) + String(",\n")
+    if cfg.use_audio_length_mask:
+        s += String("  \"use_audio_length_mask\": true,\n")
+    if cfg.audio_ref_use_negative_positions:
+        s += String("  \"audio_ref_use_negative_positions\": true,\n")
+    if cfg.audio_ref_mask_cross_attention_to_reference:
+        s += String("  \"audio_ref_mask_cross_attention_to_reference\": true,\n")
+    if cfg.audio_ref_mask_reference_from_text_attention:
+        s += String("  \"audio_ref_mask_reference_from_text_attention\": true,\n")
     return s
 
 

@@ -324,6 +324,91 @@ pub fn validate_config_enums(cfg: &Value) -> Vec<String> {
         }
     }
 
+    // ── LTX2 P6 AV (audio) arm (P6.0) — musubi ranges (ltx2_train_network.py:
+    //    2197-2218) + the XOR fail-loud. Mirrors LTX2TrainerConfig._validate_p6_av.
+    let av_mode = cfg.get("audio_loss_balance_mode").and_then(|v| v.as_str());
+    if let Some(m) = av_mode {
+        if !["none", "inv_freq", "ema_mag", "uncertainty"].contains(&m) {
+            out.push(format!(
+                "audio_loss_balance_mode = {m:?} rejected (must be none|inv_freq|ema_mag|uncertainty)"
+            ));
+        }
+    }
+    if let Some(n) = cfg.get("audio_loss_balance_beta").and_then(|v| v.as_f64()) {
+        if !(n > 0.0 && n <= 1.0) {
+            out.push(format!("audio_loss_balance_beta = {n} rejected (must be in (0, 1])"));
+        }
+    }
+    if let Some(n) = cfg.get("audio_loss_balance_eps").and_then(|v| v.as_f64()) {
+        if n <= 0.0 {
+            out.push(format!("audio_loss_balance_eps = {n} rejected (must be > 0)"));
+        }
+    }
+    if let Some(n) = cfg.get("audio_loss_balance_min").and_then(|v| v.as_f64()) {
+        if n < 0.0 {
+            out.push(format!("audio_loss_balance_min = {n} rejected (must be >= 0)"));
+        }
+    }
+    if let Some(n) = cfg.get("audio_loss_balance_max").and_then(|v| v.as_f64()) {
+        if n <= 0.0 {
+            out.push(format!("audio_loss_balance_max = {n} rejected (must be > 0)"));
+        }
+    }
+    if let (Some(mn), Some(mx)) = (
+        cfg.get("audio_loss_balance_min").and_then(|v| v.as_f64()),
+        cfg.get("audio_loss_balance_max").and_then(|v| v.as_f64()),
+    ) {
+        if mx < mn {
+            out.push(format!(
+                "audio_loss_balance_max = {mx} rejected (must be >= audio_loss_balance_min = {mn})"
+            ));
+        }
+    }
+    if let Some(n) = cfg.get("audio_loss_balance_ema_init").and_then(|v| v.as_f64()) {
+        if av_mode == Some("inv_freq") {
+            if !(n > 0.0 && n <= 1.0) {
+                out.push(format!(
+                    "audio_loss_balance_ema_init = {n} rejected (must be in (0, 1] for inv_freq)"
+                ));
+            }
+        } else if n <= 0.0 {
+            out.push(format!("audio_loss_balance_ema_init = {n} rejected (must be > 0)"));
+        }
+    }
+    if let Some(n) = cfg.get("audio_loss_balance_target_ratio").and_then(|v| v.as_f64()) {
+        if n < 0.0 {
+            out.push(format!("audio_loss_balance_target_ratio = {n} rejected (must be >= 0)"));
+        }
+    }
+    if let Some(n) = cfg.get("audio_loss_balance_ema_decay").and_then(|v| v.as_f64()) {
+        if !(n > 0.0 && n < 1.0) {
+            out.push(format!("audio_loss_balance_ema_decay = {n} rejected (must be in (0, 1))"));
+        }
+    }
+    if let Some(s) = cfg.get("audio_bucket_strategy").and_then(|v| v.as_str()) {
+        if !["pad", "truncate"].contains(&s) {
+            out.push(format!("audio_bucket_strategy = {s:?} rejected (must be pad|truncate)"));
+        }
+    }
+    // XOR (lead-mandated): the quota sampler (min_audio_batches_per_accum > 0) and
+    // the probability sampler (audio_batch_probability set) are mutually exclusive.
+    let has_quota = cfg
+        .get("min_audio_batches_per_accum")
+        .and_then(|v| v.as_i64())
+        .map(|n| n > 0)
+        .unwrap_or(false);
+    let has_prob = cfg
+        .get("audio_batch_probability")
+        .and_then(|v| v.as_f64())
+        .map(|n| n >= 0.0)
+        .unwrap_or(false);
+    if has_quota && has_prob {
+        out.push(
+            "min_audio_batches_per_accum and audio_batch_probability are mutually exclusive (set only one)"
+                .into(),
+        );
+    }
+
     // nested optimizer object: the reader reads optimizer.optimizer as the tag,
     // and structurally REQUIRES an object (a bare string fails cur.expect('{')).
     if let Some(v) = cfg.get("optimizer") {
