@@ -121,11 +121,17 @@ from serenitymojo.training.lora_ema import (
     lora_ema_adapters, ema_path_for_lora,
 )
 from serenitymojo.training.train_config import (
-    TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TrainConfig, GRADIENT_CHECKPOINTING_ON, TRAIN_OPTIMIZER_ADAMW,
     TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
     TRAIN_ADAPTER_ALGO_LOCON, TRAIN_ADAPTER_ALGO_LOHA,
     TRAIN_ADAPTER_ALGO_DORA, TRAIN_ADAPTER_ALGO_LOKR,
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
+)
+from serenitymojo.training.levers import (
+    levers_loss_active, levers_loss_grad, caption_dropout_pick,
+    LeversOptimizerState, levers_optimizer_active, levers_optimizer_validate,
+    levers_optimizer_step_host, levers_optimizer_eval_for_save,
+    levers_optimizer_train_after_save,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
@@ -294,7 +300,24 @@ def validate_anima_train_config(cfg: TrainConfig) raises:
         raise Error("Anima trainer config requires learning_rate > 0")
     if cfg.max_grad_norm <= Float32(0.0):
         raise Error("Anima trainer config requires max_grad_norm > 0")
-    validate_serenity_train_math_policy(cfg, String("Anima trainer"))
+    # T1.C levers optimizer dispatch (P4 wiring): supported non-ADAMW tags are
+    # wired on the plain-LoRA arm only; the shared ADAMW-only loop policy then
+    # runs on a tag-neutralized copy (zimage pattern). optimizer=ADAMW routes
+    # AROUND the levers module entirely (C13 default-off contract).
+    levers_optimizer_validate(cfg, String("Anima trainer"))
+    if levers_optimizer_active(cfg):
+        if (
+            cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA
+            and cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LOCON
+        ):
+            raise Error(
+                "Anima trainer: levers optimizers are wired for the plain-LoRA"
+                " arm only (lora/locon); use optimizer=ADAMW for LyCORIS/direct algos"
+            )
+    var policy_cfg = cfg.copy()
+    if levers_optimizer_active(cfg):
+        policy_cfg.optimizer = TRAIN_OPTIMIZER_ADAMW
+    validate_serenity_train_math_policy(policy_cfg, String("Anima trainer"))
     if cfg.max_steps <= 0:
         raise Error("Anima trainer config requires max_steps > 0")
     if cfg.save_every < 0:
@@ -1110,6 +1133,10 @@ def main() raises:
     # device P/M/V + ONE-TIME pinned staging; lazily initialized on first
     # optimizer use (after any resume load) inside the plain-LoRA arm. ──────────
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    # T1.C levers optimizer state (P4 wiring; default-off => stays empty, no
+    # alloc). Host-only — the per-step anima_lora_set_to_device upload keeps
+    # the host lora.ad mirrors authoritative on the levers arm.
+    var lev_opt = LeversOptimizerState()
     var adamw_state_ready = False
 
     # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
@@ -1215,28 +1242,63 @@ def main() raises:
             # forward (B=2, DEVICE-RESIDENT; LoRA uploaded once per step). ropes.cos/
             # sin are the SINGLE-sample table; the b2 stack doubles them internally
             # (both samples share the same image grid).
+            # T1.D caption dropout (P4 wiring; default-off p<=0 never draws):
+            # per-sample picks on the SEED*31+step stream (indices 2*step+1 /
+            # 2*step+2); a drop zeroes that sample's context half (the zero
+            # uncond conditioning, matching context_uncond).
+            var step_context_b2 = context_b2.copy()
+            if cfg.caption_dropout_prob > Float32(0.0):
+                var n_ctx1 = S_TXT * JOINT
+                if caption_dropout_pick(UInt64(2 * step) + 1, SEED, cfg.caption_dropout_prob):
+                    for i in range(n_ctx1):
+                        step_context_b2[i] = Float32(0.0)
+                if caption_dropout_pick(UInt64(2 * step) + 2, SEED, cfg.caption_dropout_prob):
+                    for i in range(n_ctx1, 2 * n_ctx1):
+                        step_context_b2[i] = Float32(0.0)
             var lora_dev_b2 = anima_lora_set_to_device(lora, STDtype.BF16, ctx)
             var fwd = anima_stack_lora_forward_device_resident_b2[H, Dh, S_IMG, S_TXT](
-                patches_b2.copy(), t_cond_b2.copy(), base_adaln_b2.copy(), context_b2.copy(),
+                patches_b2.copy(), t_cond_b2.copy(), base_adaln_b2.copy(), step_context_b2.copy(),
                 base, res_blocks, lora_dev_b2, ropes.cos, ropes.sin,
                 2, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
             )
             # JOINT 2N-mean MSE: d_out = 2/(2N)*(pred-target); loss = sse/(2N).
             var npred_b2 = len(fwd.out)
-            var sse = Float32(0.0)
             var d_out_b2 = List[Float32]()
             d_out_b2.reserve(npred_b2)
-            var inv_n2 = Float32(2.0) / Float32(npred_b2)
-            for i in range(npred_b2):
-                var diff = fwd.out[i] - target_patches_b2[i]
-                sse += diff * diff
-                d_out_b2.append(inv_n2 * diff)
-            loss = sse / Float32(npred_b2)
+            if levers_loss_active(cfg):
+                # T1.A loss levers (P4): per-sample halves with THEIR sigma
+                # (sigma0/sigma1 for min-snr), each 0.5-scaled — identical
+                # joint 2N-mean chain to the legacy block below.
+                var half_n = npred_b2 // 2
+                var pred0 = List[Float32](); var pred1 = List[Float32]()
+                var tgt0 = List[Float32](); var tgt1 = List[Float32]()
+                for i in range(half_n):
+                    pred0.append(fwd.out[i])
+                    tgt0.append(target_patches_b2[i])
+                for i in range(half_n, npred_b2):
+                    pred1.append(fwd.out[i])
+                    tgt1.append(target_patches_b2[i])
+                var lg0 = levers_loss_grad(pred0, tgt0, sigma0, cfg)
+                var lg1 = levers_loss_grad(pred1, tgt1, sigma1, cfg)
+                loss = Float32(0.5) * (lg0.loss + lg1.loss)
+                for i in range(half_n):
+                    d_out_b2.append(Float32(0.5) * lg0.d_pred[i])
+                for i in range(half_n):
+                    d_out_b2.append(Float32(0.5) * lg1.d_pred[i])
+            else:
+                # C13 default path: the literal legacy joint F32-accum block.
+                var sse = Float32(0.0)
+                var inv_n2 = Float32(2.0) / Float32(npred_b2)
+                for i in range(npred_b2):
+                    var diff = fwd.out[i] - target_patches_b2[i]
+                    sse += diff * diff
+                    d_out_b2.append(inv_n2 * diff)
+                loss = sse / Float32(npred_b2)
             if step == 0:
                 first_loss = loss
             last_loss = loss
             grads = anima_stack_lora_backward_device_resident_b2[H, Dh, S_IMG, S_TXT](
-                d_out_b2, patches_b2.copy(), t_cond_b2.copy(), base_adaln_b2.copy(), context_b2.copy(),
+                d_out_b2, patches_b2.copy(), t_cond_b2.copy(), base_adaln_b2.copy(), step_context_b2.copy(),
                 base, res_blocks, lora_dev_b2, ropes.cos, ropes.sin, fwd,
                 2, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
             )
@@ -1273,10 +1335,19 @@ def main() raises:
             # ── t_embedder: sigma -> (t_cond RAW, base_adaln) ──
             var temb = _prepare_timestep(sigma, base, ctx)
 
+            # ── T1.D caption dropout (P4 wiring; default-off p<=0 never draws):
+            # shared levers pick on the SEED*31+step stream; a drop swaps the
+            # frozen sidecar context for the zero uncond context (the same
+            # zero-context the sampler's CFG uses).
+            var step_context = context.copy()
+            if cfg.caption_dropout_prob > Float32(0.0):
+                if caption_dropout_pick(UInt64(step) + 1, SEED, cfg.caption_dropout_prob):
+                    step_context = context_uncond.copy()
+
             # ── forward (DEVICE-RESIDENT 28-block; LoRA uploaded once per step) ──
             var lora_dev = anima_lora_set_to_device(lora, STDtype.BF16, ctx)
             var fwd = anima_stack_lora_forward_device_resident[H, Dh, S_IMG, S_TXT](
-                patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
+                patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), step_context.copy(),
                 base, res_blocks, lora_dev, ropes.cos, ropes.sin,
                 B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
             )
@@ -1285,15 +1356,22 @@ def main() raises:
             # fwd.out is [B*N, 64] host; read it by reference (fwd is consumed by
             # the backward call below, so we don't bind/copy it out here).
             var npred = len(fwd.out)
-            var sse = Float32(0.0)
             var d_out = List[Float32]()
             d_out.reserve(npred)
-            var inv_n = Float32(2.0) / Float32(npred)
-            for i in range(npred):
-                var diff = fwd.out[i] - target_patches[i]
-                sse += diff * diff
-                d_out.append(inv_n * diff)
-            loss = sse / Float32(npred)
+            if levers_loss_active(cfg):
+                # T1.A loss levers (P4; default-off). Keys absent => the literal
+                # legacy F32-accum MSE block below (C13 anchors unmoved).
+                var lgl = levers_loss_grad(fwd.out, target_patches, sigma, cfg)
+                loss = lgl.loss
+                d_out = lgl.d_pred.copy()
+            else:
+                var sse = Float32(0.0)
+                var inv_n = Float32(2.0) / Float32(npred)
+                for i in range(npred):
+                    var diff = fwd.out[i] - target_patches[i]
+                    sse += diff * diff
+                    d_out.append(inv_n * diff)
+                loss = sse / Float32(npred)
             # Capture loss BEFORE the accumulation block: on a mid-window micro-step
             # the block `continue`s past the rest of the loop, so first_loss/last_loss
             # must be recorded here (every micro-step) or first_loss stays 0.0 when
@@ -1304,7 +1382,7 @@ def main() raises:
 
             # ── backward (streamed) ──
             grads = anima_stack_lora_backward_device_resident[H, Dh, S_IMG, S_TXT](
-                d_out, patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), context.copy(),
+                d_out, patches.copy(), temb.t_cond.copy(), temb.base_adaln.copy(), step_context.copy(),
                 base, res_blocks, lora_dev, ropes.cos, ropes.sin, fwd,
                 B, D, JOINT, F, IN_PATCH, OUT_PATCH, EPS, ctx,
             )
@@ -1393,6 +1471,19 @@ def main() raises:
             lora = anima_oft_carrier_set(oft_masters, D, JOINT, F)
             print("[Anima-oft] step=", completed_step, " master_grad_norm=", Float32(mnorm),
                   " vec_l1=", anima_oft_vec_l1(oft_masters))
+        elif levers_optimizer_active(cfg):
+            # T1.C optimizer lever (P4 wiring; default-off): HOST levers step
+            # (adafactor / schedule-free / adamw8bit / automagic3) on the
+            # lora.ad host mirrors; the per-step anima_lora_set_to_device
+            # upload is still how the device sees the new weights, so no
+            # resident sync is needed.
+            levers_optimizer_step_host(
+                cfg, lora.ad, grads.d_a, grads.d_b, optimizer_step,
+                step_lr, 0, n_adapters, lev_opt,
+            )
+            # T1.B: EMA shadow update post-optimizer (same seam as AdamW arm).
+            if cfg.ema_enabled:
+                ema_update(ema, lora.ad, optimizer_step)
         else:
             # MJ-1070/MJ-1085: resident fused AdamW — persistent device P/M/V
             # with ONE-TIME pinned staging (init lazily after resume load); the
@@ -1439,7 +1530,14 @@ def main() raises:
             print("[Anima-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
         var saved_this_step = False
-        if anima_should_save_checkpoint(cfg, completed_step):
+        # T1.C schedule-free SAVE BRACKET (levers.mojo SAVE CONTRACT): eval-mode
+        # around any weight save / validation sample; no-op for every other
+        # optimizer (and when the levers state is uninitialized).
+        var save_due = anima_should_save_checkpoint(cfg, completed_step)
+        var sample_due = sample_enabled and should_sample_completed_step(sample_cadence, completed_step)
+        if save_due or sample_due:
+            levers_optimizer_eval_for_save(cfg, lev_opt)
+        if save_due:
             var ckpt_path = _step_lora_path(lora_out, completed_step)
             if lokr_active:
                 _ = save_anima_lokr(lokr_masters, ckpt_path, ctx)
@@ -1458,7 +1556,7 @@ def main() raises:
                 print("[checkpoint] saved step=", completed_step, " state=", ckpt_state)
             saved_this_step = True
             _anima_prune_old_checkpoints(cfg, lora_out, completed_step)
-        if sample_enabled and should_sample_completed_step(sample_cadence, completed_step):
+        if sample_due:
             if anima_should_save_before_sample(sample_cadence, completed_step, saved_this_step):
                 var pre_sample_path = _step_lora_path(lora_out, completed_step)
                 if lokr_active:
@@ -1516,6 +1614,9 @@ def main() raises:
                 anima_decode_latent_to_png[LATENT_HW](sample_latent, sample_png, ctx)
             var sample_secs = Float64(perf_counter_ns() - sample_t0) / 1.0e9
             print("[cadence] sample(s) done (", sample_secs, "s)")
+        if save_due or sample_due:
+            # pair of levers_optimizer_eval_for_save — back to train mode.
+            levers_optimizer_train_after_save(cfg, lev_opt)
 
     var t1 = perf_counter_ns()
     var secs = Float64(t1 - t0) / 1.0e9
@@ -1526,6 +1627,9 @@ def main() raises:
           "  delta =", last_loss - first_loss)
 
     # ── final LoRA save (kohya net.blocks.<i>.* keys, rs:1136-1155) ──
+    # T1.C schedule-free SAVE BRACKET for the final save (train loop over — no
+    # train_after pair needed; no-op for non-schedule-free optimizers).
+    levers_optimizer_eval_for_save(cfg, lev_opt)
     if lokr_active:
         var npairs = save_anima_lokr(lokr_masters, lora_out, ctx)
         print("saved", npairs, "LoKr adapter modules to", lora_out)

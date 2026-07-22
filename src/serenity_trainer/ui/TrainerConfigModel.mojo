@@ -1190,12 +1190,21 @@ def trainer_ui_network_algorithm(cfg: TrainerUIConfig) -> String:
 
 
 def trainer_ui_supported_lever_keys(target: String) -> List[String]:
+    # P4 wave (2026-07-22): chroma/ernie/anima/sd35/sdxl/l2p wired the shared
+    # levers seams (train_<m>_real.mojo T1.A/T1.C/T1.D brackets); wave-3
+    # backends added with their CURRENT truths so this table stops being stale.
     var keys = List[String]()
     if (
         target == String("klein")
+        or target == String("klein4b")
         or target == String("zimage")
         or target == String("hidream")
         or target == String("ideogram4")
+        # P4: chroma/ernie/anima now wire the full lever set (T1.B EMA was
+        # already in; T1.A loss, T1.C optimizer, T1.D caption dropout landed).
+        or target == String("chroma")
+        or target == String("ernie")
+        or target == String("anima")
     ):
         keys.append(String("optimizer"))
         keys.append(String("warmup"))
@@ -1204,20 +1213,51 @@ def trainer_ui_supported_lever_keys(target: String) -> List[String]:
         keys.append(String("ema"))
         keys.append(String("caption_dropout"))
         keys.append(String("network_algorithm"))
+    elif target == String("sd35"):
+        # P4: full levers EXCEPT ema (no T1.B shadows in train_sd35_real —
+        # ema keys fail loud there).
+        keys.append(String("optimizer"))
+        keys.append(String("warmup"))
+        keys.append(String("loss_fn"))
+        keys.append(String("min_snr_gamma_flow"))
+        keys.append(String("caption_dropout"))
+        keys.append(String("network_algorithm"))
+    elif target == String("sdxl"):
+        # P4: optimizer + loss_fn only. min_snr_gamma_flow is flow-only (sdxl
+        # is eps-pred DDPM — fails loud); caption_dropout_prob fails loud (sdxl
+        # uses the OT per-encoder text_encoder_*_dropout_prob keys); no ema.
+        keys.append(String("optimizer"))
+        keys.append(String("warmup"))
+        keys.append(String("loss_fn"))
+        keys.append(String("network_algorithm"))
+    elif target == String("l2p"):
+        # P4: optimizer + loss levers + pre-existing ema. No warmup (l2p uses
+        # a constant cfg.lr, no LR schedule); caption_dropout fails loud (cap
+        # pad-token conditioning, zero-uncond unproven).
+        keys.append(String("optimizer"))
+        keys.append(String("loss_fn"))
+        keys.append(String("min_snr_gamma_flow"))
+        keys.append(String("ema"))
+        keys.append(String("network_algorithm"))
     elif target == String("krea2"):
         keys.append(String("optimizer"))
         keys.append(String("warmup"))
         keys.append(String("loss_fn"))
         keys.append(String("min_snr_gamma_flow"))
         keys.append(String("network_algorithm"))
+    elif target == String("mageflow"):
+        # wave-3 truth: loss lever only (train_mageflow_real levers_loss_grad).
+        keys.append(String("loss_fn"))
+        keys.append(String("min_snr_gamma_flow"))
     elif (
-        target == String("chroma")
-        or target == String("ernie")
-        or target == String("anima")
-        or target == String("sdxl")
-        or target == String("l2p")
-        or target == String("qwen")
+        target == String("ltx2")
+        or target == String("wan22")
+        or target == String("wan21")
+        or target == String("flux")
     ):
+        # wave-3 truth: NO levers wired yet in these drivers (P4 later wave).
+        pass
+    elif target == String("qwen"):
         keys.append(String("network_algorithm"))
     return keys^
 

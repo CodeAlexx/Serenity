@@ -96,6 +96,12 @@
   .swatch.sel { border-color:var(--acc); }
   .swatch .dots { display:flex; gap:4px; margin-top:6px; }
   .swatch .dots i { width:16px; height:16px; border-radius:4px; display:block; }
+  /* ── P5 per-model capability layer: disabled = visible but greyed + an inline
+       note saying WHY (never hidden — users should see what exists). ── */
+  input:disabled, select:disabled { opacity:.45; cursor:not-allowed; }
+  .capnote { display:none; color:var(--orange); font-size:11px; margin:2px 0 6px; }
+  .capnote.on { display:block; }
+  .capnote.info { color:var(--dim); }
   #lightbox { display:none; position:fixed; inset:0; background:rgba(0,0,0,.85); z-index:9; align-items:center; justify-content:center; }
   #lightbox img { max-width:92vw; max-height:92vh; border-radius:8px; }
 </style>
@@ -124,7 +130,6 @@
     <a data-sec="backup">Backup</a>
     <a data-sec="cloud">Cloud</a>
     <a data-sec="resume">Resume</a>
-    <a data-sec="cloud">Cloud</a>
     <a data-sec="runs">Runs</a>
     <a data-sec="logs">Logs</a>
     <a data-sec="samples">Samples</a>
@@ -184,10 +189,12 @@
             <div class="row nw"><label>Model Type <span class="nwtag">preset-derived</span></label>
               <select id="model_type"><option>IDEOGRAM_4</option><option selected>FLUX_2</option><option>STABLE_DIFFUSION_XL_10_BASE</option><option>STABLE_DIFFUSION_35</option><option>CHROMA_1</option><option>ERNIE_IMAGE</option><option>ANIMA</option><option>Z_IMAGE</option><option>Z_IMAGE_L2P</option><option>LTX_2_VIDEO</option><option>WAN_22_VIDEO</option><option>HIDREAM_O1</option><option>KREA_2</option><option>WAN_21</option><option>MAGEFLOW</option><option>FLUX_1</option><option>KLEIN_4B</option></select></div>
             <div class="row"><label>Architecture <span class="wtag">wired</span></label><select id="preset"></select></div>
+            <div class="capnote info" id="cap_backend_note"></div>
             <div class="row"><label>Base Model</label><input id="checkpoint"></div>
             <div class="row"><label>VAE (override) <span class="wtag">wired</span></label><input id="vae_override" placeholder="preset default"></div>
             <div class="row"><label>Quantized base <span class="wtag">wired</span></label>
               <select id="quantized_resident"><option value="OFF">off (bf16)</option><option value="fp8_e4m3">fp8_e4m3 (device)</option><option value="fp8_e4m3_host">fp8_e4m3_host</option><option value="streamed_base_opt_in">streamed_base_opt_in</option></select></div>
+            <div class="capnote" id="capnote_quant"></div>
           </div>
           <div>
             <div class="row"><label>Destination</label><input id="workspace_dir" disabled></div>
@@ -236,6 +243,7 @@
         <div class="grid2"><div>
           <div class="row"><label>Cache path <span class="wtag">wired</span></label><input id="cache"></div>
           <div class="row"><label>Caption dropout <span class="wtag">wired</span></label><input id="caption_dropout_prob" type="number" step="0.01" value="0"></div>
+          <div class="capnote" id="capnote_caption"></div>
           <div class="row"><label>Image folder</label><input id="ds_folder" placeholder="/home/alex/1_giger/gigerver3"></div>
           <div class="row"><label></label><button class="btnp" onclick="scanDataset()">Scan folder</button></div>
         </div><div>
@@ -331,6 +339,7 @@
           <div class="row"><label>Weight decay <span class="wtag">wired</span></label><input id="optimizer_weight_decay" type="number" step="0.00001" value="0.01"></div>
           <div class="row"><label>Warmup steps <span class="wtag">wired</span></label><input id="optimizer_warmup_steps" type="number" value="0"></div>
           <div class="row"><label>Max grad norm <span class="wtag">wired</span></label><input id="max_grad_norm" type="number" step="0.1" placeholder="preset"></div>
+          <div class="capnote" id="capnote_optimizer"></div>
         </div><div>
           <div class="row nw"><label>Scheduler <span class="nwtag">not wired</span></label><select><option>COSINE</option><option>CONSTANT</option><option>LINEAR</option></select></div>
           <div class="row nw"><label>Text encoder LR <span class="nwtag">not wired</span></label><input type="number" step="0.00001" value="0.00001"></div>
@@ -358,6 +367,7 @@
         <div class="grid2"><div>
           <div class="row"><label>EMA <span class="wtag">wired</span></label><input id="ema_enabled" type="checkbox"></div>
           <div class="row"><label>EMA decay <span class="wtag">wired</span></label><input id="ema_decay" type="number" step="0.0001" value="0.999"></div>
+          <div class="capnote" id="capnote_ema"></div>
           <div class="row nw"><label>EMA update interval <span class="nwtag">not wired</span></label><input type="number" value="5"></div>
         </div><div>
           <div class="row nw"><label>Train transformer <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
@@ -408,6 +418,7 @@
           <div class="row"><label>Huber delta <span class="wtag">wired</span></label><input id="huber_delta" type="number" step="0.01" placeholder="—"></div>
           <div class="row"><label>SmoothL1 beta <span class="wtag">wired</span></label><input id="smooth_l1_beta" type="number" step="0.01" placeholder="—"></div>
           <div class="row"><label>Min-SNR gamma (flow) <span class="wtag">wired</span></label><input id="min_snr_gamma_flow" type="number" step="0.1" placeholder="off"></div>
+          <div class="capnote" id="capnote_loss"></div>
           <div class="row nw"><label>MSE strength <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="1"></div>
           <div class="row nw"><label>MAE strength <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="0"></div>
         </div><div>
@@ -420,7 +431,8 @@
         </div></div>
       </div>
 
-      <div class="panel"><h3>MASKED TRAINING <span class="nwtag">not wired</span></h3><div class="sub">No runner consumes these — excluded from every launch config (UI_MAP §8.5)</div>
+      <div class="panel" id="panel-masked"><h3>MASKED TRAINING <span class="nwtag">not wired in any runner yet</span></h3><div class="sub">Masked loss is implemented+gated trainer-side but wired into NO runner — dead for every backend, excluded from every launch config (UI_MAP §8.5)</div>
+        <div class="capnote on" id="capnote_masked">masked loss: not wired in any runner yet — controls disabled for every backend</div>
         <div class="grid2"><div>
           <div class="row nw"><label>Masked <span class="nwtag">not wired</span></label><input type="checkbox"></div>
           <div class="row nw"><label>Unmasked probability <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="0"></div>
@@ -449,6 +461,7 @@
         <div class="grid2"><div>
           <div class="row"><label>Sample every <span class="wtag">wired</span></label><input id="sample_every" type="number"></div>
           <div class="row"><label>Prompts file <span class="wtag">wired</span></label><input id="validation_prompts_file" placeholder="preset / config default"></div>
+          <div class="capnote" id="capnote_sampling"></div>
           <div class="row"><label></label><button class="vbtn ghost" onclick="editPromptsFromSampling()">Edit these prompts →</button></div>
         </div><div>
           <div class="row nw"><label>Sample dir <span class="nwtag">not wired</span></label><input placeholder="&lt;workspace&gt;/samples"></div>
@@ -486,17 +499,18 @@
       </div>
     </div>
 
-    <!-- CLOUD -->
+    <!-- CLOUD (single section — the duplicate #sec-cloud block was merged here,
+         P5 DOM fix: two ids broke per-id logic + nav routing) -->
     <div class="sec" id="sec-cloud">
       <div class="panel"><h3>CLOUD <span class="nwtag">not wired</span></h3><div class="sub">Serenity cloud target (RunPod / Linux SSH). Surface-only in both the Mojo UI and here — cloud sync is not implemented (UI_MAP §7).</div>
         <div class="grid2"><div>
-          <div class="row nw"><label>Cloud type <span class="nwtag">not wired</span></label><select><option>NONE</option><option>RUNPOD</option><option>LINUX</option></select></div>
-          <div class="row nw"><label>Host <span class="nwtag">not wired</span></label><input placeholder="ssh host"></div>
-          <div class="row nw"><label>Port <span class="nwtag">not wired</span></label><input value="22"></div>
+          <div class="row nw"><label>Cloud type <span class="nwtag">not wired</span></label><select id="cloud_type" class="nw"><option>NONE</option><option>RUNPOD</option><option>LINUX</option></select></div>
+          <div class="row nw"><label>Host <span class="nwtag">not wired</span></label><input id="cloud_host" class="nw" placeholder="ssh host"></div>
+          <div class="row nw"><label>Port <span class="nwtag">not wired</span></label><input id="cloud_port" class="nw" value="22"></div>
         </div><div>
-          <div class="row nw"><label>User <span class="nwtag">not wired</span></label><input value="root"></div>
-          <div class="row nw"><label>Remote dir <span class="nwtag">not wired</span></label><input value="/workspace/serenity"></div>
-          <div class="row nw"><label>Delete work dir after run <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>User <span class="nwtag">not wired</span></label><input id="cloud_user" class="nw" value="root"></div>
+          <div class="row nw"><label>Remote dir <span class="nwtag">not wired</span></label><input id="cloud_workspace_dir" class="nw" value="/workspace/serenity"></div>
+          <div class="row nw"><label>Delete work dir after run <span class="nwtag">not wired</span></label><input id="cloud_delete_workspace" type="checkbox" class="nw"></div>
         </div></div>
       </div>
       <div class="panel"><h3>SYNC <span class="nwtag">not wired</span></h3><div class="sub">File sync and post-run behavior — UI surface ready, no transport wired</div>
@@ -513,22 +527,7 @@
       <div class="panel"><h3>RESUME</h3><div class="sub">FULL resume needs the .state file path — the PEFT path silently warm-resumes (MJ-1077). Wired for krea2, klein, zimage, sd35 only; other backends refuse resume with a 400. (sd35 has no start-step slot — its start step is auto-probed from the checkpoint.)</div>
         <div class="row"><label>.state file <span class="wtag">wired</span></label><input id="resume_state" placeholder="/path/to/ckpt.safetensors.state"></div>
         <div class="row"><label>Start step <span class="wtag">wired</span></label><input id="start_step" type="number" placeholder="0"></div>
-      </div>
-    </div>
-
-
-    <!-- CLOUD -->
-    <div class="sec" id="sec-cloud">
-      <div class="panel"><h3>CLOUD <span class="nwtag">[surface only — not implemented, matches Mojo UI]</h3><div class="sub">UI_MAP §7: Cloud sync was never implemented in the native UI either</div>
-        <div class="grid2"><div>
-          <div class="row"><label>Cloud type</label><select id="cloud_type" class="nw"><option>NONE</option><option>RUNPOD</option><option>LINUX</option></select></div>
-          <div class="row"><label>Host</label><input id="cloud_host" class="nw"></div>
-          <div class="row"><label>Port</label><input id="cloud_port" class="nw" value="22"></div>
-        </div><div>
-          <div class="row"><label>User</label><input id="cloud_user" class="nw" value="root"></div>
-          <div class="row"><label>Remote dir</label><input id="cloud_workspace_dir" class="nw" value="/workspace/serenity"></div>
-          <div class="row"><label>Delete workspace</label><input id="cloud_delete_workspace" type="checkbox" class="nw"></div>
-        </div></div>
+        <div class="capnote" id="capnote_resume"></div>
       </div>
     </div>
 
@@ -628,7 +627,58 @@ function applyPreset() {
   $("livetarget").textContent = "Live target — " + p.label;
   $("projname").textContent = p.run_name; $("s_backend").textContent = p.label;
   for (const f of RECIPE_FIELDS) if (p.recipe[f] !== undefined) $(f).value = p.recipe[f];
+  applyCapabilities(p);
   $("valid").textContent = p.wired ? "VALIDATION — Ready" : "VALIDATION — backend not wired";
+}
+
+/* ── P5 per-model capability layer: presets.json rows carry a `capabilities`
+   object (source of truth, served through /api/presets). On preset change,
+   controls a backend does not consume are DISABLED (never hidden) with an
+   inline note saying why, and buildLaunchBody skips disabled fields so the
+   emitted config stays clean. Missing capability key = permissive (legacy). ── */
+const CAP_GROUPS = [
+  { key: "optimizer_levers",
+    ids: ["optimizer_name", "optimizer_weight_decay", "optimizer_warmup_steps", "max_grad_norm"],
+    note: "capnote_optimizer",
+    msg: "optimizer levers not wired for this backend — launch uses the trainer's built-in AdamW defaults" },
+  { key: "loss_levers",
+    ids: ["loss_fn", "huber_delta", "smooth_l1_beta", "min_snr_gamma_flow"],
+    note: "capnote_loss",
+    msg: "loss levers not wired for this backend (fixed MSE)" },
+  { key: "ema",
+    ids: ["ema_enabled", "ema_decay", "ema_update_step_interval"],
+    note: "capnote_ema",
+    msg: "EMA hooks are not called by this backend's driver" },
+  { key: "caption_dropout",
+    ids: ["caption_dropout_prob"],
+    note: "capnote_caption",
+    msg: "caption dropout is not read by this backend" },
+  { key: "sampling",
+    ids: ["sample_every", "validation_prompts_file"],
+    note: "capnote_sampling",
+    msg: "sampling disabled for this backend (stripped at launch)" },
+  { key: "resume",
+    ids: ["resume_state", "start_step"],
+    note: "capnote_resume",
+    msg: "resume not supported for this backend" },
+  { key: "quantized_resident",
+    ids: ["quantized_resident"],
+    note: "capnote_quant",
+    msg: "quantized residency is not read by this backend" },
+];
+function applyCapabilities(p) {
+  const caps = (p && p.capabilities) || {};
+  for (const g of CAP_GROUPS) {
+    const off = caps[g.key] === false;
+    for (const id of g.ids) { const el = $(id); if (el) el.disabled = off; }
+    const n = $(g.note);
+    if (n) { n.textContent = off ? g.msg : ""; n.classList.toggle("on", off); }
+  }
+  // masked loss: dead in EVERY runner — panel inputs always disabled + badged
+  document.querySelectorAll("#panel-masked input").forEach(el => el.disabled = true);
+  // per-backend user-facing note (e.g. sd35 FROZEN, flux1dev smoke-blocked)
+  const bn = $("cap_backend_note");
+  if (bn) { bn.textContent = caps.notes || ""; bn.classList.toggle("on", !!caps.notes); }
 }
 $("preset").onchange = applyPreset;
 $("runname_top").oninput = () => { $("projname").textContent = $("runname_top").value;
@@ -638,23 +688,31 @@ $("runname_top").oninput = () => { $("projname").textContent = $("runname_top").
 function buildLaunchBody() {
   const overrides = {};
   for (const f of RECIPE_FIELDS.concat(EXTRA_FIELDS)) {
-    const el = $(f); if (!el) continue;
+    // capability-disabled controls are NOT emitted (P5 emit-list hygiene:
+    // a lever the backend can't consume never reaches the launch config)
+    const el = $(f); if (!el || el.disabled) continue;
     const v = el.type === "checkbox" ? el.checked : el.value;
     if (v !== "" && v !== false) overrides[f] = (el.type === "number") ? parseFloat(v) : v;
   }
   if ($("seed").value !== "") overrides.seed = parseInt($("seed").value);
   // reader keys on the string enum "ema" (train_config_reader _ema_mode_int:
   // OFF|GPU|CPU|EMA); the old bool `ema_enabled` never set the mode -> EMA dead.
-  overrides.ema = $("ema_enabled").checked ? "EMA" : "OFF";
-  if ($("ema_enabled").checked) {
-    overrides.ema_decay = parseFloat($("ema_decay").value);
-    overrides.ema_update_step_interval = parseInt($("ema_update_step_interval").value || "1", 10);
+  if (!$("ema_enabled").disabled) {
+    overrides.ema = $("ema_enabled").checked ? "EMA" : "OFF";
+    if ($("ema_enabled").checked) {
+      overrides.ema_decay = parseFloat($("ema_decay").value);
+      overrides.ema_update_step_interval = parseInt($("ema_update_step_interval").value || "1", 10);
+    }
   }
-  overrides.optimizer = { optimizer: $("optimizer_name").value, weight_decay: parseFloat($("optimizer_weight_decay").value) };
+  if (!$("optimizer_name").disabled) {
+    overrides.optimizer = { optimizer: $("optimizer_name").value, weight_decay: parseFloat($("optimizer_weight_decay").value) };
+  }
   const body = { preset_id: $("preset").value, overrides,
                  cache: $("cache").value || null, run_name: $("runname_top").value || null };
-  if ($("resume_state").value) { body.resume_state = $("resume_state").value;
-                                 body.start_step = parseInt($("start_step").value || "0"); }
+  if ($("resume_state").value && !$("resume_state").disabled) {
+    body.resume_state = $("resume_state").value;
+    body.start_step = parseInt($("start_step").value || "0");
+  }
   return body;
 }
 $("startbtn").onclick = async () => {
@@ -1088,7 +1146,11 @@ async function reattachRun() {
     refreshGallery();
   } catch (e) {}
 }
-loadPresets().then(async () => { await persistLoad(); $("g_runname").value = $("runname_top").value; await reattachRun(); routeHash(); })
+loadPresets().then(async () => { await persistLoad();
+  // persistLoad may restore a different preset selection without firing change —
+  // re-apply the capability gating for whatever preset is now selected (P5).
+  applyCapabilities(PRESETS.find(x => x.id === $("preset").value));
+  $("g_runname").value = $("runname_top").value; await reattachRun(); routeHash(); })
              .catch(e => { $("valid").textContent = "PRESETS FAIL: " + (e.message || e); });
 connectSSE(); pollSystem(); setInterval(pollSystem, 5000);
 </script>

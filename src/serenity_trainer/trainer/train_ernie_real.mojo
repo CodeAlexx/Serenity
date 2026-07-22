@@ -113,11 +113,17 @@ from serenitymojo.models.ernie.ernie_lycoris_stack import (
 )
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.train_config import (
-    TrainConfig,
+    TrainConfig, TRAIN_OPTIMIZER_ADAMW,
     TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
     TRAIN_ADAPTER_ALGO_LOCON, TRAIN_ADAPTER_ALGO_LOHA,
     TRAIN_ADAPTER_ALGO_DORA, TRAIN_ADAPTER_ALGO_LOKR,
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
+)
+from serenitymojo.training.levers import (
+    levers_loss_active, levers_loss_grad, caption_dropout_pick,
+    LeversOptimizerState, levers_optimizer_active, levers_optimizer_validate,
+    levers_optimizer_step_host, levers_optimizer_eval_for_save,
+    levers_optimizer_train_after_save,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
@@ -609,7 +615,24 @@ def validate_ernie_train_config(cfg: TrainConfig) raises:
         raise Error("ERNIE trainer config requires learning_rate > 0")
     if cfg.max_grad_norm <= Float32(0.0):
         raise Error("ERNIE trainer config requires max_grad_norm > 0")
-    validate_serenity_train_math_policy(cfg, String("ERNIE trainer"))
+    # T1.C levers optimizer dispatch (P4 wiring): supported non-ADAMW tags are
+    # wired on the plain-LoRA arm only; the shared ADAMW-only loop policy then
+    # runs on a tag-neutralized copy (zimage pattern). optimizer=ADAMW routes
+    # AROUND the levers module entirely (C13 default-off contract).
+    levers_optimizer_validate(cfg, String("ERNIE trainer"))
+    if levers_optimizer_active(cfg):
+        if (
+            cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA
+            and cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LOCON
+        ):
+            raise Error(
+                "ERNIE trainer: levers optimizers are wired for the plain-LoRA"
+                " arm only (lora/locon); use optimizer=ADAMW for LyCORIS/direct algos"
+            )
+    var policy_cfg = cfg.copy()
+    if levers_optimizer_active(cfg):
+        policy_cfg.optimizer = TRAIN_OPTIMIZER_ADAMW
+    validate_serenity_train_math_policy(policy_cfg, String("ERNIE trainer"))
     if cfg.max_steps <= 0:
         raise Error("ERNIE trainer config requires max_steps > 0")
     if cfg.save_every < 0:
@@ -1069,6 +1092,10 @@ def main() raises:
     # device P/M/V + ONE-TIME pinned staging; lazily initialized on first
     # optimizer use (after any resume load) inside the plain-LoRA GPU arm. ──────
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    # T1.C levers optimizer state (P4 wiring; default-off => stays empty, no
+    # alloc). Host-only — the per-step ernie_lora_set_to_device upload keeps the
+    # host lora.ad mirrors authoritative on the levers arm.
+    var lev_opt = LeversOptimizerState()
     var adamw_state_ready = False
 
     # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
@@ -1108,6 +1135,15 @@ def main() raises:
 
         var img_tokens = _latent_to_img_tokens(latent)                     # [N_IMG, IN_CH]
         var txt_tokens = _text_to_txt_tokens(text, t_cache)                # [N_TXT, TEXT_IN]
+
+        # ── T1.D caption dropout (P4 wiring; default-off p<=0 never draws) ────
+        # Shared levers pick on the SEED*31+step stream (per-sample step index
+        # = pair_lead+1, the same 1-based index the noise stream keys on). A
+        # drop zeroes the caption embeds (uncond conditioning).
+        if train_cfg.caption_dropout_prob > Float32(0.0):
+            if caption_dropout_pick(UInt64(pair_lead) + 1, SEED, train_cfg.caption_dropout_prob):
+                for i in range(len(txt_tokens)):
+                    txt_tokens[i] = Float32(0.0)
 
         # ── per-sample real TEXT length (pre-pad token count). OneTrainer trims
         # text to text_lengths.max() and MASKS padded text in attention; the cache
@@ -1244,6 +1280,12 @@ def main() raises:
                 var t_cache1 = tdims1[1]
                 var img_tokens1 = _latent_to_img_tokens(latent1)
                 var txt_tokens1 = _text_to_txt_tokens(text1, t_cache1)
+                # T1.D caption dropout, pair partner (own per-sample step index
+                # pair_lead+2 on the same SEED*31+step stream; default-off).
+                if train_cfg.caption_dropout_prob > Float32(0.0):
+                    if caption_dropout_pick(UInt64(pair_lead + 1) + 1, SEED, train_cfg.caption_dropout_prob):
+                        for i in range(len(txt_tokens1)):
+                            txt_tokens1[i] = Float32(0.0)
 
                 var real_len1 = N_TXT
                 if cache_has_key(cs1, String("text_real_len")):
@@ -1286,11 +1328,28 @@ def main() raises:
                     real_len, real_len1,
                 )
                 # joint 2N-mean MSE: each per-sample loss/grad halved → summed.
-                var lg0 = _mse_half_loss_grad(fwd_b2.out0, target)
-                var lg1 = _mse_half_loss_grad(fwd_b2.out1, target1)
-                loss = lg0.loss + lg1.loss
+                var d_out0 = List[Float32]()
+                var d_out1 = List[Float32]()
+                if levers_loss_active(train_cfg):
+                    # T1.A loss levers (P4): per-sample levers_loss_grad, each
+                    # half 0.5-scaled — the same joint 2N-mean chain as the
+                    # legacy _mse_half_loss_grad pair below.
+                    var lgl0 = levers_loss_grad(fwd_b2.out0, target, sigma, train_cfg)
+                    var lgl1 = levers_loss_grad(fwd_b2.out1, target1, sigma1, train_cfg)
+                    loss = Float32(0.5) * (lgl0.loss + lgl1.loss)
+                    for i in range(len(lgl0.d_pred)):
+                        d_out0.append(Float32(0.5) * lgl0.d_pred[i])
+                    for i in range(len(lgl1.d_pred)):
+                        d_out1.append(Float32(0.5) * lgl1.d_pred[i])
+                else:
+                    # C13 default path: the literal legacy halved-MSE pair.
+                    var lg0 = _mse_half_loss_grad(fwd_b2.out0, target)
+                    var lg1 = _mse_half_loss_grad(fwd_b2.out1, target1)
+                    loss = lg0.loss + lg1.loss
+                    d_out0 = lg0.d_out.copy()
+                    d_out1 = lg1.d_out.copy()
                 grads = ernie_stack_lora_backward_resident_device_b2[H, Dh, N_IMG, N_TXT, S](
-                    lg0.d_out, lg1.d_out,
+                    d_out0, d_out1,
                     noisy_tokens.copy(), txt_tokens.copy(),
                     noisy_tokens1.copy(), txt_tokens1.copy(),
                     base, blocks, lora_dev, mv, mv1,
@@ -1306,10 +1365,19 @@ def main() raises:
                     D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
                     real_len,
                 )
-                var lg = _mse_loss_grad(fwd.out, target)
-                loss = lg.loss
+                var d_out_b1 = List[Float32]()
+                if levers_loss_active(train_cfg):
+                    # T1.A loss levers (P4; default-off). Keys absent => the
+                    # literal legacy _mse_loss_grad below (C13 anchors unmoved).
+                    var lgl = levers_loss_grad(fwd.out, target, sigma, train_cfg)
+                    loss = lgl.loss
+                    d_out_b1 = lgl.d_pred.copy()
+                else:
+                    var lg = _mse_loss_grad(fwd.out, target)
+                    loss = lg.loss
+                    d_out_b1 = lg.d_out.copy()
                 grads = ernie_stack_lora_backward_resident_device[H, Dh, N_IMG, N_TXT, S](
-                    lg.d_out, noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
+                    d_out_b1, noisy_tokens.copy(), txt_tokens.copy(), base, blocks, lora_dev, mv,
                     f_scale.copy(), f_shift.copy(), rope[0], rope[1], fwd,
                     D, F, IN_CH, TEXT_IN, OUT_CH, EPS, ctx,
                     real_len,
@@ -1362,6 +1430,19 @@ def main() raises:
                 lora = ernie_loha_carrier_set(loha_masters, D, F)
                 print("[Ernie-loha] step=", done_step, " master_grad_norm=", Float32(mnorm),
                       " zero_leg_l1=", ernie_loha_zero_leg_l1(loha_masters))
+            elif levers_optimizer_active(train_cfg):
+                # T1.C optimizer lever (P4 wiring; default-off): HOST levers
+                # step (adafactor / schedule-free / adamw8bit / automagic3) on
+                # the lora.ad host mirrors; the per-step ernie_lora_set_to_device
+                # upload is still how the device sees the new weights, so no
+                # resident sync is needed.
+                levers_optimizer_step_host(
+                    train_cfg, lora.ad, grads.d_a, grads.d_b,
+                    optimizer_step, step_lr, 0, len(lora.ad), lev_opt,
+                )
+                # T1.B: EMA shadow update post-optimizer (same seam as AdamW arm).
+                if train_cfg.ema_enabled:
+                    ema_update(ema, lora.ad, optimizer_step)
             else:
                 comptime if ERNIE_GPU_ADAMW:
                     # MJ-1070/MJ-1085: RESIDENT fused plain-AdamW over the whole
@@ -1412,6 +1493,17 @@ def main() raises:
 
         var saved_this_step = False
         var saved_lora_path = String("")
+
+        # T1.C schedule-free SAVE BRACKET (levers.mojo SAVE CONTRACT): eval-mode
+        # around any weight save / validation sample; no-op for every other
+        # optimizer (and when the levers state is uninitialized).
+        var save_or_sample_due = (
+            (mode == String("resume_smoke") and done_step == 10)
+            or ernie_should_save_checkpoint(train_cfg, done_step)
+            or (sample_enabled and should_sample_completed_step(sample_cadence, done_step))
+        )
+        if save_or_sample_due:
+            levers_optimizer_eval_for_save(train_cfg, lev_opt)
 
         if mode == String("resume_smoke") and done_step == 10:
             var smoke_lora = _step_lora_path(save_path, done_step)
@@ -1468,6 +1560,9 @@ def main() raises:
                 var cadence_state = _state_path_for_lora(cadence_lora)
                 lora = load_ernie_lora_state(NUM_LAYERS, train_cfg.lora_rank, train_cfg.lora_alpha, cadence_state, ctx)
                 print("[Ernie-lora] resume_state step=", done_step, " path=", cadence_state)
+        if save_or_sample_due:
+            # pair of levers_optimizer_eval_for_save — back to train mode.
+            levers_optimizer_train_after_save(train_cfg, lev_opt)
 
     # ── final adapter growth report + save ──
     var b_sum = Float64(0.0)
@@ -1493,6 +1588,9 @@ def main() raises:
     elif oft_active:
         print("[Ernie-oft-direct] vec L1 after training =", flat_direct_oft_vec_l1(direct_oft),
               " (init ", carrier_zero_init, ")")
+    # T1.C schedule-free SAVE BRACKET for the final save (train loop over — no
+    # train_after pair needed; no-op for non-schedule-free optimizers).
+    levers_optimizer_eval_for_save(train_cfg, lev_opt)
     _save_adapter_for_algo(
         lora, lokr_masters, loha_masters, dora_masters, oft_masters,
         direct_dora, direct_oft,

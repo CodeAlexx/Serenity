@@ -142,6 +142,12 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_BOFT,
     TRAIN_ADAPTER_ALGO_LOCON,
 )
+from serenitymojo.training.levers import (
+    levers_loss_active, levers_loss_grad,
+    LeversOptimizerState, levers_optimizer_active, levers_optimizer_validate,
+    levers_optimizer_step_host, levers_optimizer_eval_for_save,
+    levers_optimizer_train_after_save,
+)
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.grad_accum import (
@@ -329,6 +335,28 @@ def validate_l2p_train_config(cfg: TrainConfig) raises:
             "inline sampling not wired for l2p; remove validation_prompts_file"
             " or use the standalone sampler"
         )
+    # T1.C levers optimizer dispatch (P4 wiring): supported non-ADAMW tags
+    # (ADAFACTOR / ADAMW_8BIT / SCHEDULE_FREE_ADAMW / AUTOMAGIC3) are wired on
+    # the plain-LoRA arm only. Before this, l2p never validated the optimizer
+    # tag — a non-ADAMW config silently trained AdamW.
+    levers_optimizer_validate(cfg, String("L2P trainer"))
+    if levers_optimizer_active(cfg):
+        if (
+            cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA
+            and cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LOCON
+        ):
+            raise Error(
+                "L2P trainer: levers optimizers are wired for the plain-LoRA"
+                " arm only (lora/locon); use optimizer=ADAMW for LyCORIS/direct algos"
+            )
+    # T1.D caption dropout is NOT wired for l2p (the cap pad token, not a zero
+    # vector, is the pad conditioning — a zero uncond is unproven here): fail
+    # loud rather than silently ignore the key.
+    if cfg.caption_dropout_prob > Float32(0.0):
+        raise Error(
+            "L2P trainer: caption_dropout_prob is not wired for l2p;"
+            " remove the key"
+        )
 
 
 def _global_norm_l2p(grads: ZImageLoraGrads, start: Int, end: Int) -> Float64:
@@ -455,6 +483,8 @@ def _train_one_step_l2p(
     mut micro_in_window: Int,
     mut adamw_dev_state: Optional[LoraAdamWPlainDeviceState],
     mut adamw_state_ready: Bool,
+    train_cfg: TrainConfig,
+    mut lev_opt: LeversOptimizerState,
     train_start_ns: UInt,
     ctx: DeviceContext,
 ) raises -> L2PStepResult:
@@ -609,16 +639,31 @@ def _train_one_step_l2p(
     var d_pred_h = List[Float32]()
     for _ in range(npix):
         d_pred_h.append(Float32(0.0))
-    var sse = 0.0
-    var inv_n = Float32(2.0) / Float32(npix)
-    for i in range(npix):
-        var pred = -pred_h[i]
-        var target = noise_pix[i] - pix_h[i]
-        var diff = pred - target
-        sse += Float64(diff) * Float64(diff)
-        # dL/d(decoder_out) = dL/dpred * dpred/d(decoder_out) = (2/N)*diff * (-1)
-        d_pred_h[i] = -inv_n * diff
-    var loss = Float32(sse / Float64(npix))
+    var loss: Float32
+    if levers_loss_active(train_cfg):
+        # T1.A loss levers (P4; default-off). pred = -decoder_out chain gives
+        # d(decoder_out) = -d_pred (the legacy -inv_n*diff). Keys absent =>
+        # the literal legacy MSE block below (C13 anchors unmoved).
+        var pred_vals = List[Float32]()
+        var tgt_vals = List[Float32]()
+        for i in range(npix):
+            pred_vals.append(-pred_h[i])
+            tgt_vals.append(noise_pix[i] - pix_h[i])
+        var lgl = levers_loss_grad(pred_vals, tgt_vals, sigma, train_cfg)
+        loss = lgl.loss
+        for i in range(npix):
+            d_pred_h[i] = -lgl.d_pred[i]
+    else:
+        var sse = 0.0
+        var inv_n = Float32(2.0) / Float32(npix)
+        for i in range(npix):
+            var pred = -pred_h[i]
+            var target = noise_pix[i] - pix_h[i]
+            var diff = pred - target
+            sse += Float64(diff) * Float64(diff)
+            # dL/d(decoder_out) = dL/dpred * dpred/d(decoder_out) = (2/N)*diff * (-1)
+            d_pred_h[i] = -inv_n * diff
+        loss = Float32(sse / Float64(npix))
     var d_pred_t = Tensor.from_host(d_pred_h^, [1, PIX_C, PIX_H, PIX_W], STDtype.F32, ctx)
     var t_loss = perf_counter_ns()
 
@@ -780,16 +825,33 @@ def _train_one_step_l2p(
             micro_in_window = 0
             var opt_idx = ((k - 1) // accum_steps) + 1
             gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
-            _l2p_step_adamw_resident(
-                adamw_dev_state, adamw_state_ready, lora, grads, opt_idx, step_lr,
-                beta1, beta2, optimizer_eps, weight_decay, ctx,
-            )
+            if levers_optimizer_active(train_cfg):
+                # T1.C optimizer lever (P4 wiring; default-off): HOST levers
+                # step on the main-window lora.ad mirrors; the per-step
+                # zimage_lora_set_to_device upload keeps the host set
+                # authoritative, so no resident sync is needed.
+                levers_optimizer_step_host(
+                    train_cfg, lora.ad, grads.d_a, grads.d_b, opt_idx, step_lr,
+                    TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL, lev_opt,
+                )
+            else:
+                _l2p_step_adamw_resident(
+                    adamw_dev_state, adamw_state_ready, lora, grads, opt_idx, step_lr,
+                    beta1, beta2, optimizer_eps, weight_decay, ctx,
+                )
         else:
             gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
-            _l2p_step_adamw_resident(
-                adamw_dev_state, adamw_state_ready, lora, grads, k, step_lr,
-                beta1, beta2, optimizer_eps, weight_decay, ctx,
-            )
+            if levers_optimizer_active(train_cfg):
+                # T1.C optimizer lever (P4 wiring; default-off): see above.
+                levers_optimizer_step_host(
+                    train_cfg, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+                    TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL, lev_opt,
+                )
+            else:
+                _l2p_step_adamw_resident(
+                    adamw_dev_state, adamw_state_ready, lora, grads, k, step_lr,
+                    beta1, beta2, optimizer_eps, weight_decay, ctx,
+                )
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()
@@ -877,6 +939,8 @@ def _train_one_step_l2p_b2(
     weight_decay: Float32,
     mut adamw_dev_state: Optional[LoraAdamWPlainDeviceState],
     mut adamw_state_ready: Bool,
+    train_cfg: TrainConfig,
+    mut lev_opt: LeversOptimizerState,
     train_start_ns: UInt,
     ctx: DeviceContext,
 ) raises -> L2PStepResult:
@@ -1047,23 +1111,48 @@ def _train_one_step_l2p_b2(
     for _ in range(npix):
         d_pred0_h.append(Float32(0.0))
         d_pred1_h.append(Float32(0.0))
-    var sse0 = 0.0
-    var sse1 = 0.0
-    for i in range(npix):
-        var pred = -pred_h0[i]
-        var target = noise_pix0[i] - pix_h0[i]
-        var diff = pred - target
-        sse0 += Float64(diff) * Float64(diff)
-        d_pred0_h[i] = -inv_n_b2 * diff
-    for i in range(npix):
-        var pred = -pred_h1[i]
-        var target = noise_pix1[i] - pix_h1[i]
-        var diff = pred - target
-        sse1 += Float64(diff) * Float64(diff)
-        d_pred1_h[i] = -inv_n_b2 * diff
-    var mse0 = Float32(sse0 / Float64(npix))
-    var mse1 = Float32(sse1 / Float64(npix))
-    var loss = Float32((sse0 + sse1) / Float64(2 * npix))
+    var mse0: Float32
+    var mse1: Float32
+    var loss: Float32
+    if levers_loss_active(train_cfg):
+        # T1.A loss levers (P4): per-sample levers_loss_grad with THAT sample's
+        # sigma, each 0.5-scaled (inv_n_b2 = 0.5 * b1's 2/npix) — the same
+        # joint 2N-mean chain as the legacy block below; pred = -decoder_out
+        # gives d(decoder_out) = -d_pred.
+        var pred0 = List[Float32](); var tgt0 = List[Float32]()
+        var pred1 = List[Float32](); var tgt1 = List[Float32]()
+        for i in range(npix):
+            pred0.append(-pred_h0[i])
+            tgt0.append(noise_pix0[i] - pix_h0[i])
+            pred1.append(-pred_h1[i])
+            tgt1.append(noise_pix1[i] - pix_h1[i])
+        var lg0 = levers_loss_grad(pred0, tgt0, sigma0, train_cfg)
+        var lg1 = levers_loss_grad(pred1, tgt1, sigma1, train_cfg)
+        mse0 = lg0.loss
+        mse1 = lg1.loss
+        loss = Float32(0.5) * (lg0.loss + lg1.loss)
+        for i in range(npix):
+            d_pred0_h[i] = -Float32(0.5) * lg0.d_pred[i]
+            d_pred1_h[i] = -Float32(0.5) * lg1.d_pred[i]
+    else:
+        # C13 default path: the literal legacy joint 2N-mean block.
+        var sse0 = 0.0
+        var sse1 = 0.0
+        for i in range(npix):
+            var pred = -pred_h0[i]
+            var target = noise_pix0[i] - pix_h0[i]
+            var diff = pred - target
+            sse0 += Float64(diff) * Float64(diff)
+            d_pred0_h[i] = -inv_n_b2 * diff
+        for i in range(npix):
+            var pred = -pred_h1[i]
+            var target = noise_pix1[i] - pix_h1[i]
+            var diff = pred - target
+            sse1 += Float64(diff) * Float64(diff)
+            d_pred1_h[i] = -inv_n_b2 * diff
+        mse0 = Float32(sse0 / Float64(npix))
+        mse1 = Float32(sse1 / Float64(npix))
+        loss = Float32((sse0 + sse1) / Float64(2 * npix))
     var d_pred_t0 = Tensor.from_host(d_pred0_h^, [1, PIX_C, PIX_H, PIX_W], STDtype.F32, ctx)
     var d_pred_t1 = Tensor.from_host(d_pred1_h^, [1, PIX_C, PIX_H, PIX_W], STDtype.F32, ctx)
     var t_loss = perf_counter_ns()
@@ -1095,10 +1184,19 @@ def _train_one_step_l2p_b2(
 
     # ── clip + optimize (main adapters only; one optimizer step per b2 step) ──
     var gn_before = _clip_l2p(grads, max_grad_norm, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
-    _l2p_step_adamw_resident(
-        adamw_dev_state, adamw_state_ready, lora, grads, k, step_lr,
-        beta1, beta2, optimizer_eps, weight_decay, ctx,
-    )
+    if levers_optimizer_active(train_cfg):
+        # T1.C optimizer lever (P4 wiring; default-off): HOST levers step on
+        # the main-window lora.ad mirrors (per-step device upload keeps the
+        # host set authoritative — no resident sync needed).
+        levers_optimizer_step_host(
+            train_cfg, lora.ad, grads.d_a, grads.d_b, k, step_lr,
+            TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL, lev_opt,
+        )
+    else:
+        _l2p_step_adamw_resident(
+            adamw_dev_state, adamw_state_ready, lora, grads, k, step_lr,
+            beta1, beta2, optimizer_eps, weight_decay, ctx,
+        )
     var t_opt = perf_counter_ns()
 
     var t1 = perf_counter_ns()
@@ -1428,6 +1526,10 @@ def main() raises:
         train_cfg.ema_decay, train_cfg.ema_min_decay,
         train_cfg.ema_update_after_step, train_cfg.ema_update_step_interval,
     )
+    # T1.C levers optimizer state (P4 wiring; default-off => stays empty, no
+    # alloc). Host-only — the per-step zimage_lora_set_to_device upload keeps
+    # the host lora.ad mirrors authoritative on the levers arm.
+    var lev_opt = LeversOptimizerState()
     if train_cfg.ema_enabled and not carrier_active and not direct_active:
         var ema_base = lora_ema_track(ema, lora.ad, TRAIN_ADAPTER_START, N_ADAPTERS_TOTAL)
         if ema_base != 0:
@@ -1454,6 +1556,7 @@ def main() raises:
                 nr_blocks, cr_blocks, main_blocks, lora,
                 step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
                 adamw_dev_state, adamw_state_ready,
+                train_cfg, lev_opt,
                 train_start, ctx,
             )
         else:
@@ -1468,6 +1571,7 @@ def main() raises:
                 step_lr, max_grad_norm, beta1, beta2, optimizer_eps, weight_decay,
                 accum_steps, acc_a, acc_b, micro_in_window,
                 adamw_dev_state, adamw_state_ready,
+                train_cfg, lev_opt,
                 train_start, ctx,
             )
         if k == start_step + 1:
@@ -1508,6 +1612,9 @@ def main() raises:
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         _ = sys_system(String("mkdir -p ") + String(LORA_DIR))
         var lora_out = String(LORA_DIR) + String("/l2p_lora_step") + String(run_steps) + String(".safetensors")
+        # T1.C schedule-free SAVE BRACKET for the final save (train loop over —
+        # no train_after pair needed; no-op for non-schedule-free optimizers).
+        levers_optimizer_eval_for_save(train_cfg, lev_opt)
         if lokr_active:
             var nmods = save_zimage_lokr(lokr_masters, lora_out, ctx)
             print("[L2P-lokr] saved:", lora_out, " modules=", nmods)

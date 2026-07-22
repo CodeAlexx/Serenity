@@ -65,7 +65,7 @@ from serenitymojo.models.sdxl.sdxl_unet_stack_lora import (
     save_sdxl_lora, save_sdxl_lora_state, sdxl_lora_prefixes,
 )
 from serenitymojo.models.sdxl.lora_block import SDXL_SLOTS
-from serenitymojo.training.train_step import LoraGrads, _lora_adamw
+from serenitymojo.training.train_step import LoraGrads, LoraAdapter, _lora_adamw
 from serenitymojo.training.flat_lycoris_stack import (
     FlatLoKrSet, empty_flat_lokr_set, build_flat_lokr_set,
     FlatLoKrGrads,
@@ -119,8 +119,14 @@ from serenitymojo.training.serenity_trainer_train_loop_policy import (
     validate_serenity_lora_adamw_loop_policy,
     validate_serenity_train_math_policy,
 )
+from serenitymojo.training.levers import (
+    levers_loss_active, levers_loss_grad,
+    LeversOptimizerState, levers_optimizer_active, levers_optimizer_validate,
+    levers_optimizer_step_host, levers_optimizer_eval_for_save,
+    levers_optimizer_train_after_save,
+)
 from serenitymojo.training.train_config import (
-    TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TrainConfig, GRADIENT_CHECKPOINTING_ON, TRAIN_OPTIMIZER_ADAMW,
     TRAIN_ADAPTER_ALGO_LORA,
     TRAIN_ADAPTER_ALGO_FULL,
     TRAIN_ADAPTER_ALGO_LOHA,
@@ -305,8 +311,41 @@ def validate_sdxl_train_config(cfg: TrainConfig) raises:
         raise Error("SDXL trainer requires learning_rate > 0")
     if not _close_f32(cfg.max_grad_norm, CLIP):
         raise Error("SDXL trainer max_grad_norm does not match compiled constant")
-    validate_serenity_lora_adamw_loop_policy(cfg, String("SDXL trainer"))
-    validate_serenity_train_math_policy(cfg, String("SDXL trainer"))
+    if cfg.ema_enabled:
+        raise Error(
+            "SDXL trainer: EMA shadows are not wired for this driver;"
+            " remove the ema keys or use a driver with T1.B wired"
+        )
+    if cfg.caption_dropout_prob > Float32(0.0):
+        raise Error(
+            "SDXL trainer: caption_dropout_prob is not wired for sdxl — use the"
+            " OT per-encoder keys text_encoder_dropout_prob /"
+            " text_encoder_2_dropout_prob instead"
+        )
+    if cfg.min_snr_gamma_flow > Float32(0.0):
+        raise Error(
+            "SDXL trainer: min_snr_gamma_flow is a FLOW-match weight; sdxl is"
+            " eps-pred DDPM (no flow sigma) — remove the key"
+        )
+    # T1.C levers optimizer dispatch (P4 wiring): supported non-ADAMW tags are
+    # wired on the plain-LoRA arm only; the shared ADAMW-only loop policy then
+    # runs on a tag-neutralized copy (zimage pattern). optimizer=ADAMW routes
+    # AROUND the levers module entirely (C13 default-off contract).
+    levers_optimizer_validate(cfg, String("SDXL trainer"))
+    if levers_optimizer_active(cfg):
+        if (
+            cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA
+            and cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LOCON
+        ):
+            raise Error(
+                "SDXL trainer: levers optimizers are wired for the plain-LoRA"
+                " arm only (lora/locon); use optimizer=ADAMW for LyCORIS/direct algos"
+            )
+    var policy_cfg = cfg.copy()
+    if levers_optimizer_active(cfg):
+        policy_cfg.optimizer = TRAIN_OPTIMIZER_ADAMW
+    validate_serenity_lora_adamw_loop_policy(policy_cfg, String("SDXL trainer"))
+    validate_serenity_train_math_policy(policy_cfg, String("SDXL trainer"))
     validate_serenity_gradient_checkpointing_policy(
         cfg, String("SDXL trainer"), SERENITY_GRAD_POLICY_ON_ONLY
     )
@@ -494,6 +533,45 @@ def _adamw_all(
                 sets[s].ad[i], lg, t, lr, ctx,
                 beta1, beta2, eps, weight_decay,
             )
+
+
+def _levers_all(
+    cfg: TrainConfig,
+    mut sets: List[SdxlLoraSet],
+    g: SdxlRealGrads,
+    t: Int,
+    step_lr: Float32,
+    mut st: LeversOptimizerState,
+) raises:
+    """T1.C levers-optimizer sibling of _adamw_all (P4 wiring): flatten the
+    N_ST per-set adapter lists into ONE list (stable set-major order), run one
+    shared levers host step over it, and write the stepped a/b back. Copy cost
+    is LoRA-sized and levers-path-only (the default AdamW path never calls
+    this). _adamw_all's skip-empty-grads semantics are NOT supported here —
+    an empty group would desync the per-adapter levers state, so fail loud."""
+    var flat = List[LoraAdapter]()
+    var fa = List[List[Float32]]()
+    var fb = List[List[Float32]]()
+    for s in range(N_ST):
+        var n = sets[s].num_blocks * SDXL_SLOTS
+        for i in range(n):
+            if len(g.d_a[s][i]) == 0 or len(g.d_b[s][i]) == 0:
+                raise Error(
+                    String("SDXL levers optimizer: empty grad group at set ")
+                    + String(s) + String(" adapter ") + String(i)
+                    + String(" — skip-empty is only supported on the AdamW arm")
+                )
+            flat.append(sets[s].ad[i].copy())
+            fa.append(g.d_a[s][i].copy())
+            fb.append(g.d_b[s][i].copy())
+    levers_optimizer_step_host(cfg, flat, fa, fb, t, step_lr, 0, len(flat), st)
+    var idx = 0
+    for s in range(N_ST):
+        var n = sets[s].num_blocks * SDXL_SLOTS
+        for i in range(n):
+            sets[s].ad[i].a = flat[idx].a.copy()
+            sets[s].ad[i].b = flat[idx].b.copy()
+            idx += 1
 
 
 def _sdxl_slot_in(slot: Int, C: Int, Cctx: Int, Cff: Int) -> Int:
@@ -1030,6 +1108,11 @@ def main() raises:
     if use_grad_accum and carrier_active:
         raise Error("SDXL: grad_accum_steps>1 not wired for LyCORIS (lokr/loha/dora/oft) this wave")
 
+    # T1.C levers optimizer state (P4 wiring; default-off => stays empty, no
+    # alloc). ONE shared state over the flattened N_ST adapter lists — see
+    # _levers_all. Host-only; the per-step forward consumes the host sets.
+    var lev_opt = LeversOptimizerState()
+
     if dora_active or oft_active:
         var projected_bytes = _sdxl_full_delta_carrier_bytes_estimate(train_cfg.lokr_targets)
         _require_sdxl_carrier_runtime_vram(
@@ -1345,18 +1428,37 @@ def main() raises:
 
         # ── target ε in NHWC order (noise is NCHW; convert index) ──
         # NHWC flat idx (h,w,c) -> NCHW idx (c,h,w). loss in NHWC space; d_loss NHWC.
-        var sse = 0.0
         var d_loss_nhwc = List[Float32]()
-        var inv_n = Float32(2.0) / Float32(N_LAT)
-        for hh in range(LATENT_HW):
-            for ww in range(LATENT_HW):
-                for c in range(4):
-                    var nhwc_i = (hh * LATENT_HW + ww) * 4 + c
-                    var nchw_i = (c * LATENT_HW + hh) * LATENT_HW + ww
-                    var diff = pred_nhwc_h[nhwc_i] - noise[nchw_i]
-                    sse += Float64(diff) * Float64(diff)
-                    d_loss_nhwc.append(inv_n * diff)
-        var loss = Float32(sse / Float64(N_LAT))
+        var loss: Float32
+        if levers_loss_active(train_cfg):
+            # T1.A loss levers (P4; default-off): pred/target staged in NHWC
+            # order, same index mapping as the legacy block below. sigma is a
+            # FLOW-only min-snr input; validate fails loud on
+            # min_snr_gamma_flow>0 for sdxl (eps-pred DDPM), so 0.0 is inert.
+            var pred_vals = List[Float32]()
+            var tgt_vals = List[Float32]()
+            for hh in range(LATENT_HW):
+                for ww in range(LATENT_HW):
+                    for c in range(4):
+                        var nhwc_i = (hh * LATENT_HW + ww) * 4 + c
+                        var nchw_i = (c * LATENT_HW + hh) * LATENT_HW + ww
+                        pred_vals.append(pred_nhwc_h[nhwc_i])
+                        tgt_vals.append(noise[nchw_i])
+            var lgl = levers_loss_grad(pred_vals, tgt_vals, Float32(0.0), train_cfg)
+            loss = lgl.loss
+            d_loss_nhwc = lgl.d_pred.copy()
+        else:
+            var sse = 0.0
+            var inv_n = Float32(2.0) / Float32(N_LAT)
+            for hh in range(LATENT_HW):
+                for ww in range(LATENT_HW):
+                    for c in range(4):
+                        var nhwc_i = (hh * LATENT_HW + ww) * 4 + c
+                        var nchw_i = (c * LATENT_HW + hh) * LATENT_HW + ww
+                        var diff = pred_nhwc_h[nhwc_i] - noise[nchw_i]
+                        sse += Float64(diff) * Float64(diff)
+                        d_loss_nhwc.append(inv_n * diff)
+            loss = Float32(sse / Float64(N_LAT))
         if k == 1:
             first_loss = loss
         last_loss = loss
@@ -1504,6 +1606,13 @@ def main() raises:
                 lora[s].ad = carriers^
             print("[SDXL-oft] step=", k, " master_grad_norm=", Float32(gn_before),
                   " vec_l1=", flat_oft_vec_l1(oft_sets[0]))
+        elif levers_optimizer_active(train_cfg):
+            # T1.C optimizer lever (P4 wiring; default-off): shared levers host
+            # step over the flattened N_ST adapter lists (_levers_all); the
+            # per-step forward consumes the host sets, so no resident sync is
+            # needed.
+            gn_before = _clip(grads, train_cfg.max_grad_norm)
+            _levers_all(train_cfg, lora, grads, optimizer_step, step_lr, lev_opt)
         else:
             gn_before = _clip(grads, train_cfg.max_grad_norm)
             _adamw_all(
@@ -1555,7 +1664,14 @@ def main() raises:
             print("[SDXL-lora] warning nonfinite_lora_grads=", grads.nonfinite)
 
         var saved_this_step = False
-        if sdxl_should_save_checkpoint(train_cfg, k):
+        # T1.C schedule-free SAVE BRACKET (levers.mojo SAVE CONTRACT): eval-mode
+        # around any weight save / validation sample; no-op for every other
+        # optimizer (and when the levers state is uninitialized).
+        var save_due = sdxl_should_save_checkpoint(train_cfg, k)
+        var sample_due = sample_enabled and should_sample_completed_step(sample_cadence, k)
+        if save_due or sample_due:
+            levers_optimizer_eval_for_save(train_cfg, lev_opt)
+        if save_due:
             var prefixes = sdxl_st_prefixes()
             for s in range(N_ST):
                 var save_path = sdxl_output_lora_path_for_st(train_cfg, k, s)
@@ -1573,7 +1689,7 @@ def main() raises:
                     _ = save_sdxl_lora_state(lora[s], prefixes[s], state_path, ctx)
             saved_this_step = True
             print("[SDXL-lycoris] save step=", k, " per-ST files=", N_ST)
-        if sample_enabled and should_sample_completed_step(sample_cadence, k):
+        if sample_due:
             if sdxl_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var sample_prefixes = sdxl_st_prefixes()
                 for s in range(N_ST):
@@ -1616,6 +1732,9 @@ def main() raises:
                 _sdxl_run_sample(
                     w, lora, context, y, sample_vae_path, samples_dir, k, ctx,
                 )
+        if save_due or sample_due:
+            # pair of levers_optimizer_eval_for_save — back to train mode.
+            levers_optimizer_train_after_save(train_cfg, lev_opt)
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
@@ -1643,6 +1762,9 @@ def main() raises:
               "; loss", first_loss, "->", last_loss,
               (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         # save each ST's adapters under its real prefix (kohya-loadable PEFT).
+        # T1.C schedule-free SAVE BRACKET for the final save (train loop over —
+        # no train_after pair needed; no-op for non-schedule-free optimizers).
+        levers_optimizer_eval_for_save(train_cfg, lev_opt)
         var prefixes = sdxl_st_prefixes()
         for s in range(N_ST):
             var save_path = sdxl_output_lora_path_for_st(train_cfg, run_steps, s)

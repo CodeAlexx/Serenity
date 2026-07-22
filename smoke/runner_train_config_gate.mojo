@@ -635,8 +635,9 @@ def _gate_capability_warnings() raises:
            trainer_ui_ignored_lever_summary(def_cfg) == String(""),
            String("summary='") + trainer_ui_ignored_lever_summary(def_cfg) + String("'"))
 
-    # chroma + optimizer/EMA/dropout flips -> all named (its trainer consumes
-    # none of them; measured zero ema_enabled/caption_dropout_prob/levers hits)
+    # P4 (2026-07-22): chroma now WIRES optimizer/EMA/dropout/loss levers
+    # (train_chroma_real.mojo T1.A/T1.C/T1.D seams) -> the same flips that
+    # used to be named must now warn about NOTHING.
     var ch = TrainerUIConfig()
     ch.model_type_index = 4  # CHROMA_1
     trainer_ui_apply_model_preset(ch, True)
@@ -645,13 +646,30 @@ def _gate_capability_warnings() raises:
     ch.caption_dropout = 0.1
     ch.loss_fn = String("huber")
     var s_ch = trainer_ui_ignored_lever_summary(ch)
-    _check(String("cap-chroma-named"),
-           _contains(s_ch, String("chroma ignores: "))
-           and _contains(s_ch, String("optimizer"))
-           and _contains(s_ch, String("ema"))
-           and _contains(s_ch, String("caption_dropout"))
-           and _contains(s_ch, String("loss_fn")),
+    _check(String("cap-chroma-silent-p4"),
+           s_ch == String(""),
            String("summary='") + s_ch + String("'"))
+
+    # sdxl still ignores ema + caption_dropout (per-TE keys instead) +
+    # min_snr_gamma_flow (eps-pred DDPM) -> those flips are NAMED, while the
+    # now-wired optimizer/loss_fn levers are NOT.
+    var sx = TrainerUIConfig()
+    sx.model_type_index = 2  # STABLE_DIFFUSION_XL_10_BASE
+    trainer_ui_apply_model_preset(sx, True)
+    sx.optimizer_index = 3  # ADAFACTOR (wired -> silent)
+    sx.loss_fn = String("huber")  # wired -> silent
+    sx.ema_mode = String("EMA")
+    sx.caption_dropout = 0.1
+    sx.min_snr_gamma_flow = 5.0
+    var s_sx = trainer_ui_ignored_lever_summary(sx)
+    _check(String("cap-sdxl-named-p4"),
+           _contains(s_sx, String("sdxl ignores: "))
+           and _contains(s_sx, String("ema"))
+           and _contains(s_sx, String("caption_dropout"))
+           and _contains(s_sx, String("min_snr_gamma_flow"))
+           and (not _contains(s_sx, String("optimizer")))
+           and (not _contains(s_sx, String("loss_fn"))),
+           String("summary='") + s_sx + String("'"))
 
     # klein consumes all six levers -> same flips warn about NOTHING
     var kl = TrainerUIConfig()

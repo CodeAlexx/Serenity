@@ -114,6 +114,12 @@ from serenitymojo.training.lora_ema import (
     LoraEmaState, lora_ema_track, ema_update,
     lora_ema_adapters, ema_path_for_lora,
 )
+from serenitymojo.training.levers import (
+    levers_loss_active, levers_loss_grad, caption_dropout_pick,
+    LeversOptimizerState, levers_optimizer_active, levers_optimizer_validate,
+    levers_optimizer_step_host, levers_optimizer_eval_for_save,
+    levers_optimizer_train_after_save,
+)
 from serenitymojo.training.sample_prompt_config import (
     SampleCadence, read_sample_cadence_config,
     validate_step_sample_cadence, should_sample_completed_step,
@@ -137,7 +143,7 @@ from serenitymojo.training.serenity_trainer_train_loop_policy import (
     validate_serenity_train_math_policy,
 )
 from serenitymojo.training.train_config import (
-    TrainConfig, GRADIENT_CHECKPOINTING_ON,
+    TrainConfig, GRADIENT_CHECKPOINTING_ON, TRAIN_OPTIMIZER_ADAMW,
     TRAIN_ADAPTER_ALGO_LORA, TRAIN_ADAPTER_ALGO_FULL,
     TRAIN_ADAPTER_ALGO_LOCON, TRAIN_ADAPTER_ALGO_LOHA,
     TRAIN_ADAPTER_ALGO_DORA, TRAIN_ADAPTER_ALGO_LOKR,
@@ -306,7 +312,25 @@ def validate_chroma_train_config(cfg: TrainConfig) raises:
         raise Error("Chroma trainer timestep_shift does not match compiled constant")
     if not _close_f32(cfg.max_grad_norm, CLIP_GRAD_NORM):
         raise Error("Chroma trainer max_grad_norm does not match compiled constant")
-    validate_serenity_train_math_policy(cfg, String("Chroma trainer"))
+    # T1.C levers optimizer dispatch (P4 wiring): supported non-ADAMW tags
+    # (ADAFACTOR / ADAMW_8BIT / SCHEDULE_FREE_ADAMW / AUTOMAGIC3) are wired on
+    # the plain-LoRA arm only; the shared ADAMW-only loop policy then runs on a
+    # tag-neutralized copy (zimage pattern). optimizer=ADAMW routes AROUND the
+    # levers module entirely (C13 default-off contract).
+    levers_optimizer_validate(cfg, String("Chroma trainer"))
+    if levers_optimizer_active(cfg):
+        if (
+            cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LORA
+            and cfg.adapter_algo != TRAIN_ADAPTER_ALGO_LOCON
+        ):
+            raise Error(
+                "Chroma trainer: levers optimizers are wired for the plain-LoRA"
+                " arm only (lora/locon); use optimizer=ADAMW for LyCORIS/direct algos"
+            )
+    var policy_cfg = cfg.copy()
+    if levers_optimizer_active(cfg):
+        policy_cfg.optimizer = TRAIN_OPTIMIZER_ADAMW
+    validate_serenity_train_math_policy(policy_cfg, String("Chroma trainer"))
     validate_serenity_gradient_checkpointing_policy(
         cfg, String("Chroma trainer"), SERENITY_GRAD_POLICY_ON_ONLY
     )
@@ -986,6 +1010,12 @@ def main() raises:
     # Persistent device P/M/V + ONE-TIME pinned staging; lazily initialized on
     # first optimizer use (after any resume load) inside the plain-LoRA arm. ────
     var adamw_dev_state = Optional[LoraAdamWPlainDeviceState](None)
+    # T1.C levers optimizer state (P4 wiring; default-off => stays empty, no
+    # alloc). Covers the WHOLE flat lora.ad list ([0, len)); host-only — the
+    # per-step device forward re-uploads the host set, so no resident sync is
+    # needed (klein4b non-resident pattern) and the fused resident AdamW state
+    # above is never initialized on the levers arm.
+    var lev_opt = LeversOptimizerState()
     var adamw_state_ready = False
 
     # ── T1.B EMA (default-off; SimpleTuner EMAModel — training/lora_ema.mojo).
@@ -1082,6 +1112,16 @@ def main() raises:
             else:
                 for _ in range(TXT_CH):
                     txt_tokens.append(Float32(0.0))
+
+        # ── T1.D caption dropout (P4 wiring; default-off p<=0 never draws) ────
+        # Shared levers pick on the SEED_BASE*31+step stream (distinct from the
+        # sigma SEED_BASE+step and noise SEED_BASE*7919+step streams). A drop
+        # swaps the caption embeds for the zero (uncond) conditioning — the same
+        # zero vector the sampler uses as UNCOND.
+        if train_cfg.caption_dropout_prob > Float32(0.0):
+            if caption_dropout_pick(step_seed, SEED_BASE, train_cfg.caption_dropout_prob):
+                for i in range(len(txt_tokens)):
+                    txt_tokens[i] = Float32(0.0)
 
         # ── VAE shift/scale then pack_latents ──
         for i in range(len(lat_raw)):
@@ -1259,6 +1299,12 @@ def main() raises:
                 else:
                     for _ in range(TXT_CH):
                         txt_tokens1.append(Float32(0.0))
+            # T1.D caption dropout, sample-1 (own step_seed1 draw on the same
+            # SEED_BASE*31+step stream; default-off p<=0 never draws).
+            if train_cfg.caption_dropout_prob > Float32(0.0):
+                if caption_dropout_pick(step_seed1, SEED_BASE, train_cfg.caption_dropout_prob):
+                    for i in range(len(txt_tokens1)):
+                        txt_tokens1[i] = Float32(0.0)
             for i in range(len(lat_raw1)):
                 lat_raw1[i] = (lat_raw1[i] - VAE_SHIFT) * VAE_SCALE
             var latent_packed1 = _pack_latents(lat_raw1)
@@ -1288,19 +1334,31 @@ def main() raises:
                 D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
             )
             var nout = len(fwd.out0)
-            var inv_n = Float32(2.0) / Float32(nout)
-            var sse0 = 0.0
-            var sse1 = 0.0
             var d_out0 = List[Float32]()
             var d_out1 = List[Float32]()
-            for i in range(nout):
-                var diff0 = fwd.out0[i] - target[i]
-                var diff1 = fwd.out1[i] - target1[i]
-                sse0 += Float64(diff0) * Float64(diff0)
-                sse1 += Float64(diff1) * Float64(diff1)
-                d_out0.append(Float32(0.5) * inv_n * diff0)
-                d_out1.append(Float32(0.5) * inv_n * diff1)
-            loss = Float32(0.5) * (Float32(sse0 / Float64(nout)) + Float32(sse1 / Float64(nout)))
+            if levers_loss_active(train_cfg):
+                # T1.A loss levers (P4): per-sample levers_loss_grad, each half
+                # 0.5-scaled so the b2 backward's in-GEMM SUM = the 2-sample
+                # batch MEAN (identical chain to the legacy block below).
+                var lg0 = levers_loss_grad(fwd.out0, target, sig, train_cfg)
+                var lg1 = levers_loss_grad(fwd.out1, target1, sig1, train_cfg)
+                loss = Float32(0.5) * (lg0.loss + lg1.loss)
+                for i in range(nout):
+                    d_out0.append(Float32(0.5) * lg0.d_pred[i])
+                    d_out1.append(Float32(0.5) * lg1.d_pred[i])
+            else:
+                # C13 default path: the literal legacy joint-mean MSE block.
+                var inv_n = Float32(2.0) / Float32(nout)
+                var sse0 = 0.0
+                var sse1 = 0.0
+                for i in range(nout):
+                    var diff0 = fwd.out0[i] - target[i]
+                    var diff1 = fwd.out1[i] - target1[i]
+                    sse0 += Float64(diff0) * Float64(diff0)
+                    sse1 += Float64(diff1) * Float64(diff1)
+                    d_out0.append(Float32(0.5) * inv_n * diff0)
+                    d_out1.append(Float32(0.5) * inv_n * diff1)
+                loss = Float32(0.5) * (Float32(sse0 / Float64(nout)) + Float32(sse1 / Float64(nout)))
             grads = chroma_stack_lora_backward_device_offload_b2[H, Dh, N_IMG, N_TXT, S](
                 d_out0, d_out1, base, loader, lora, cos.copy(), sin.copy(), fwd,
                 D, FMLP, IN_CH, TXT_CH, OUT_CH, EPS, ctx,
@@ -1313,13 +1371,20 @@ def main() raises:
             )
             var nout = len(fwd.out)
             var d_loss = List[Float32]()
-            var sse = 0.0
-            var inv_n = Float32(2.0) / Float32(nout)
-            for i in range(nout):
-                var diff = fwd.out[i] - target[i]
-                sse += Float64(diff) * Float64(diff)
-                d_loss.append(inv_n * diff)
-            loss = Float32(sse / Float64(nout))
+            if levers_loss_active(train_cfg):
+                # T1.A loss levers (P4; default-off). Keys absent => the literal
+                # legacy MSE block below (C13 anchors unmoved).
+                var lg = levers_loss_grad(fwd.out, target, sig, train_cfg)
+                loss = lg.loss
+                d_loss = lg.d_pred.copy()
+            else:
+                var sse = 0.0
+                var inv_n = Float32(2.0) / Float32(nout)
+                for i in range(nout):
+                    var diff = fwd.out[i] - target[i]
+                    sse += Float64(diff) * Float64(diff)
+                    d_loss.append(inv_n * diff)
+                loss = Float32(sse / Float64(nout))
             grads = chroma_stack_lora_backward_device_offload[H, Dh, N_IMG, N_TXT, S](
                 d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
                 cos.copy(), sin.copy(), fwd,
@@ -1333,13 +1398,19 @@ def main() raises:
             )
             var nout = len(fwd.out)
             var d_loss = List[Float32]()
-            var sse = 0.0
-            var inv_n = Float32(2.0) / Float32(nout)
-            for i in range(nout):
-                var diff = fwd.out[i] - target[i]
-                sse += Float64(diff) * Float64(diff)
-                d_loss.append(inv_n * diff)
-            loss = Float32(sse / Float64(nout))
+            if levers_loss_active(train_cfg):
+                # T1.A loss levers (P4; default-off) — host-stack oracle arm.
+                var lg = levers_loss_grad(fwd.out, target, sig, train_cfg)
+                loss = lg.loss
+                d_loss = lg.d_pred.copy()
+            else:
+                var sse = 0.0
+                var inv_n = Float32(2.0) / Float32(nout)
+                for i in range(nout):
+                    var diff = fwd.out[i] - target[i]
+                    sse += Float64(diff) * Float64(diff)
+                    d_loss.append(inv_n * diff)
+                loss = Float32(sse / Float64(nout))
             grads = chroma_stack_lora_backward_offload[H, Dh, N_IMG, N_TXT, S](
                 d_loss, noisy.copy(), txt_tokens.copy(), base, loader, lora,
                 cos.copy(), sin.copy(), fwd,
@@ -1409,6 +1480,19 @@ def main() raises:
             lora = flux_loha_carrier_set(loha_masters, D, FMLP)
             print("[Chroma-loha] step=", k, " master_grad_norm=", Float32(mnorm),
                   " zero_leg_l1=", flux_loha_zero_leg_l1(loha_masters))
+        elif levers_optimizer_active(train_cfg):
+            # T1.C optimizer lever (P4 wiring; default-off): HOST levers step
+            # (adafactor / schedule-free / adamw8bit / automagic3) on the
+            # lora.ad host mirrors. The per-step device forward re-uploads the
+            # host set, so no resident sync is needed and the fused resident
+            # AdamW state below is never initialized on this arm.
+            levers_optimizer_step_host(
+                train_cfg, lora.ad, grads.d_a, grads.d_b, optimizer_step,
+                step_lr, 0, total_adapters(lora), lev_opt,
+            )
+            # T1.B: EMA shadow update post-optimizer (same seam as the AdamW arm).
+            if train_cfg.ema_enabled:
+                ema_update(ema, lora.ad, optimizer_step)
         else:
             # MJ-1070/MJ-1085: resident fused AdamW — persistent device P/M/V
             # with ONE-TIME pinned staging (init lazily after resume load); the
@@ -1442,7 +1526,14 @@ def main() raises:
             print("[Chroma-lora] warning nonfinite_lora_grads=", grads.nonfinite_lora_grads)
 
         var saved_this_step = False
-        if chroma_should_save_checkpoint(train_cfg, k):
+        # T1.C schedule-free SAVE BRACKET (levers.mojo SAVE CONTRACT): eval-mode
+        # around any weight save / validation sample; no-op for every other
+        # optimizer (and when the levers state is uninitialized).
+        var save_due = chroma_should_save_checkpoint(train_cfg, k)
+        var sample_due = sample_enabled and should_sample_completed_step(sample_cadence, k)
+        if save_due or sample_due:
+            levers_optimizer_eval_for_save(train_cfg, lev_opt)
+        if save_due:
             var save_path = _step_lora_path(
                 chroma_output_lora_path_from_train_config(train_cfg, run_steps), k
             )
@@ -1459,7 +1550,7 @@ def main() raises:
                 print("[Chroma-lora] save_state step=", k, " path=", state_path)
             saved_this_step = True
             _chroma_prune_old_checkpoints(train_cfg, run_steps, k)
-        if sample_enabled and should_sample_completed_step(sample_cadence, k):
+        if sample_due:
             if chroma_should_save_before_sample(sample_cadence, k, saved_this_step):
                 var sample_path = _step_lora_path(
                     chroma_output_lora_path_from_train_config(train_cfg, run_steps), k
@@ -1504,6 +1595,9 @@ def main() raises:
                     base, approx, loader, lora, txt_tokens.copy(),
                     cos.copy(), sin.copy(), samples_dir, k, ctx,
                 )
+        if save_due or sample_due:
+            # pair of levers_optimizer_eval_for_save — back to train mode.
+            levers_optimizer_train_after_save(train_cfg, lev_opt)
 
     print("")
     print("first_loss=", first_loss, " last_loss=", last_loss)
@@ -1535,6 +1629,9 @@ def main() raises:
                   "; loss", first_loss, "->", last_loss,
                   (" (DECREASED)" if last_loss < first_loss else " (see trajectory)"))
         var lora_out = chroma_output_lora_path_from_train_config(train_cfg, run_steps)
+        # T1.C schedule-free SAVE BRACKET for the final save (train loop over —
+        # no train_after pair needed; no-op for non-schedule-free optimizers).
+        levers_optimizer_eval_for_save(train_cfg, lev_opt)
         if lokr_active:
             _ = save_flux_lokr(lokr_masters, lora_out, ctx)
         elif loha_active:
