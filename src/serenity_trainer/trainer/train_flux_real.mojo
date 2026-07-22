@@ -866,11 +866,17 @@ def main() raises:
     # ── block-swap offload loader (streams attn/mlp blocks one at a time) ────
     var plan = build_flux1_dev_block_plan()
     var cfg = OffloadConfig.synchronous_single()
-    # fp8_e4m3 pins EVERY block device-resident — skip the whole-DiT pinned
-    # host block store (never read again; 2× concurrent = host OOM).
+    # NO host block store for EITHER arm (P6 60GB-box refit, 2026-07-22): the
+    # streamed arm's whole-DiT pinned store (~20GB for the 23.8GB flux1-dev)
+    # host-OOM'd the 60GB box on top of the ~12GB F32 stack base. Backward
+    # re-streams via loader.await_block (flux_stack_lora.mojo:2886/3283), and
+    # prefetch falls back to mmap→pinned-slot memcpy when the store is absent
+    # (turbo_loader.mojo:485-495) — same bytes, slower per step (~60GB/step
+    # host memcpy at 57 blocks × fwd+bwd), fits the box. NOT "because wan22
+    # does it" (wan22 uses the store; it fits on footprint).
     var loader = TurboPlannedLoader.open(
         ckpt, plan^, cfg, ctx,
-        fill_block_store=train_cfg.quantized_resident != String("fp8_e4m3"),
+        fill_block_store=False,
     )
     print("[load] offload loader opened (", loader.block_count(), "blocks)")
 
