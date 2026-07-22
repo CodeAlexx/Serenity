@@ -366,6 +366,14 @@ struct TrainerUIConfig(Movable):
         self.model_type_options.append(String("HIDREAM_O1"))
         # Krea-2 appended LAST so existing option indices stay stable.
         self.model_type_options.append(String("KREA_2"))
+        # Wave 3 (2026-07-22): Wan2.1 + MageFlow appended LAST so existing
+        # option indices stay stable (matches webui static/index.html order).
+        self.model_type_options.append(String("WAN_21"))
+        self.model_type_options.append(String("MAGEFLOW"))
+        # Wave 3 cont. (2026-07-22): FLUX.1-dev + Klein-4B appended LAST so
+        # existing option indices stay stable (indices 15/16).
+        self.model_type_options.append(String("FLUX_1"))
+        self.model_type_options.append(String("KLEIN_4B"))
         self.model_type_index = 1
         self.model_type_open = False
 
@@ -385,6 +393,12 @@ struct TrainerUIConfig(Movable):
         self.architecture_options.append(String("HiDream O1"))
         # Krea-2 appended LAST so existing option indices stay stable.
         self.architecture_options.append(String("Krea 2 Raw"))
+        # Wave 3 (2026-07-22): appended LAST (indices 13/14).
+        self.architecture_options.append(String("Wan2.1 T2V 1.3B"))
+        self.architecture_options.append(String("MageFlow Base"))
+        # Wave 3 cont. (2026-07-22): appended LAST (indices 15/16).
+        self.architecture_options.append(String("Flux.1 Dev"))
+        self.architecture_options.append(String("Klein 4B"))
         self.architecture_index = 1
         self.architecture_open = False
 
@@ -783,6 +797,14 @@ def _arch_index_for_model_type(model_type_index: Int32) -> Int32:
         return 11
     if model_type_index == 12:  # KREA_2
         return 12
+    if model_type_index == 13:  # WAN_21 (wave 3)
+        return 13
+    if model_type_index == 14:  # MAGEFLOW (wave 3)
+        return 14
+    if model_type_index == 15:  # FLUX_1 (wave 3 cont.)
+        return 15
+    if model_type_index == 16:  # KLEIN_4B (wave 3 cont.)
+        return 16
     return -1  # STABLE_DIFFUSION_35: no trainable runner yet
 
 
@@ -812,6 +834,14 @@ def _model_type_for_arch_index(architecture_index: Int32) -> Int32:
         return 11
     if architecture_index == 12:  # Krea 2 Raw
         return 12
+    if architecture_index == 13:  # Wan2.1 T2V 1.3B (wave 3)
+        return 13
+    if architecture_index == 14:  # MageFlow Base (wave 3)
+        return 14
+    if architecture_index == 15:  # Flux.1 Dev (wave 3 cont.)
+        return 15
+    if architecture_index == 16:  # Klein 4B (wave 3 cont.)
+        return 16
     return -1
 
 
@@ -948,27 +978,109 @@ def trainer_ui_apply_model_preset(mut cfg: TrainerUIConfig, prefer_model_type: B
         cfg.lora_alpha = 16.0
         cfg.timestep_shift = 3.0
     elif arch == 9:
-        # LTX-2 AV (video+audio) — NO production trainer yet. The legacy
-        # video-only train_ltx2_real is fail-closed by design; train_ltx2_av is
-        # a readiness contract. Routed to an unwired backend so launch fails
-        # loudly instead of silently running a legacy/unfaithful path.
+        # LTX-2 AV — WIRED (wave 3, 2026-07-22) to mojodiffusion's PRODUCTION
+        # train_ltx2_av (musubi-oracle, image512 arm for the UI smoke). Flag
+        # argv (webui argv_shape "ltx2"); recipe mirrors
+        # serenitymojo/configs/ltx2_image512_anchor.json (rank32/alpha32/1e-4).
         cfg.backend_target = String("ltx2")
         cfg.model_type_index = 9
         cfg.architecture_index = 9
-        cfg.base_model_name = String("")
+        cfg.base_model_name = String("/home/alex/.serenity/models/checkpoints/ltx-2.3-22b-dev-fp8.safetensors")
+        cfg.cache_dir = String("/home/alex/datasets/ltx2_image512_ui_cache")
         cfg.model_arch = String("ltx2_av")
-        cfg.frames = String("25")
+        cfg.frames = String("1")
+        cfg.learning_rate = 0.0001
+        cfg.lora_rank = 32.0
+        cfg.lora_alpha = 32.0
+        cfg.timestep_shift = 1.0
     elif arch == 10:
-        # Wan2.2-T2V 14B — train_wan22_real exists but its RoPE tables are
-        # placeholders ("TODO: replace with wan22_build_rope for real
-        # training") and it is config-less smoke-mode. Unwired backend:
-        # fail-loud until the trainer is made faithful.
+        # Wan2.2-T2V 14B — WIRED (wave 3, 2026-07-22) to mojodiffusion's
+        # training/train_wan22_real (real rope via wan22_build_rope, dual
+        # high/low-noise experts, WAN22_DATA_CACHE real-data path). Recipe
+        # mirrors serenitymojo/configs/wan22_real_smoke_2step.json.
         cfg.backend_target = String("wan22")
         cfg.model_type_index = 10
         cfg.architecture_index = 10
         cfg.base_model_name = String("/home/alex/.serenity/models/checkpoints/wan2.2_t2v_low_noise_14b_fp16.safetensors")
+        cfg.cache_dir = String("/home/alex/.serenity/wan22_cache/40_woman")
         cfg.model_arch = String("wan22_t2v_14b")
         cfg.frames = String("1")
+        cfg.learning_rate = 0.0001
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 16.0
+        cfg.timestep_shift = 1.0
+    elif arch == 13:
+        # Wan2.1-T2V 1.3B (wave 3) — SAME train_wan22_real binary; the Wan2.1
+        # single-expert arm is selected by env WAN21_MODEL=t2v_1.3b (webui
+        # preset env map). Reuses the wan22 t2v 40_woman cache (same
+        # Wan2.1-VAE 16ch latent + umt5 text layout).
+        cfg.backend_target = String("wan21")
+        cfg.model_type_index = 13
+        cfg.architecture_index = 13
+        cfg.base_model_name = String("/home/alex/.serenity/models/checkpoints/wan2.1_t2v_1.3B_fp16.safetensors")
+        cfg.cache_dir = String("/home/alex/.serenity/wan22_cache/40_woman")
+        cfg.model_arch = String("wan21_t2v_1p3b")
+        cfg.frames = String("1")
+        cfg.learning_rate = 0.0001
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 16.0
+        cfg.timestep_shift = 1.0
+    elif arch == 15:
+        # FLUX.1-dev (wave 3 cont., 2026-07-22) — serenity-trainer
+        # train_flux_real (binary built 07-15; FIXED_SIGMA_SMOKE comptime).
+        # checkpoint = the REAL flux1-dev (guidance_in present, 07-16 dl).
+        # cache = boxjana_flux_512 (flux_cache_from_chroma derivation, 22
+        # samples) restored to output/cache from the retired-repo tree.
+        # quantized_resident streamed_base_opt_in = 16GB refit (fp8_e4m3
+        # pins ~12GiB blocks + ~6.4GiB bf16 stack base > 16GB VRAM).
+        cfg.backend_target = String("flux")
+        cfg.model_type_index = 15
+        cfg.architecture_index = 15
+        cfg.base_model_name = String("/home/alex/.serenity/models/checkpoints/flux1-dev.safetensors")
+        cfg.cache_dir = String("/home/alex/mojodiffusion/output/cache/boxjana_flux_512")
+        cfg.model_arch = String("flux1dev")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.learning_rate = 0.0003
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 1.0
+        cfg.timestep_shift = 1.0
+        cfg.quantized_resident = String("streamed_base_opt_in")
+    elif arch == 16:
+        # Klein 4B (wave 3 cont., 2026-07-22) — FLUX.2-klein-base-4B via the
+        # train_klein4b_real thin variant (comptime dims from klein4b.json:
+        # 3072 inner / 5 double / 20 single / 24 heads / jad 7680).
+        # checkpoint = the BFL-format single file (the diffusers transformer
+        # download is split-q/k/v named and NOT loadable by the klein loader).
+        # CACHE: the 9B cache is INCOMPATIBLE (text_embedding 12288 = Qwen3-8B
+        # x3 layers vs 4B's 7680 = Qwen3-4B x3) — a 4B cache must be prepared
+        # before real runs; path below is where it will land.
+        cfg.backend_target = String("klein4b")
+        cfg.model_type_index = 16
+        cfg.architecture_index = 16
+        cfg.base_model_name = String("/home/alex/.serenity/models/checkpoints/flux-2-klein-base-4b.safetensors")
+        cfg.cache_dir = String("/home/alex/mojodiffusion/output/cache/eri2_klein4b_512")
+        cfg.model_arch = String("klein4b")
+        cfg.sample_sampler = String("FlowMatch Euler")
+        cfg.learning_rate = 0.0001
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 16.0
+        cfg.timestep_shift = 1.0
+    elif arch == 14:
+        # MageFlow Base (wave 3) — mojodiffusion training/train_mageflow_real
+        # (Qwen-Image gated block reuse, 144 adapters). Data cache via env
+        # MAGEFLOW_DATA_CACHE (webui preset env map). timestep_shift 6.0 = the
+        # Base transformer static_shift.
+        cfg.backend_target = String("mageflow")
+        cfg.model_type_index = 14
+        cfg.architecture_index = 14
+        cfg.base_model_name = String("/home/alex/.serenity/models/checkpoints/Mage-Flow-Base/transformer/diffusion_pytorch_model.safetensors")
+        cfg.cache_dir = String("/home/alex/.serenity/mageflow_cache/40_woman")
+        cfg.model_arch = String("mageflow_base")
+        cfg.frames = String("1")
+        cfg.learning_rate = 0.0001
+        cfg.lora_rank = 16.0
+        cfg.lora_alpha = 16.0
+        cfg.timestep_shift = 6.0
     elif arch == 11:
         # HiDream-O1 — serenitymojo train_hidream_o1_real (campaign-verified
         # ~1.0 s/step; flags-off 3-step anchor 0.05885428/0.33308488/
@@ -1228,6 +1340,50 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             + _runner_recipe_json(cfg)
             + String("}\n")
         )
+    if t == String("flux"):
+        # FLUX.1-dev (wave 3 cont.) — serenity-trainer train_flux_real
+        # (config_runner argv [config.json, steps]). Arch dims verbatim from
+        # serenitymojo/configs/flux.json — validate_flux_train_config fails
+        # loud on any drift. quantized_resident is REQUIRED by the driver
+        # (empty/OFF fail loud): fp8_e4m3 or streamed_base_opt_in.
+        return (
+            String("{\n  \"model_type\": \"flux\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
+            + String("  \"vae\": \"/home/alex/.serenity/models/vaes/ae.safetensors\",\n")
+            + String("  \"inner_dim\": 3072,\n  \"in_channels\": 64,\n")
+            + String("  \"joint_attention_dim\": 4096,\n  \"out_channels\": 64,\n")
+            + String("  \"num_double\": 19,\n  \"num_single\": 38,\n")
+            + String("  \"num_heads\": 24,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 12288,\n  \"timestep_dim\": 256,\n")
+            + String("  \"rope_theta\": 10000,\n")
+            + String("  \"quantized_resident\": \"") + trainer_ui_json_escape(cfg.quantized_resident) + String("\",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("klein4b"):
+        # Klein 4B (wave 3 cont.) — train_klein4b_real thin variant of the
+        # klein driver (config_runner argv). Arch dims verbatim from
+        # serenitymojo/configs/klein4b.json. Lever emission mirrors klein's
+        # (same driver body -> same read_model_config consumption).
+        return (
+            String("{\n  \"model_type\": \"klein\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
+            + String("  \"vae\": \"") + String(SERENITY_KLEIN_VAE) + String("\",\n")
+            + String("  \"inner_dim\": 3072,\n  \"in_channels\": 128,\n")
+            + String("  \"joint_attention_dim\": 7680,\n  \"out_channels\": 128,\n")
+            + String("  \"num_double\": 5,\n  \"num_single\": 20,\n")
+            + String("  \"num_heads\": 24,\n  \"head_dim\": 128,\n")
+            + String("  \"mlp_hidden\": 9216,\n  \"timestep_dim\": 256,\n")
+            + String("  \"rope_theta\": 2000,\n")
+            + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
+            + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
+            + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
+            + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
+            + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
+            + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
     if t == String("krea2"):
         # Krea-2 Raw — mojodiffusion train_krea2.mojo. It has the same
         # TrainConfig reader as the config-driven runners, but the live argv is
@@ -1409,6 +1565,46 @@ def trainer_ui_runner_train_config_json(cfg: TrainerUIConfig) raises -> String:
             # sampler off. Delivered only when the levers JSON is passed
             # (trainer_ui_ideogram4_levers_set gates argv 11).
             + String("  \"validation_prompts_file\": \"") + String(SERENITY_IDEOGRAM4_SAMPLE_PROMPTS) + String("\",\n")
+            + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
+            + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
+            + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")
+            + String("  \"min_snr_gamma_flow\": ") + String(cfg.min_snr_gamma_flow) + String(",\n")
+            + String("  \"optimizer\": { \"optimizer\": \"") + cfg.optimizer_runner_value() + String("\" },\n")
+            + String("  \"optimizer_warmup_steps\": ") + String(Int(cfg.learning_rate_warmup_steps)) + String(",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("wan22") or t == String("wan21"):
+        # Wave 3: train_wan22_real (mojodiffusion) — config-driven recipe
+        # (rank/alpha/lr/steps/optimizer via read_model_config). No arch dims:
+        # geometry is comptime in the driver; the wan21 arm is selected by env
+        # WAN21_MODEL (webui preset env map), not by any config key.
+        return (
+            String("{\n  \"model_type\": \"") + t + String("\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("mageflow"):
+        # Wave 3: train_mageflow_real (mojodiffusion) — argv [config.json];
+        # recipe via read_model_config (timestep_shift 6.0 = Base static_shift).
+        # Data cache via env MAGEFLOW_DATA_CACHE; cache_dir in the recipe tail
+        # documents it for the run record.
+        return (
+            String("{\n  \"model_type\": \"mageflow\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
+            + _runner_recipe_json(cfg)
+            + String("}\n")
+        )
+    if t == String("ltx2"):
+        # Wave 3: train_ltx2_av (mojodiffusion, production musubi-oracle).
+        # The trainer's OWN argv wins for lr/rank/steps (webui argv_shape
+        # "ltx2" emits those flags from this same merged config); --config
+        # carries the lever set. This emission round-trips read_model_config
+        # for the UI seam gate.
+        return (
+            String("{\n  \"model_type\": \"ltx2\",\n")
+            + String("  \"checkpoint\": \"") + trainer_ui_json_escape(cfg.base_model_name) + String("\",\n")
             + String("  \"loss_fn\": \"") + trainer_ui_json_escape(cfg.loss_fn) + String("\",\n")
             + String("  \"huber_delta\": ") + String(cfg.huber_delta) + String(",\n")
             + String("  \"smooth_l1_beta\": ") + String(cfg.smooth_l1_beta) + String(",\n")

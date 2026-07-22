@@ -730,6 +730,19 @@ def main() raises:
     _gate_target(8, String("l2p"), String("l2p"), 3840, 30, 30)
     # klein (UI wave 2): model_type index 1 = FLUX_2 -> klein preset.
     _gate_target(1, String("klein"), String("klein"), 4096, 24, 32)
+    # wave 3 (2026-07-22): the four newly wired video/image verticals. No arch
+    # dims asserted (geometry is comptime in their drivers): 9=LTX_2_VIDEO
+    # (production train_ltx2_av), 10=WAN_22_VIDEO, 13=WAN_21 (same wan22 binary,
+    # env-dispatched arm), 14=MAGEFLOW.
+    _gate_target(9, String("ltx2"), String("ltx2"), 0, 0, 0)
+    _gate_target(10, String("wan22"), String("wan22"), 0, 0, 0)
+    _gate_target(13, String("wan21"), String("wan21"), 0, 0, 0)
+    _gate_target(14, String("mageflow"), String("mageflow"), 0, 0, 0)
+    # wave 3 cont. (2026-07-22): 15=FLUX_1 (flux1-dev live trainer, dims from
+    # configs/flux.json), 16=KLEIN_4B (train_klein4b_real thin variant, dims
+    # from configs/klein4b.json; model_type stays "klein" — same driver body).
+    _gate_target(15, String("flux"), String("flux"), 3072, 38, 24)
+    _gate_target(16, String("klein4b"), String("klein"), 3072, 20, 24)
     _gate_klein_levers()
     _gate_zimage_loss_levers()
     _gate_caption_dropout_prob()

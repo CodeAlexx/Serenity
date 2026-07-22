@@ -50,6 +50,15 @@ struct Preset {
     workspace_dir: String,
     save_filename_prefix: String,
     recipe: Value,
+    /// Per-preset environment for the spawned trainer (wave 3, 2026-07-22).
+    /// Needed because several mojodiffusion drivers select variants/data via
+    /// env, not argv/config (measured): train_wan22_real reads WAN21_MODEL
+    /// (Wan2.1 dispatch happens BEFORE the config is read) and WAN22_DATA_CACHE
+    /// (all wan2x arms read the cache dir from env only); train_mageflow_real
+    /// reads MAGEFLOW_DATA_CACHE. Empty for every other preset — launches are
+    /// byte-identical to the pre-wave-3 behavior when this map is empty.
+    #[serde(default)]
+    env: HashMap<String, String>,
     #[serde(flatten)]
     extra: HashMap<String, Value>,
 }
@@ -571,6 +580,41 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             "-".into(),
             "512".into(),
         ],
+        // shape 5 (wave 3): LTX-2 AV production trainer (mojodiffusion
+        // training/train_ltx2_av.mojo). Flag-based CLI (LTX2TrainerConfig::
+        // from_args) — NOT the positional config_runner shape; positional args
+        // are silently IGNORED by its parser, so config_runner would launch it
+        // with pure defaults. --config carries the merged lever JSON; the
+        // recipe scalars ride their own flags (ltx2 argv wins for its fields).
+        // --ltx2_mode video is REQUIRED (the struct default is MODE_AV, which
+        // fail-louds without --lora_target_preset audio).
+        "ltx2" => {
+            let mut v = vec![
+                "--config".into(), cfg_path.clone(),
+                "--ltx2_mode".into(), "video".into(),
+                "--geometry".into(),
+                cfg.get("geometry").and_then(|g| g.as_str()).unwrap_or("image512").to_string(),
+                "--dataset_cache_dir".into(), cache.clone(),
+                "--output_dir".into(), workspace.clone(),
+                "--max_steps".into(), steps.to_string(),
+                "--lora_rank".into(), format!("{}", getu("lora_rank", 32)),
+                "--lora_alpha".into(), format!("{}", getf("lora_alpha", 32.0)),
+                "--learning_rate".into(), format!("{}", getf("learning_rate", 1e-4)),
+                "--save_every".into(), format!("{}", getu("save_every", 0)),
+                "--sample_every".into(), format!("{}", getu("sample_every", 0)),
+                "--seed".into(), format!("{}", getu("seed", 42)),
+                // 16GB refit (measured 2026-07-22): the trainer's non-capture
+                // default is 42 fp8-resident blocks (~17GB, sized for the 24GB
+                // box) -> generic CUDA OOM in the load phase on the 5080.
+                // Residency changes NO math (anchor-identical); preset-tunable.
+                "--resident_blocks".into(), format!("{}", getu("resident_blocks", 12)),
+            ];
+            if !p.checkpoint.is_empty() {
+                v.push("--ltx2_checkpoint".into());
+                v.push(p.checkpoint.clone());
+            }
+            v
+        }
         other => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("argv shape {other} not wired")}))),
     };
     // finding #1: resume argv order is PER-BACKEND, not per argv-shape. The
@@ -607,7 +651,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         }
     }
     if req.dry_run {
-        return (StatusCode::OK, Json(json!({"dry_run": true, "binary": p.binary, "args": args, "config_written": cfg_path, "config": cfg, "notes": notes.clone()})));
+        return (StatusCode::OK, Json(json!({"dry_run": true, "binary": p.binary, "args": args, "env": p.env, "config_written": cfg_path, "config": cfg, "notes": notes.clone()})));
     }
     let log_path = format!("{workspace}/train_web.log");
     let log_file = match std::fs::File::create(&log_path) {
@@ -628,6 +672,9 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         .current_dir(REPO_ROOT)
         .env("MODULAR_DEVICE_CONTEXT_SYNC_MODE", "true")
         .env("LD_LIBRARY_PATH", CUDA_LD)
+        // per-preset trainer env (wave 3): variant/data selection some drivers
+        // read from env only (WAN21_MODEL / WAN22_DATA_CACHE / MAGEFLOW_DATA_CACHE)
+        .envs(&p.env)
         .stdout(Stdio::from(log_file.try_clone().unwrap()))
         .stderr(Stdio::from(log_file.try_clone().unwrap()));
     let mut child = match cmd.spawn() {
