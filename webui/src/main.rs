@@ -550,6 +550,57 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
     let steps = cfg.get("max_steps").and_then(|v| v.as_u64()).unwrap_or(2000);
     let getf = |k: &str, d: f64| cfg.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
     let getu = |k: &str, d: u64| cfg.get(k).and_then(|v| v.as_u64()).unwrap_or(d);
+    // ---- P2 (UI_WIRING_CAMPAIGN 2026-07-22): ideogram4 levers delivery ----
+    // The ideogram4 shape is all-argv; before this the merged config was written
+    // to disk but NEVER delivered — every non-argv lever silently discarded.
+    // Fix: extract the LEVER subset the runner's argv-11 path actually consumes
+    // (Ideogram4LiveTrainer.mojo:158-287 reads argv 11 via serenitymojo
+    // read_model_config; Ideogram4LoRATrainer.mojo lcfg usage: loss/optimizer/
+    // EMA/caption-dropout-fallback/batch_size/adapter_algo+LoKr knobs) into a
+    // levers JSON in the workspace and pass its path as argv 11. Recipe scalars
+    // (lr/rank/alpha/steps/save) stay argv-owned per the seam contract. With NO
+    // lever key present argv 11 stays "-" (trainer skip sentinel, C13) so
+    // default launches remain byte-identical to the pre-fix line.
+    let mut ideogram4_levers_arg = String::from("-");
+    if p.argv_shape == "ideogram4" {
+        const IDEOGRAM4_LEVER_KEYS: &[&str] = &[
+            // loss levers (train_config_reader.mojo:1123-1133)
+            "loss_fn", "huber_delta", "smooth_l1_beta", "min_snr_gamma_flow",
+            // optimizer levers: nested object (reader _parse_optimizer) + warmup
+            // aliases (reader l.1100-1105)
+            "optimizer", "optimizer_warmup_steps", "lr_warmup_steps",
+            "learning_rate_warmup_steps",
+            // EMA levers (reader l.1175-1193)
+            "ema", "ema_enabled", "ema_inv_gamma", "ema_power",
+            "ema_update_after_step", "ema_min_decay", "ema_max_decay",
+            "ema_decay", "ema_update_step_interval",
+            // caption-dropout fallback (argv 10 wins when > 0; reader l.1157)
+            "caption_dropout_prob",
+            // TRUE batch-2 selector (LiveTrainer.mojo:275-278)
+            "batch_size",
+            // LyCORIS carrier dispatch + LoKr knobs (reader l.1211-1246)
+            "network_algorithm", "algo", "adapter_algo", "lokr_targets",
+            "lokr_factor", "lokr_decompose_both", "lokr_full_matrix",
+            "init_lokr_norm",
+        ];
+        let mut levers = serde_json::Map::new();
+        if let Value::Object(m) = &cfg {
+            for k in IDEOGRAM4_LEVER_KEYS {
+                if let Some(v) = m.get(*k) {
+                    levers.insert((*k).to_string(), v.clone());
+                }
+            }
+        }
+        if !levers.is_empty() {
+            // model_type documents the emitting seam (reader: cfg.name only)
+            levers.insert("model_type".into(), json!("ideogram4"));
+            let levers_path = format!("{workspace}/web_levers.json");
+            if std::fs::write(&levers_path, serde_json::to_string_pretty(&Value::Object(levers)).unwrap()).is_err() {
+                return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": "cannot write levers config"})));
+            }
+            ideogram4_levers_arg = levers_path;
+        }
+    }
     // ---- all 4 argv shapes (UI_MAP §4) + the resume slot the Mojo UI never wired ----
     let mut args: Vec<String> = match p.argv_shape.as_str() {
         "krea2" => vec![cache.clone(), steps.to_string(), cfg_path.clone()],
@@ -566,8 +617,11 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             cfg_path.clone(),
         ],
         // shape 4: the 18-arg ideogram4 line (TrainerRuntimeBridge.mojo:354-403).
-        // argv 11 levers "-" (defaults stay byte-identical, C13), argv 16 resume "-",
-        // argv 17 prompt "-" (no inline sampling in unit 2), argv 18 resolution.
+        // argv 11 = levers JSON path when any lever key is in the merged config
+        // (P2 delivery fix above), else "-" (defaults stay byte-identical, C13).
+        // argv 13/14 sampler steps+cfg and argv 18 resolution come from the
+        // merged config (preset recipe defaults 20 / 4.5 / 512, overridable).
+        // argv 16 resume "-", argv 17 prompt "-" (no inline sampling in unit 2).
         "ideogram4" => vec![
             format!("{workspace}/progress.log"),
             format!("{}/transformer/diffusion_pytorch_model.safetensors", p.checkpoint),
@@ -581,14 +635,14 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             // UI emit renamed caption_dropout -> caption_dropout_prob (the
             // shared reader's key); argv10 reads the same renamed key.
             format!("{}", getf("caption_dropout_prob", 0.0)),
-            "-".into(),
+            ideogram4_levers_arg.clone(),
             format!("{}", getu("sample_every", 0)),
-            "20".into(),
-            "4.5".into(),
+            format!("{}", getu("sample_steps", 20)),
+            format!("{}", getf("sample_cfg", 4.5)),
             format!("{}", getu("seed", 42)),
             "-".into(),
             "-".into(),
-            "512".into(),
+            format!("{}", getu("resolution", 512)),
         ],
         // shape 5 (wave 3): LTX-2 AV production trainer (mojodiffusion
         // training/train_ltx2_av.mojo). Flag-based CLI (LTX2TrainerConfig::

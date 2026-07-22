@@ -218,6 +218,8 @@
     "max_steps": 2000,
     "save_every": 500,
     "sample_every": 0,
+    "sample_steps": 20,
+    "sample_cfg": 4.5,
     "quantized_resident": "fp8_e4m3"
    },
    "_unwired_note": "WIRED (18-arg shape 4) \u2014 dry-run verified; not yet run-gated on GPU"
