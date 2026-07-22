@@ -128,9 +128,9 @@ from serenitymojo.training.flat_direct_lycoris_stack import (
     flat_direct_oft_grad_norm, flat_direct_oft_clip_grads,
     flat_direct_oft_adamw_step, flat_direct_oft_vec_l1,
 )
-from serenitymojo.training.onetrainer_cache_preflight import (
-    create_onetrainer_cache_preflight_plan,
-    validate_onetrainer_cache_preflight_plan,
+from serenitymojo.training.serenity_trainer_cache_preflight import (
+    create_serenity_trainer_cache_preflight_plan,
+    validate_serenity_trainer_cache_preflight_plan,
 )
 from serenitymojo.training.sample_prompt_config import (
     SamplePrompt, SamplePromptConfig, SampleCadence,
@@ -139,19 +139,19 @@ from serenitymojo.training.sample_prompt_config import (
     sample_time_unit_name,
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
 )
-from serenitymojo.training.onetrainer_train_loop_policy import (
-    OT_GRAD_POLICY_ON_OR_OFF,
-    ot_cache_dir_from_train_config,
-    ot_fixed_output_lora_path_from_train_config,
-    ot_lr_for_optimizer_step,
-    ot_sample_cadence_from_train_config,
-    ot_sampling_enabled_checked,
-    ot_should_save_before_sample,
-    ot_should_save_checkpoint,
-    ot_state_path_for_lora,
-    ot_step_lora_path,
-    validate_ot_gradient_checkpointing_policy,
-    validate_ot_train_math_policy,
+from serenitymojo.training.serenity_trainer_train_loop_policy import (
+    SERENITY_GRAD_POLICY_ON_OR_OFF,
+    serenity_cache_dir_from_train_config,
+    serenity_fixed_output_lora_path_from_train_config,
+    serenity_lr_for_optimizer_step,
+    serenity_sample_cadence_from_train_config,
+    serenity_sampling_enabled_checked,
+    serenity_should_save_before_sample,
+    serenity_should_save_checkpoint,
+    serenity_state_path_for_lora,
+    serenity_step_lora_path,
+    validate_serenity_gradient_checkpointing_policy,
+    validate_serenity_train_math_policy,
 )
 from serenitymojo.training.lora_adamw_plain_fused import (
     fused_lora_adamw_plain_step, LoraAdamWPlainDeviceState,
@@ -478,7 +478,7 @@ def _parse_int(s: String) -> Int:
 
 
 def _state_path_for_lora(lora_path: String) -> String:
-    return ot_state_path_for_lora(lora_path)
+    return serenity_state_path_for_lora(lora_path)
 
 
 def _substr(s: String, start: Int, end: Int) -> String:
@@ -508,7 +508,7 @@ def _mkdir_parent(path: String):
 
 
 def _step_lora_path(save_path: String, step: Int) -> String:
-    return ot_step_lora_path(save_path, step)
+    return serenity_step_lora_path(save_path, step)
 
 
 # Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
@@ -609,34 +609,34 @@ def validate_ernie_train_config(cfg: TrainConfig) raises:
         raise Error("ERNIE trainer config requires learning_rate > 0")
     if cfg.max_grad_norm <= Float32(0.0):
         raise Error("ERNIE trainer config requires max_grad_norm > 0")
-    validate_ot_train_math_policy(cfg, String("ERNIE trainer"))
+    validate_serenity_train_math_policy(cfg, String("ERNIE trainer"))
     if cfg.max_steps <= 0:
         raise Error("ERNIE trainer config requires max_steps > 0")
     if cfg.save_every < 0:
         raise Error("ERNIE trainer config requires save_every >= 0")
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("ERNIE trainer"), OT_GRAD_POLICY_ON_OR_OFF
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("ERNIE trainer"), SERENITY_GRAD_POLICY_ON_OR_OFF
     )
 
 
 def ernie_sample_cadence_from_train_config(
     cfg_path: String, cfg: TrainConfig,
 ) raises -> SampleCadence:
-    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+    return serenity_sample_cadence_from_train_config(cfg_path, cfg)
 
 
 def ernie_sampling_enabled(cadence: SampleCadence) raises -> Bool:
-    return ot_sampling_enabled_checked(cadence)
+    return serenity_sampling_enabled_checked(cadence)
 
 
 def ernie_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
-    return ot_should_save_checkpoint(cfg, completed_step)
+    return serenity_should_save_checkpoint(cfg, completed_step)
 
 
 def ernie_should_save_before_sample(
     cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
 ) raises -> Bool:
-    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+    return serenity_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 def _sample_png_path(step: Int, label: String) -> String:
@@ -795,13 +795,13 @@ def main() raises:
             run_steps = _parse_int(a1)
 
     var train_cfg = read_model_config(cfg_path)
-    var save_path = ot_fixed_output_lora_path_from_train_config(
+    var save_path = serenity_fixed_output_lora_path_from_train_config(
         train_cfg, String(SAVE_PATH)
     )
     if len(args) > arg_base + 1:
         save_path = String(args[arg_base + 1])
 
-    var cache_dir = ot_cache_dir_from_train_config(train_cfg, String(CACHE_DIR))
+    var cache_dir = serenity_cache_dir_from_train_config(train_cfg, String(CACHE_DIR))
     if len(args) > arg_base + 2:
         cache_dir = String(args[arg_base + 2])
 
@@ -809,8 +809,8 @@ def main() raises:
         mode = String(args[arg_base + 3])
 
     validate_ernie_train_config(train_cfg)
-    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
-    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var cache_preflight = create_serenity_trainer_cache_preflight_plan(train_cfg)
+    validate_serenity_trainer_cache_preflight_plan(cache_preflight)
     if run_steps < 0:
         run_steps = train_cfg.max_steps
     if mode == String("resume_smoke") and run_steps < 25:
@@ -1158,7 +1158,7 @@ def main() raises:
         # Wave 2A scheduled lr keys on OPTIMIZER steps, not micro-steps; with
         # accum_steps=1 this is (step//1)+1 == done_step => baseline unchanged.
         var optimizer_step = (step // accum_steps) + 1
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, optimizer_step)
+        var step_lr = serenity_lr_for_optimizer_step(train_cfg, optimizer_step)
         var loss = Float32(0.0)
         var gn = Float64(0.0)
         var nonfinite_grads = 0

@@ -147,9 +147,9 @@ from serenitymojo.training.trainer_core import (
     GradAccumWindow, trainer_prune_target_step, trainer_prune_step_checkpoint,
 )
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
-from serenitymojo.training.onetrainer_cache_preflight import (
-    create_onetrainer_cache_preflight_plan,
-    validate_onetrainer_cache_preflight_plan,
+from serenitymojo.training.serenity_trainer_cache_preflight import (
+    create_serenity_trainer_cache_preflight_plan,
+    validate_serenity_trainer_cache_preflight_plan,
 )
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.sample_prompt_config import (
@@ -161,16 +161,16 @@ from serenitymojo.training.sample_prompt_config import (
     caps_sampling_active, assert_enabled_sample_prompts,
     warn_legacy_cached_caption_sampling,
 )
-from serenitymojo.training.onetrainer_train_loop_policy import (
-    OT_GRAD_POLICY_ON_ONLY,
-    ot_lr_for_optimizer_step,
-    ot_sample_cadence_from_train_config,
-    ot_sampling_enabled,
-    ot_should_save_before_sample,
-    ot_state_path_for_lora,
-    ot_step_lora_path,
-    validate_ot_gradient_checkpointing_policy,
-    validate_ot_train_math_policy,
+from serenitymojo.training.serenity_trainer_train_loop_policy import (
+    SERENITY_GRAD_POLICY_ON_ONLY,
+    serenity_lr_for_optimizer_step,
+    serenity_sample_cadence_from_train_config,
+    serenity_sampling_enabled,
+    serenity_should_save_before_sample,
+    serenity_state_path_for_lora,
+    serenity_step_lora_path,
+    validate_serenity_gradient_checkpointing_policy,
+    validate_serenity_train_math_policy,
 )
 
 
@@ -323,9 +323,9 @@ def validate_qwen_train_config(cfg: TrainConfig) raises:
         raise Error("Qwen trainer config requires learning_rate > 0")
     if cfg.max_grad_norm <= Float32(0.0):
         raise Error("Qwen trainer config requires max_grad_norm > 0")
-    validate_ot_train_math_policy(cfg, String("Qwen trainer"))
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("Qwen trainer"), OT_GRAD_POLICY_ON_ONLY
+    validate_serenity_train_math_policy(cfg, String("Qwen trainer"))
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("Qwen trainer"), SERENITY_GRAD_POLICY_ON_ONLY
     )
 
 
@@ -342,25 +342,25 @@ def qwen_offload_config_from_train_config(cfg: TrainConfig) raises -> OffloadCon
 def qwen_sample_cadence_from_train_config(
     cfg_path: String, cfg: TrainConfig,
 ) raises -> SampleCadence:
-    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+    return serenity_sample_cadence_from_train_config(cfg_path, cfg)
 
 
 def qwen_sampling_enabled(cadence: SampleCadence) -> Bool:
-    return ot_sampling_enabled(cadence)
+    return serenity_sampling_enabled(cadence)
 
 
 def qwen_should_save_before_sample(
     cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
 ) raises -> Bool:
-    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+    return serenity_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 def qwen_state_path_for_lora(lora_path: String) -> String:
-    return ot_state_path_for_lora(lora_path)
+    return serenity_state_path_for_lora(lora_path)
 
 
 def _step_lora_path(base_path: String, step: Int) -> String:
-    return ot_step_lora_path(base_path, step)
+    return serenity_step_lora_path(base_path, step)
 
 
 # Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
@@ -754,8 +754,8 @@ def main() raises:
 
     var train_cfg = read_model_config(cfg_path)
     validate_qwen_train_config(train_cfg)
-    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
-    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var cache_preflight = create_serenity_trainer_cache_preflight_plan(train_cfg)
+    validate_serenity_trainer_cache_preflight_plan(cache_preflight)
     var sample_cadence = qwen_sample_cadence_from_train_config(cfg_path, train_cfg)
     var sample_enabled = qwen_sampling_enabled(sample_cadence)
     var direct_algo_requested = (
@@ -1299,7 +1299,7 @@ def main() raises:
             var dnorm = qwen_direct_dora_grad_norm(grads_dora.grads)
             if dnorm > Float64(train_cfg.max_grad_norm):
                 qwen_direct_dora_clip_grads(grads_dora.grads, train_cfg.max_grad_norm / Float32(dnorm))
-            var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+            var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
             qwen_direct_dora_adamw_step(
                 dora_masters, grads_dora.grads, k, step_lr,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
@@ -1359,7 +1359,7 @@ def main() raises:
             var onorm = qwen_direct_oft_grad_norm(grads_oft.grads)
             if onorm > Float64(train_cfg.max_grad_norm):
                 qwen_direct_oft_clip_grads(grads_oft.grads, train_cfg.max_grad_norm / Float32(onorm))
-            var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+            var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
             qwen_direct_oft_adamw_step(
                 oft_masters, grads_oft.grads, k, step_lr,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps, train_cfg.weight_decay,
@@ -1565,7 +1565,7 @@ def main() raises:
         # Wave 2A scheduled lr keys on OPTIMIZER steps, not micro-steps; with
         # accum_steps=1 this is ((k-1)//1)+1 == k => baseline unchanged.
         var optimizer_step = ((k - 1) // accum_steps) + 1
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, optimizer_step)
+        var step_lr = serenity_lr_for_optimizer_step(train_cfg, optimizer_step)
         if lokr_active:
             var mg = qwen_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
             var mnorm = qwen_lokr_grad_norm(mg)

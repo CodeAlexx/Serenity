@@ -105,7 +105,7 @@ from serenitymojo.training.levers import (
     caption_dropout_pick,
     levers_loss_active, levers_loss_grad,
     LeversOptimizerState, levers_optimizer_active, levers_optimizer_validate,
-    levers_optimizer_step_host, levers_optimizer_sync_resident_ot,
+    levers_optimizer_step_host, levers_optimizer_sync_resident_serenity,
     levers_optimizer_eval_for_save, levers_optimizer_train_after_save,
 )
 from serenitymojo.training.noise_modifiers import apply_noise_modifiers_host
@@ -122,19 +122,19 @@ from serenitymojo.training.sample_prompt_config import (
     next_sample_completed_step, sample_time_unit_name,
     SAMPLE_UNIT_NEVER, SAMPLE_UNIT_STEP,
 )
-from serenitymojo.training.onetrainer_train_loop_policy import (
-    OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED,
-    ot_cache_dir_from_train_config,
-    ot_final_or_step_lora_path,
-    ot_sample_cadence_from_train_config,
-    ot_sampling_enabled,
-    ot_should_save_before_sample,
-    ot_should_save_checkpoint,
-    ot_state_path_for_lora,
-    ot_lr_for_optimizer_step,
-    validate_ot_gradient_checkpointing_policy,
-    validate_ot_lora_adamw_loop_policy,
-    validate_ot_train_math_policy,
+from serenitymojo.training.serenity_trainer_train_loop_policy import (
+    SERENITY_GRAD_POLICY_ON_OR_CPU_OFFLOADED,
+    serenity_cache_dir_from_train_config,
+    serenity_final_or_step_lora_path,
+    serenity_sample_cadence_from_train_config,
+    serenity_sampling_enabled,
+    serenity_should_save_before_sample,
+    serenity_should_save_checkpoint,
+    serenity_state_path_for_lora,
+    serenity_lr_for_optimizer_step,
+    validate_serenity_gradient_checkpointing_policy,
+    validate_serenity_lora_adamw_loop_policy,
+    validate_serenity_train_math_policy,
 )
 from serenitymojo.training.serenityboard import SerenityBoardWriter
 from serenitymojo.sampling.klein_sampler import klein_sample
@@ -151,9 +151,9 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_BOFT, TRAIN_ADAPTER_ALGO_LOCON,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
-from serenitymojo.training.onetrainer_cache_preflight import (
-    create_onetrainer_cache_preflight_plan,
-    validate_onetrainer_cache_preflight_plan,
+from serenitymojo.training.serenity_trainer_cache_preflight import (
+    create_serenity_trainer_cache_preflight_plan,
+    validate_serenity_trainer_cache_preflight_plan,
 )
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.ops.tensor_algebra import permute, reshape, reshape_owned
@@ -196,9 +196,9 @@ comptime KLEIN_V2_GRAPH_PATH = KLEIN_V2_ENGINE and KLEIN_V2_GRAPH
 # until the backward attribution (flash-bwd-vs-math at B=2, nsys) lands.
 comptime KLEIN_B2_ROWSTACK = True
 
-from serenitymojo.training.lora_adamw_ot_fused import (
-    LoraAdamWOTDeviceState, lora_adamw_ot_device_state_init,
-    lora_adamw_ot_device_state_sync_moments,
+from serenitymojo.training.lora_adamw_serenity_fused import (
+    LoraAdamWSerenityDeviceState, lora_adamw_serenity_device_state_init,
+    lora_adamw_serenity_device_state_sync_moments,
 )
 # T2.G LoKr e2e training (adapter_algo==4): SimpleTuner-parity LoKr masters
 # trained through the existing stack via the Kronecker carrier representation
@@ -814,7 +814,7 @@ def _sample_png_path(step: Int, label: String) -> String:
 
 
 def _state_path_for_lora(lora_path: String) -> String:
-    return ot_state_path_for_lora(lora_path)
+    return serenity_state_path_for_lora(lora_path)
 
 
 # EMA shadow checkpoint sibling path: alina_lora_step100.safetensors ->
@@ -827,7 +827,7 @@ def _ema_path_for_lora(lora_path: String) -> String:
 
 
 def _lora_path_for_step(base_path: String, step: Int, max_steps: Int) -> String:
-    return ot_final_or_step_lora_path(
+    return serenity_final_or_step_lora_path(
         base_path,
         String(LORA_DIR),
         String("alina_lora_final.safetensors"),
@@ -897,10 +897,10 @@ def validate_klein_train_config(cfg: TrainConfig) raises:
     var policy_cfg = cfg.copy()
     if levers_optimizer_active(cfg):
         policy_cfg.optimizer = TRAIN_OPTIMIZER_ADAMW
-    validate_ot_lora_adamw_loop_policy(policy_cfg, String("Klein trainer"))
-    validate_ot_train_math_policy(policy_cfg, String("Klein trainer"))
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("Klein trainer"), OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED
+    validate_serenity_lora_adamw_loop_policy(policy_cfg, String("Klein trainer"))
+    validate_serenity_train_math_policy(policy_cfg, String("Klein trainer"))
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("Klein trainer"), SERENITY_GRAD_POLICY_ON_OR_CPU_OFFLOADED
     )
     # T1.A loss-lever precedence warning (decision: LEVERS WIN — see
     # _klein_loss_grad): if a run sets BOTH klein's own combined-loss /
@@ -924,7 +924,7 @@ def validate_klein_train_config(cfg: TrainConfig) raises:
 
 
 def klein_cache_dir_from_train_config(cfg: TrainConfig) -> String:
-    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+    return serenity_cache_dir_from_train_config(cfg, String(CACHE_DIR))
 
 
 def klein_output_lora_path_from_train_config(
@@ -936,21 +936,21 @@ def klein_output_lora_path_from_train_config(
 def klein_sample_cadence_from_train_config(
     cfg_path: String, cfg: TrainConfig,
 ) raises -> SampleCadence:
-    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+    return serenity_sample_cadence_from_train_config(cfg_path, cfg)
 
 
 def klein_sampling_enabled(cadence: SampleCadence) -> Bool:
-    return ot_sampling_enabled(cadence)
+    return serenity_sampling_enabled(cadence)
 
 
 def klein_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
-    return ot_should_save_checkpoint(cfg, completed_step)
+    return serenity_should_save_checkpoint(cfg, completed_step)
 
 
 def klein_should_save_before_sample(
     cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
 ) raises -> Bool:
-    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+    return serenity_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 def _do_sample_prompt(
@@ -1126,8 +1126,8 @@ def main() raises:
     # LoKr/LoHa still drive the shared carrier path. DoRA/OFT use compact direct
     # W_eff lowering to avoid the dense full-delta carrier above 24 GB.
     var carrier_active = lokr_active or loha_active
-    var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
-    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var cache_preflight = create_serenity_trainer_cache_preflight_plan(cfg)
+    validate_serenity_trainer_cache_preflight_plan(cache_preflight)
     var output_lora_path = String("")
     if cfg.output_model_destination != String(""):
         output_lora_path = cfg.output_model_destination.copy()
@@ -1634,19 +1634,19 @@ def main() raises:
     # touches the resident OT state (host AdamW on the masters + per-step
     # carrier re-upload), so it gets a TINY dummy state instead of allocating
     # P/M/V for the full carrier set.
-    var dbl_state: LoraAdamWOTDeviceState
-    var sgl_state: LoraAdamWOTDeviceState
+    var dbl_state: LoraAdamWSerenityDeviceState
+    var sgl_state: LoraAdamWSerenityDeviceState
     var resident_lora_dev: KleinLoraDeviceSet
     if carrier_active or direct_active:
         var dummy = build_klein_lora_set(1, 1, 8, 8, 1, Float32(1.0))
-        dbl_state = lora_adamw_ot_device_state_init(dummy.dbl, ctx)
-        sgl_state = lora_adamw_ot_device_state_init(dummy.sgl, ctx)
+        dbl_state = lora_adamw_serenity_device_state_init(dummy.dbl, ctx)
+        sgl_state = lora_adamw_serenity_device_state_init(dummy.sgl, ctx)
         resident_lora_dev = klein_lora_set_to_device_resident(
             dummy, dbl_state, sgl_state, ctx,
         )
     else:
-        dbl_state = lora_adamw_ot_device_state_init(lora.dbl, ctx)
-        sgl_state = lora_adamw_ot_device_state_init(lora.sgl, ctx)
+        dbl_state = lora_adamw_serenity_device_state_init(lora.dbl, ctx)
+        sgl_state = lora_adamw_serenity_device_state_init(lora.sgl, ctx)
         resident_lora_dev = klein_lora_set_to_device_resident(
             lora, dbl_state, sgl_state, ctx,
         )
@@ -1966,7 +1966,7 @@ def main() raises:
                 var t_clip1_direct = perf_counter_ns()
                 perf_clip_seconds += Float64(t_clip1_direct - t_clip0_direct) / 1.0e9
                 var optimizer_step = ((k - 1) // accum_steps) + 1
-                var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
+                var step_lr = serenity_lr_for_optimizer_step(cfg, optimizer_step)
                 if runtime_profile:
                     print("PROG_STAGE step=", k, " total=", run_steps, " phase=optim_begin")
                 var t_optim0_direct = perf_counter_ns()
@@ -2063,7 +2063,7 @@ def main() raises:
                 var t_clip1_direct = perf_counter_ns()
                 perf_clip_seconds += Float64(t_clip1_direct - t_clip0_direct) / 1.0e9
                 var optimizer_step = ((k - 1) // accum_steps) + 1
-                var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
+                var step_lr = serenity_lr_for_optimizer_step(cfg, optimizer_step)
                 if runtime_profile:
                     print("PROG_STAGE step=", k, " total=", run_steps, " phase=optim_begin")
                 var t_optim0_direct = perf_counter_ns()
@@ -2328,7 +2328,7 @@ def main() raises:
                     Float64(t1m - train_start) / 1.0e9,
                 )
                 var pending_optimizer_step = ((k - 1) // accum_steps) + 1
-                var pending_lr = ot_lr_for_optimizer_step(cfg, pending_optimizer_step)
+                var pending_lr = serenity_lr_for_optimizer_step(cfg, pending_optimizer_step)
                 board.log_train_step(k, loss, 0.0, pending_lr, secsm, noise_speed)
                 perf_min_free = _klein_update_min_free(ctx, perf_min_free)
                 continue
@@ -2388,7 +2388,7 @@ def main() raises:
         # Wave 2A item 2a: scheduled lr. Default-off (lr_scheduler=0 Constant +
         # lr_warmup_steps=0) returns cfg.lr for every step => baseline unchanged.
         var optimizer_step = ((k - 1) // accum_steps) + 1
-        var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
+        var step_lr = serenity_lr_for_optimizer_step(cfg, optimizer_step)
         # T1.C optimizer lever (default-off; C13: optimizer=ADAMW routes to the
         # existing literal fused calls below, untouched). Active path: HOST
         # adafactor/schedule-free step on the dbl+sgl host a/b mirrors (the
@@ -2397,7 +2397,7 @@ def main() raises:
         # the resident OT kernel does not run on this branch), then — on the
         # KLEIN_V2_ENGINE resident path — push the stepped params into the
         # live OT dev_p buffers so the device LoRA sub-buffer views see them
-        # next step (levers_optimizer_sync_resident_ot = the inverse of the
+        # next step (levers_optimizer_sync_resident_serenity = the inverse of the
         # resident step's P readback). On the non-resident path no sync is
         # needed: the next loop iteration re-uploads the host set via
         # klein_lora_set_to_device.
@@ -2525,8 +2525,8 @@ def main() raises:
                 step_lr, 0, len(lora.sgl), lev_opt_sgl,
             )
             comptime if KLEIN_V2_ENGINE:
-                levers_optimizer_sync_resident_ot(dbl_state, lora.dbl, ctx)
-                levers_optimizer_sync_resident_ot(sgl_state, lora.sgl, ctx)
+                levers_optimizer_sync_resident_serenity(dbl_state, lora.dbl, ctx)
+                levers_optimizer_sync_resident_serenity(sgl_state, lora.sgl, ctx)
         else:
             comptime if KLEIN_V2_ENGINE:
                 klein_lora_adamw_step_resident(
@@ -2631,8 +2631,8 @@ def main() raises:
                     # state's AdamW moments are NOT levers state; levers resume
                     # fails loud at the first step by contract).
                     if not levers_optimizer_active(cfg):
-                        lora_adamw_ot_device_state_sync_moments(dbl_state, lora.dbl, ctx)
-                        lora_adamw_ot_device_state_sync_moments(sgl_state, lora.sgl, ctx)
+                        lora_adamw_serenity_device_state_sync_moments(dbl_state, lora.dbl, ctx)
+                        lora_adamw_serenity_device_state_sync_moments(sgl_state, lora.sgl, ctx)
                 var nstate = save_klein_lora_state(lora, state_path, ctx)
                 print("[Klein-lora] save_state step=", k, " path=", state_path, " pairs=", nstate)
                 board.log_text(String("events/save_state"), k, state_path)

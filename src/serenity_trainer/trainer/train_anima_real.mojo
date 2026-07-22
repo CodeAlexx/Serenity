@@ -132,9 +132,9 @@ from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.trainer_core import (
     GradAccumWindow, trainer_prune_target_step, trainer_prune_step_checkpoint,
 )
-from serenitymojo.training.onetrainer_cache_preflight import (
-    create_onetrainer_cache_preflight_plan,
-    validate_onetrainer_cache_preflight_plan,
+from serenitymojo.training.serenity_trainer_cache_preflight import (
+    create_serenity_trainer_cache_preflight_plan,
+    validate_serenity_trainer_cache_preflight_plan,
 )
 from serenitymojo.io.train_config_reader import read_model_config
 from serenitymojo.training.sample_prompt_config import (
@@ -150,19 +150,19 @@ from serenitymojo.training.anima_sample_streamed import (
     anima_sample_streamed, anima_decode_latent_to_png,
 )
 from std.os import listdir, makedirs
-from serenitymojo.training.onetrainer_train_loop_policy import (
-    OT_GRAD_POLICY_ON_ONLY,
-    ot_cache_dir_from_train_config,
-    ot_fixed_output_lora_path_from_train_config,
-    ot_lr_for_optimizer_step,
-    ot_sample_cadence_from_train_config,
-    ot_sampling_enabled_checked,
-    ot_should_save_before_sample,
-    ot_should_save_checkpoint,
-    ot_state_path_for_lora,
-    ot_step_lora_path,
-    validate_ot_gradient_checkpointing_policy,
-    validate_ot_train_math_policy,
+from serenitymojo.training.serenity_trainer_train_loop_policy import (
+    SERENITY_GRAD_POLICY_ON_ONLY,
+    serenity_cache_dir_from_train_config,
+    serenity_fixed_output_lora_path_from_train_config,
+    serenity_lr_for_optimizer_step,
+    serenity_sample_cadence_from_train_config,
+    serenity_sampling_enabled_checked,
+    serenity_should_save_before_sample,
+    serenity_should_save_checkpoint,
+    serenity_state_path_for_lora,
+    serenity_step_lora_path,
+    validate_serenity_gradient_checkpointing_policy,
+    validate_serenity_train_math_policy,
 )
 
 
@@ -294,13 +294,13 @@ def validate_anima_train_config(cfg: TrainConfig) raises:
         raise Error("Anima trainer config requires learning_rate > 0")
     if cfg.max_grad_norm <= Float32(0.0):
         raise Error("Anima trainer config requires max_grad_norm > 0")
-    validate_ot_train_math_policy(cfg, String("Anima trainer"))
+    validate_serenity_train_math_policy(cfg, String("Anima trainer"))
     if cfg.max_steps <= 0:
         raise Error("Anima trainer config requires max_steps > 0")
     if cfg.save_every < 0:
         raise Error("Anima trainer config requires save_every >= 0")
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("Anima trainer"), OT_GRAD_POLICY_ON_ONLY
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("Anima trainer"), SERENITY_GRAD_POLICY_ON_ONLY
     )
 
 
@@ -312,29 +312,29 @@ def anima_offload_policy_from_train_config(cfg: TrainConfig) raises -> String:
 def anima_sample_cadence_from_train_config(
     cfg_path: String, cfg: TrainConfig,
 ) raises -> SampleCadence:
-    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+    return serenity_sample_cadence_from_train_config(cfg_path, cfg)
 
 
 def anima_sampling_enabled(cadence: SampleCadence) raises -> Bool:
-    return ot_sampling_enabled_checked(cadence)
+    return serenity_sampling_enabled_checked(cadence)
 
 
 def anima_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
-    return ot_should_save_checkpoint(cfg, completed_step)
+    return serenity_should_save_checkpoint(cfg, completed_step)
 
 
 def anima_should_save_before_sample(
     cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
 ) raises -> Bool:
-    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+    return serenity_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 def anima_cache_dir_from_train_config(cfg: TrainConfig) -> String:
-    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+    return serenity_cache_dir_from_train_config(cfg, String(CACHE_DIR))
 
 
 def anima_output_lora_path_from_train_config(cfg: TrainConfig) -> String:
-    return ot_fixed_output_lora_path_from_train_config(cfg, String(LORA_OUT))
+    return serenity_fixed_output_lora_path_from_train_config(cfg, String(LORA_OUT))
 
 
 # T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a plain-LoRA
@@ -354,11 +354,11 @@ def _save_anima_lora_ema(
 
 
 def anima_state_path_for_lora(lora_path: String) -> String:
-    return ot_state_path_for_lora(lora_path)
+    return serenity_state_path_for_lora(lora_path)
 
 
 def _step_lora_path(base_path: String, completed_step: Int) -> String:
-    return ot_step_lora_path(base_path, completed_step)
+    return serenity_step_lora_path(base_path, completed_step)
 
 
 # Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
@@ -823,8 +823,8 @@ def main() raises:
             + String(cfg.batch_size)
         )
     var use_b2 = cfg.batch_size == 2
-    var cache_preflight = create_onetrainer_cache_preflight_plan(cfg)
-    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var cache_preflight = create_serenity_trainer_cache_preflight_plan(cfg)
+    validate_serenity_trainer_cache_preflight_plan(cache_preflight)
     var offload_policy = anima_offload_policy_from_train_config(cfg)
     var sample_cadence = anima_sample_cadence_from_train_config(cfg_path, cfg)
     var sample_enabled = anima_sampling_enabled(sample_cadence)
@@ -1344,7 +1344,7 @@ def main() raises:
         # optimizer-step index (OneTrainer keys LR + AdamW bias-correction on the
         # OPTIMIZER step, not the micro-step). N==1 => optimizer_step == completed_step.
         var optimizer_step = ((completed_step - 1) // accum_steps) + 1
-        var step_lr = ot_lr_for_optimizer_step(cfg, optimizer_step)
+        var step_lr = serenity_lr_for_optimizer_step(cfg, optimizer_step)
         if lokr_active:
             var mg = anima_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
             var mnorm = anima_lokr_grad_norm(mg)

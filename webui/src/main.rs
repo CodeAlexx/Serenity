@@ -27,8 +27,8 @@ use tokio::{
 
 mod captioner;
 mod board;
-// validate_config_enums is exercised by the config_smoke bin (shared file); in
-// the server bin only build_merged_config is called, so allow the rest.
+// The server bin calls build_merged_config + validate_config_enums (launch
+// path); the config_smoke bin exercises the rest of the shared file.
 #[allow(dead_code)]
 mod config_merge;
 
@@ -530,6 +530,14 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         Ok(v) => v,
         Err(e) => return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": e}))),
     };
+    // P1 fix #4: enum-validate on the LAUNCH path too (previously only the
+    // offline config_smoke ran this), so a reader-rejected enum is a 422 in
+    // the UI instead of a runtime fail-loud inside the spawned child.
+    let enum_errs = config_merge::validate_config_enums(&cfg);
+    if !enum_errs.is_empty() {
+        return (StatusCode::UNPROCESSABLE_ENTITY,
+                Json(json!({"error": format!("config rejected by trainer enum validation: {}", enum_errs.join("; "))})));
+    }
     let cache = req.cache.clone().unwrap_or_else(|| p.cache.clone());
     if p.argv_shape == "krea2" && !Path::new(&cache).exists() {
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("cache not found: {cache}")})));
@@ -570,7 +578,9 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             format!("{}", getf("lora_alpha", 16.0)),
             format!("{}", getf("learning_rate", 1e-4)),
             format!("{}", getu("save_every", 500)),
-            format!("{}", getf("caption_dropout", 0.0)),
+            // UI emit renamed caption_dropout -> caption_dropout_prob (the
+            // shared reader's key); argv10 reads the same renamed key.
+            format!("{}", getf("caption_dropout_prob", 0.0)),
             "-".into(),
             format!("{}", getu("sample_every", 0)),
             "20".into(),

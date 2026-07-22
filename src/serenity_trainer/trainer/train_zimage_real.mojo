@@ -171,18 +171,18 @@ from serenitymojo.training.sample_prompt_config import (
     SAMPLE_UNIT_STEP, SAMPLE_UNIT_NEVER,
     caps_sampling_active, warn_legacy_cached_caption_sampling,
 )
-from serenitymojo.training.onetrainer_train_loop_policy import (
-    OT_GRAD_POLICY_ON_ONLY,
-    ot_cache_dir_from_train_config,
-    ot_lr_for_optimizer_step,
-    ot_output_lora_path_from_train_config,
-    ot_sample_cadence_from_train_config,
-    ot_sampling_enabled,
-    ot_should_save_before_sample,
-    ot_should_save_checkpoint,
-    ot_step_lora_path,
-    validate_ot_gradient_checkpointing_policy,
-    validate_ot_train_math_policy,
+from serenitymojo.training.serenity_trainer_train_loop_policy import (
+    SERENITY_GRAD_POLICY_ON_ONLY,
+    serenity_cache_dir_from_train_config,
+    serenity_lr_for_optimizer_step,
+    serenity_output_lora_path_from_train_config,
+    serenity_sample_cadence_from_train_config,
+    serenity_sampling_enabled,
+    serenity_should_save_before_sample,
+    serenity_should_save_checkpoint,
+    serenity_step_lora_path,
+    validate_serenity_gradient_checkpointing_policy,
+    validate_serenity_train_math_policy,
 )
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON, TRAIN_OPTIMIZER_ADAMW,
@@ -192,9 +192,9 @@ from serenitymojo.training.train_config import (
     TRAIN_ADAPTER_ALGO_OFT, TRAIN_ADAPTER_ALGO_BOFT,
 )
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
-from serenitymojo.training.onetrainer_cache_preflight import (
-    create_onetrainer_cache_preflight_plan,
-    validate_onetrainer_cache_preflight_plan,
+from serenitymojo.training.serenity_trainer_cache_preflight import (
+    create_serenity_trainer_cache_preflight_plan,
+    validate_serenity_trainer_cache_preflight_plan,
 )
 from serenitymojo.autograd_v2.step_slab import StepSlab
 from serenitymojo.training.training_arena import TrainingArena
@@ -365,7 +365,7 @@ comptime OVERFIT_PROBE = False
 # JSON config (TrainConfig) — NO hardcoded recipe params. The previously-comptime
 # LR / ALPHA / TIMESTEP_SHIFT / SEED_BASE / CLIP_GRAD_NORM are now sourced from
 # train_cfg.{lr, lora_alpha, timestep_shift, seed, max_grad_norm}:
-#   - LR was already config-driven at the optimizer step (ot_lr_for_optimizer_step).
+#   - LR was already config-driven at the optimizer step (serenity_lr_for_optimizer_step).
 #   - ALPHA flows into build_zimage_lora_set / load_state as a runtime scale arg.
 #   - TIMESTEP_SHIFT feeds sample_timestep_logit_normal per step.
 #   - SEED_BASE (formerly fixed 42) is the trainer's master seed; the three
@@ -606,8 +606,8 @@ def validate_zimage_full_ft_config(cfg: TrainConfig) raises:
         raise Error("Z-Image full-FT v1 is batch-1 only")
     if cfg.max_grad_norm <= Float32(0.0):
         raise Error("Z-Image full-FT requires max_grad_norm > 0")
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("Z-Image full-FT trainer"), OT_GRAD_POLICY_ON_ONLY
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("Z-Image full-FT trainer"), SERENITY_GRAD_POLICY_ON_ONLY
     )
 
 
@@ -641,8 +641,8 @@ def validate_zimage_controlnet_config(cfg: TrainConfig) raises:
         raise Error("Z-Image controlnet requires max_grad_norm > 0")
     if levers_optimizer_active(cfg):
         raise Error("Z-Image controlnet v1 uses its own AdamW group; optimizer levers are not wired")
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("Z-Image controlnet trainer"), OT_GRAD_POLICY_ON_ONLY
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("Z-Image controlnet trainer"), SERENITY_GRAD_POLICY_ON_ONLY
     )
 
 
@@ -760,14 +760,14 @@ def validate_zimage_train_config(cfg: TrainConfig) raises:
     var policy_cfg = cfg.copy()
     if levers_optimizer_active(cfg):
         policy_cfg.optimizer = TRAIN_OPTIMIZER_ADAMW
-    validate_ot_train_math_policy(policy_cfg, String("Z-Image trainer"))
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("Z-Image trainer"), OT_GRAD_POLICY_ON_ONLY
+    validate_serenity_train_math_policy(policy_cfg, String("Z-Image trainer"))
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("Z-Image trainer"), SERENITY_GRAD_POLICY_ON_ONLY
     )
 
 
 def zimage_cache_dir_from_train_config(cfg: TrainConfig) -> String:
-    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+    return serenity_cache_dir_from_train_config(cfg, String(CACHE_DIR))
 
 
 def zimage_transformer_dir_from_train_config(cfg: TrainConfig) -> String:
@@ -777,7 +777,7 @@ def zimage_transformer_dir_from_train_config(cfg: TrainConfig) -> String:
 
 
 def zimage_output_lora_path_from_train_config(cfg: TrainConfig, completed_step: Int) -> String:
-    return ot_output_lora_path_from_train_config(
+    return serenity_output_lora_path_from_train_config(
         cfg, String(LORA_DIR), String("zimage_lora"), completed_step
     )
 
@@ -785,25 +785,25 @@ def zimage_output_lora_path_from_train_config(cfg: TrainConfig, completed_step: 
 def zimage_sample_cadence_from_train_config(
     cfg_path: String, cfg: TrainConfig,
 ) raises -> SampleCadence:
-    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+    return serenity_sample_cadence_from_train_config(cfg_path, cfg)
 
 
 def zimage_sampling_enabled(cadence: SampleCadence) -> Bool:
-    return ot_sampling_enabled(cadence)
+    return serenity_sampling_enabled(cadence)
 
 
 def zimage_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
-    return ot_should_save_checkpoint(cfg, completed_step)
+    return serenity_should_save_checkpoint(cfg, completed_step)
 
 
 def zimage_should_save_before_sample(
     cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
 ) raises -> Bool:
-    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+    return serenity_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 def _step_lora_path(base_path: String, step: Int) -> String:
-    return ot_step_lora_path(base_path, step)
+    return serenity_step_lora_path(base_path, step)
 
 
 # T1.B: save the EMA shadow set as the *_ema.safetensors sibling of a
@@ -1816,7 +1816,7 @@ def _train_one_step_bucket[
             zimage_direct_dora_clip_grads(
                 dg.grads, train_cfg.max_grad_norm / Float32(gn_before),
             )
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
         zimage_direct_dora_adamw_step(
             direct_dora, dg.grads, k, step_lr,
             train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
@@ -1858,7 +1858,7 @@ def _train_one_step_bucket[
             zimage_direct_oft_clip_grads(
                 og.grads, train_cfg.max_grad_norm / Float32(gn_before),
             )
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+        var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
         zimage_direct_oft_adamw_step(
             direct_oft, og.grads, k, step_lr,
             train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
@@ -1922,7 +1922,7 @@ def _train_one_step_bucket[
         )
     var t_bwd = perf_counter_ns()
 
-    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
     var gn_before: Float64
     if lokr_active:
         var mg = zimage_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
@@ -2256,7 +2256,7 @@ def _train_one_step_bucket_capture[
     if b.enabled and b.phase < 2:
         b.phase += 1
 
-    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
     var gn_before = Float64(0.0)
     var nonfinite_lora_grads = 0
     if levers_optimizer_active(train_cfg):
@@ -2504,7 +2504,7 @@ def _full_ft_step[
         gscale = Float32(Float64(train_cfg.max_grad_norm) / gn)
     var t_norm = perf_counter_ns()
 
-    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
     var st = zimage_full_ft_step(
         ft_opt, grads, gscale, k, step_lr,
         train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
@@ -2894,7 +2894,7 @@ def _cn_step[
         d_hints, cnf, N_IMG_REAL_B, cn_dev,
         x_cos[], x_sin[], uni_cos[], uni_sin[], D, F, EPS, ctx,
     )
-    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
     var gn = zimage_cn_apply_step(
         cn_params, grads, adaln_h, k, step_lr,
         train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
@@ -3143,8 +3143,8 @@ def main() raises:
     var carrier_active = lokr_active or loha_active
     var direct_active = dora_active or oft_active
     var direct_targets = 1 if train_cfg.lokr_targets == 1 else 2
-    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
-    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var cache_preflight = create_serenity_trainer_cache_preflight_plan(train_cfg)
+    validate_serenity_trainer_cache_preflight_plan(cache_preflight)
 
     def _is_gate_mode(v: String) -> Bool:
         return (
@@ -4420,7 +4420,7 @@ def _train_one_step_bucket_b2[
         loss = Float32(sse / Float64(2 * real_nout))
     var t_loss = perf_counter_ns()
 
-    var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+    var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
     var gn_before = Float64(0.0)
     var nonfinite_lora_grads = 0
     var t_bwd: UInt

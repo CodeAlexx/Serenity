@@ -106,18 +106,18 @@ from serenitymojo.training.sample_prompt_config import (
     caps_sampling_active, assert_enabled_sample_prompts,
     warn_legacy_cached_caption_sampling,
 )
-from serenitymojo.training.onetrainer_train_loop_policy import (
-    OT_GRAD_POLICY_ON_ONLY,
-    ot_cache_dir_from_train_config,
-    ot_output_lora_path_for_stream_from_train_config,
-    ot_sample_cadence_from_train_config,
-    ot_sampling_enabled,
-    ot_should_save_before_sample,
-    ot_should_save_checkpoint,
-    ot_lr_for_optimizer_step,
-    validate_ot_gradient_checkpointing_policy,
-    validate_ot_lora_adamw_loop_policy,
-    validate_ot_train_math_policy,
+from serenitymojo.training.serenity_trainer_train_loop_policy import (
+    SERENITY_GRAD_POLICY_ON_ONLY,
+    serenity_cache_dir_from_train_config,
+    serenity_output_lora_path_for_stream_from_train_config,
+    serenity_sample_cadence_from_train_config,
+    serenity_sampling_enabled,
+    serenity_should_save_before_sample,
+    serenity_should_save_checkpoint,
+    serenity_lr_for_optimizer_step,
+    validate_serenity_gradient_checkpointing_policy,
+    validate_serenity_lora_adamw_loop_policy,
+    validate_serenity_train_math_policy,
 )
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON,
@@ -133,9 +133,9 @@ from serenitymojo.training.train_config import (
 from serenitymojo.training.adapter_algo_policy import adapter_algo_name
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
 from serenitymojo.training.caption_dropout import should_drop_caption
-from serenitymojo.training.onetrainer_cache_preflight import (
-    create_onetrainer_cache_preflight_plan,
-    validate_onetrainer_cache_preflight_plan,
+from serenitymojo.training.serenity_trainer_cache_preflight import (
+    create_serenity_trainer_cache_preflight_plan,
+    validate_serenity_trainer_cache_preflight_plan,
 )
 
 
@@ -170,7 +170,7 @@ comptime RANK = 16
 # (TrainConfig.py:1144); OT scale = alpha/rank (LoRAModule.py:329) = 1/16 = 0.0625.
 comptime ALPHA = Float32(1.0)
 # OneTrainer "#sdxl 1.0 LoRA" preset learning_rate (3e-4). The optimizer step
-# reads train_cfg.lr (via ot_lr_for_optimizer_step) — this comptime is only the
+# reads train_cfg.lr (via serenity_lr_for_optimizer_step) — this comptime is only the
 # arch/recipe bookkeeping constant the config guard checks against.
 comptime LR = Float32(3.0e-4)
 comptime BETA_START = Float64(0.00085)
@@ -297,7 +297,7 @@ def validate_sdxl_train_config(cfg: TrainConfig) raises:
     if not _close_f32(cfg.lora_alpha, ALPHA):
         raise Error("SDXL trainer lora_alpha does not match compiled constant")
     # Learning rate is config-driven (OneTrainer treats it as a pure preset
-    # value): the optimizer step uses cfg.lr via ot_lr_for_optimizer_step, so we
+    # value): the optimizer step uses cfg.lr via serenity_lr_for_optimizer_step, so we
     # only require lr > 0 here rather than pinning it to the compiled LR. The OT
     # "#sdxl 1.0 LoRA" preset sets 3e-4 (the compiled default); other valid LoRA
     # runs (e.g. a different lr in a sibling config) must NOT be rejected.
@@ -305,10 +305,10 @@ def validate_sdxl_train_config(cfg: TrainConfig) raises:
         raise Error("SDXL trainer requires learning_rate > 0")
     if not _close_f32(cfg.max_grad_norm, CLIP):
         raise Error("SDXL trainer max_grad_norm does not match compiled constant")
-    validate_ot_lora_adamw_loop_policy(cfg, String("SDXL trainer"))
-    validate_ot_train_math_policy(cfg, String("SDXL trainer"))
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("SDXL trainer"), OT_GRAD_POLICY_ON_ONLY
+    validate_serenity_lora_adamw_loop_policy(cfg, String("SDXL trainer"))
+    validate_serenity_train_math_policy(cfg, String("SDXL trainer"))
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("SDXL trainer"), SERENITY_GRAD_POLICY_ON_ONLY
     )
 
 
@@ -319,11 +319,11 @@ def sdxl_checkpoint_from_train_config(cfg: TrainConfig) -> String:
 
 
 def sdxl_cache_dir_from_train_config(cfg: TrainConfig) -> String:
-    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+    return serenity_cache_dir_from_train_config(cfg, String(CACHE_DIR))
 
 
 def sdxl_output_lora_path_for_st(cfg: TrainConfig, completed_step: Int, st_index: Int) -> String:
-    return ot_output_lora_path_for_stream_from_train_config(
+    return serenity_output_lora_path_for_stream_from_train_config(
         cfg, String(LORA_DIR), String("sdxl_lora"), st_index, completed_step
     )
 
@@ -359,21 +359,21 @@ def _mkdir_parent(path: String) raises:
 def sdxl_sample_cadence_from_train_config(
     cfg_path: String, cfg: TrainConfig,
 ) raises -> SampleCadence:
-    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+    return serenity_sample_cadence_from_train_config(cfg_path, cfg)
 
 
 def sdxl_sampling_enabled(cadence: SampleCadence) -> Bool:
-    return ot_sampling_enabled(cadence)
+    return serenity_sampling_enabled(cadence)
 
 
 def sdxl_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
-    return ot_should_save_checkpoint(cfg, completed_step)
+    return serenity_should_save_checkpoint(cfg, completed_step)
 
 
 def sdxl_should_save_before_sample(
     cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
 ) raises -> Bool:
-    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+    return serenity_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 # ── scaled-linear ᾱ table (train_sdxl.rs compute_alpha_bar) ───────────────────
@@ -955,8 +955,8 @@ def main() raises:
 
     var train_cfg = read_model_config(cfg_path)
     validate_sdxl_train_config(train_cfg)
-    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
-    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var cache_preflight = create_serenity_trainer_cache_preflight_plan(train_cfg)
+    validate_serenity_trainer_cache_preflight_plan(cache_preflight)
 
     var run_steps = DEFAULT_RUN_STEPS
     if len(a) > arg_base:
@@ -1405,7 +1405,7 @@ def main() raises:
         # Scheduled lr keys on OPTIMIZER steps, not micro-steps; with
         # accum_steps=1 this is ((k-1)//1)+1 == k => baseline unchanged.
         var optimizer_step = ((k - 1) // accum_steps) + 1
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, optimizer_step)
+        var step_lr = serenity_lr_for_optimizer_step(train_cfg, optimizer_step)
         var gn_before: Float64
         var progress_label = String("SDXL-lora")
         if lokr_active:

@@ -133,19 +133,19 @@ from serenitymojo.training.sample_prompt_config import (
     caps_sampling_active, assert_enabled_sample_prompts,
     warn_legacy_cached_caption_sampling,
 )
-from serenitymojo.training.onetrainer_train_loop_policy import (
-    OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED,
-    ot_cache_dir_from_train_config,
-    ot_output_lora_path_from_train_config,
-    ot_sample_cadence_from_train_config,
-    ot_sampling_enabled,
-    ot_should_save_before_sample,
-    ot_should_save_checkpoint,
-    ot_step_lora_path,
-    ot_lr_for_optimizer_step,
-    validate_ot_gradient_checkpointing_policy,
-    validate_ot_lora_adamw_loop_policy,
-    validate_ot_train_math_policy,
+from serenitymojo.training.serenity_trainer_train_loop_policy import (
+    SERENITY_GRAD_POLICY_ON_OR_CPU_OFFLOADED,
+    serenity_cache_dir_from_train_config,
+    serenity_output_lora_path_from_train_config,
+    serenity_sample_cadence_from_train_config,
+    serenity_sampling_enabled,
+    serenity_should_save_before_sample,
+    serenity_should_save_checkpoint,
+    serenity_step_lora_path,
+    serenity_lr_for_optimizer_step,
+    validate_serenity_gradient_checkpointing_policy,
+    validate_serenity_lora_adamw_loop_policy,
+    validate_serenity_train_math_policy,
 )
 from serenitymojo.training.train_config import (
     TrainConfig, GRADIENT_CHECKPOINTING_ON, GRADIENT_CHECKPOINTING_CPU_OFFLOADED,
@@ -159,9 +159,9 @@ from serenitymojo.training.trainer_core import (
     GradAccumWindow, trainer_prune_target_step, trainer_prune_step_checkpoint,
 )
 from serenitymojo.training.lokr_stack import LOKR_CARRIER_MAX_DEVICE_BYTES
-from serenitymojo.training.onetrainer_cache_preflight import (
-    create_onetrainer_cache_preflight_plan,
-    validate_onetrainer_cache_preflight_plan,
+from serenitymojo.training.serenity_trainer_cache_preflight import (
+    create_serenity_trainer_cache_preflight_plan,
+    validate_serenity_trainer_cache_preflight_plan,
 )
 from serenitymojo.training.flux_sample_resident import (
     flux_sample_offload, flux_decode_packed_to_png,
@@ -321,10 +321,10 @@ def validate_flux_train_config(cfg: TrainConfig) raises:
         raise Error("Flux trainer timestep_shift does not match compiled constant")
     if not _close_f32(cfg.max_grad_norm, CLIP_GRAD_NORM):
         raise Error("Flux trainer max_grad_norm does not match compiled constant")
-    validate_ot_lora_adamw_loop_policy(cfg, String("Flux trainer"))
-    validate_ot_train_math_policy(cfg, String("Flux trainer"))
-    validate_ot_gradient_checkpointing_policy(
-        cfg, String("Flux trainer"), OT_GRAD_POLICY_ON_OR_CPU_OFFLOADED
+    validate_serenity_lora_adamw_loop_policy(cfg, String("Flux trainer"))
+    validate_serenity_train_math_policy(cfg, String("Flux trainer"))
+    validate_serenity_gradient_checkpointing_policy(
+        cfg, String("Flux trainer"), SERENITY_GRAD_POLICY_ON_OR_CPU_OFFLOADED
     )
 
 
@@ -335,11 +335,11 @@ def flux_checkpoint_from_train_config(cfg: TrainConfig) -> String:
 
 
 def flux_cache_dir_from_train_config(cfg: TrainConfig) -> String:
-    return ot_cache_dir_from_train_config(cfg, String(CACHE_DIR))
+    return serenity_cache_dir_from_train_config(cfg, String(CACHE_DIR))
 
 
 def flux_output_lora_path_from_train_config(cfg: TrainConfig, completed_step: Int) -> String:
-    return ot_output_lora_path_from_train_config(
+    return serenity_output_lora_path_from_train_config(
         cfg, String(LORA_DIR), String("flux_lora"), completed_step
     )
 
@@ -375,25 +375,25 @@ def _mkdir_parent(path: String) raises:
 def flux_sample_cadence_from_train_config(
     cfg_path: String, cfg: TrainConfig,
 ) raises -> SampleCadence:
-    return ot_sample_cadence_from_train_config(cfg_path, cfg)
+    return serenity_sample_cadence_from_train_config(cfg_path, cfg)
 
 
 def flux_sampling_enabled(cadence: SampleCadence) -> Bool:
-    return ot_sampling_enabled(cadence)
+    return serenity_sampling_enabled(cadence)
 
 
 def flux_should_save_checkpoint(cfg: TrainConfig, completed_step: Int) -> Bool:
-    return ot_should_save_checkpoint(cfg, completed_step)
+    return serenity_should_save_checkpoint(cfg, completed_step)
 
 
 def flux_should_save_before_sample(
     cadence: SampleCadence, completed_step: Int, saved_this_step: Bool,
 ) raises -> Bool:
-    return ot_should_save_before_sample(cadence, completed_step, saved_this_step)
+    return serenity_should_save_before_sample(cadence, completed_step, saved_this_step)
 
 
 def _step_lora_path(base_path: String, step: Int) -> String:
-    return ot_step_lora_path(base_path, step)
+    return serenity_step_lora_path(base_path, step)
 
 
 # Rolling checkpoint retention (audit item #4), pruned AFTER a periodic save —
@@ -785,8 +785,8 @@ def main() raises:
 
     var train_cfg = read_model_config(cfg_path)
     validate_flux_train_config(train_cfg)
-    var cache_preflight = create_onetrainer_cache_preflight_plan(train_cfg)
-    validate_onetrainer_cache_preflight_plan(cache_preflight)
+    var cache_preflight = create_serenity_trainer_cache_preflight_plan(train_cfg)
+    validate_serenity_trainer_cache_preflight_plan(cache_preflight)
 
     var run_steps = DEFAULT_RUN_STEPS
     if len(a) > arg_base:
@@ -1250,7 +1250,7 @@ def main() raises:
             var dnorm = flux_direct_dora_grad_norm(grads_dora.grads)
             if dnorm > Float64(train_cfg.max_grad_norm):
                 flux_direct_dora_clip_grads(grads_dora.grads, train_cfg.max_grad_norm / Float32(dnorm))
-            var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+            var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
             flux_direct_dora_adamw_step(
                 dora_masters, grads_dora.grads, k, step_lr,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
@@ -1307,7 +1307,7 @@ def main() raises:
             var onorm = flux_direct_oft_grad_norm(grads_oft.grads)
             if onorm > Float64(train_cfg.max_grad_norm):
                 flux_direct_oft_clip_grads(grads_oft.grads, train_cfg.max_grad_norm / Float32(onorm))
-            var step_lr = ot_lr_for_optimizer_step(train_cfg, k)
+            var step_lr = serenity_lr_for_optimizer_step(train_cfg, k)
             flux_direct_oft_adamw_step(
                 oft_masters, grads_oft.grads, k, step_lr,
                 train_cfg.beta1, train_cfg.beta2, train_cfg.eps,
@@ -1545,7 +1545,7 @@ def main() raises:
         # grad-accum: LR schedule + AdamW step counter advance per OPTIMIZER step,
         # not per micro-step (N==1 => optimizer_step==k, byte-identical).
         var optimizer_step = ((k - 1) // accum_steps) + 1
-        var step_lr = ot_lr_for_optimizer_step(train_cfg, optimizer_step)
+        var step_lr = serenity_lr_for_optimizer_step(train_cfg, optimizer_step)
         if lokr_active:
             var mg = flux_lokr_chain_all(lokr_masters, grads.d_a, grads.d_b)
             var mnorm = flux_lokr_grad_norm(mg)
