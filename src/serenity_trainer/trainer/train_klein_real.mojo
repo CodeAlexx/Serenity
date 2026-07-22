@@ -1301,10 +1301,20 @@ def main() raises:
         var resident_budget_bytes = (
             0 if (carrier_active or large_inline_sample) else RESIDENT_BUDGET_BYTES
         )
-        pinned_blocks = loader.pin_residents(resident_budget_bytes, ctx)
+        # 16GB residency refit (P6 wave 2, 2026-07-22): config key
+        # `resident_blocks` (ltx2_av --resident_blocks semantics) caps the
+        # pinned-block COUNT under the comptime byte budget. -1/absent keeps
+        # the 24GB-box behavior (budget-only, 9 GiB). The 9 GiB pin + ~12 GiB
+        # streamed-step working set OOMs the 16 GiB RTX 5080 — the preset
+        # carries a low count instead. Residency knob only: pinned bytes are
+        # byte-identical to streamed bytes (resident_byte_identity_smoke).
+        pinned_blocks = loader.pin_residents(
+            resident_budget_bytes, ctx, max_blocks=cfg.resident_blocks
+        )
         print(
             "  [streamed_base_opt_in] resident blocks pinned:", pinned_blocks,
             "of", n_blocks, " budget_bytes=", resident_budget_bytes,
+            " resident_blocks_cap=", cfg.resident_blocks,
             " (bf16 partial pin + per-step disk stream — anchor/A-B arm).",
         )
         if large_inline_sample:
