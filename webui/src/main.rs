@@ -1198,6 +1198,35 @@ async fn config_put(axum::extract::Path(name): axum::extract::Path<String>, Json
     }
 }
 
+/// Server-side filesystem browser for path pickers. Bounded to /home/alex and
+/// /mnt; returns dirs + files (names only) for one directory.
+#[derive(serde::Deserialize)]
+struct FsQuery { path: Option<String> }
+
+async fn fs_list(axum::extract::Query(q): axum::extract::Query<FsQuery>) -> (StatusCode, Json<Value>) {
+    let path = q.path.unwrap_or_else(|| "/home/alex".into());
+    let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| std::path::PathBuf::from("/home/alex"));
+    let cs = canon.to_string_lossy().to_string();
+    if !(cs == "/home/alex" || cs.starts_with("/home/alex/") || cs == "/mnt" || cs.starts_with("/mnt/")) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "path outside /home/alex and /mnt"})));
+    }
+    let mut dirs: Vec<String> = vec![];
+    let mut files: Vec<String> = vec![];
+    match std::fs::read_dir(&canon) {
+        Ok(rd) => {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') { continue; }
+                if e.file_type().map(|t| t.is_dir()).unwrap_or(false) { dirs.push(name); } else { files.push(name); }
+            }
+        }
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(json!({"error": e.to_string()}))),
+    }
+    dirs.sort(); files.sort();
+    let parent = canon.parent().map(|p| p.to_string_lossy().to_string());
+    (StatusCode::OK, Json(json!({"path": cs, "parent": parent, "dirs": dirs, "files": files})))
+}
+
 async fn events(State(st): State<Arc<AppState>>) -> Sse<EvStream> {
     let rx = st.events.subscribe();
     Sse::new(EvStream::new(rx)).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
@@ -1279,6 +1308,7 @@ async fn main() {
         .route("/api/ui/state", get(ui_state_get).put(ui_state_put))
         .route("/api/configs", get(configs_list))
         .route("/api/configs/:name", get(config_get).put(config_put))
+        .route("/api/fs", get(fs_list))
         .route("/files/*path", get(file_serve))
         .nest_service("/", tower_http::services::ServeDir::new(static_dir).append_index_html_on_directories(true))
         .with_state(st);

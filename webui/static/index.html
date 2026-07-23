@@ -112,6 +112,11 @@
   .capnote.info { color:var(--dim); }
   #lightbox { display:none; position:fixed; inset:0; background:rgba(0,0,0,.85); z-index:9; align-items:center; justify-content:center; }
   #lightbox img { max-width:92vw; max-height:92vh; border-radius:8px; }
+  #fsmodal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:8; align-items:center; justify-content:center; }
+  #fsbox { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:14px 16px; width:min(680px,92vw); max-height:80vh; display:flex; flex-direction:column; }
+  #fs_list { overflow-y:auto; margin-top:6px; }
+  .fsrow { padding:5px 8px; border-radius:5px; cursor:pointer; font-size:13px; }
+  .fsrow:hover { background:var(--bg); }
 </style>
 </head>
 <body>
@@ -449,7 +454,7 @@
 
       <div class="panel"><h3>LAYER FILTER</h3><div class="sub">Target layer preset + explicit filter</div>
         <div class="grid2"><div>
-          <div class="row"><label>Preset</label><select id="layer_filter_preset"><option>full</option><option>attention</option><option>mlp</option><option>double_blocks</option><option>single_blocks</option></select></div>
+          <div class="row"><label>Preset</label><select id="layer_filter_preset" onchange="fillLayerFilter(this.value)"><option>full</option><option>attention</option><option>mlp</option><option>double_blocks</option><option>single_blocks</option></select></div>
         </div><div>
           <div class="row"><label>Regex</label><input id="layer_filter_regex" type="checkbox"></div>
         </div></div>
@@ -583,6 +588,18 @@
   </aside>
 </main>
 <div id="lightbox" onclick="this.style.display='none'"><img id="lbimg"></div>
+<div id="fsmodal" onclick="if(event.target===this)this.style.display='none'">
+  <div id="fsbox">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
+      <b id="fs_path" style="font-size:12px;word-break:break-all"></b>
+      <span style="flex:1"></span>
+      <button id="fs_use" class="btnp" onclick="fsUseDir()">Use this folder</button>
+      <button onclick="$('fsmodal').style.display='none'" style="background:var(--bad);color:#fff;border:0;border-radius:6px;padding:6px 12px;cursor:pointer">Cancel</button>
+    </div>
+    <div id="fs_err" style="color:var(--bad);font-size:12px"></div>
+    <div id="fs_list"></div>
+  </div>
+</div>
 <script>
 // surface any script failure in the validation slot instead of dying silently
 window.onerror = (m, s, l) => { const el = document.getElementById("valid"); if (el) el.textContent = "JS error: " + m + " @" + l; };
@@ -626,6 +643,7 @@ async function loadPresets() {
   const j = await (await fetch("/api/presets")).json();
   PRESETS = j.presets;
   refreshConfigList();
+  attachBrowsers();
   $("preset").innerHTML = PRESETS.map(p =>
     `<option value="${p.id}" ${p.wired?"":"disabled"}>${p.label}${p.wired?"":" (not coded)"}</option>`).join("");
   applyPreset();
@@ -1072,6 +1090,57 @@ function applyTheme(name) {
   const pick = $("theme_pick"); if (pick && pick.value !== name) pick.value = name;
   document.querySelectorAll(".swatch").forEach(sw => sw.classList.toggle("sel", sw.dataset.theme === name));
 }
+const LAYER_FILTER_FILLS = { full: "", attention: "attention", mlp: "feed_forward",
+  double_blocks: "double_blocks", single_blocks: "single_blocks" };
+function fillLayerFilter(p) {
+  const el = $("layer_filter");
+  el.value = LAYER_FILTER_FILLS[p] !== undefined ? LAYER_FILTER_FILLS[p] : el.value;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+}
+
+/* ── server-side path picker: browse button next to every path field ── */
+const BROWSE_FIELDS = [["ds_folder","dir"],["cap_folder","dir"],["cache","dir"],
+  ["checkpoint","file"],["resume_state","file"],["validation_prompts_file","file"],
+  ["val_file","file"],["dataset_path","dir"],["vae_override","file"]];
+let FS_TARGET = null, FS_MODE = "dir";
+function attachBrowsers() {
+  for (const [id, mode] of BROWSE_FIELDS) {
+    const el = $(id); if (!el || el.dataset.browse) continue;
+    el.dataset.browse = "1";
+    const b = document.createElement("button");
+    b.textContent = "\uD83D\uDCC1"; b.title = "Browse server files"; b.type = "button";
+    b.style.cssText = "margin-left:6px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;cursor:pointer";
+    b.onclick = () => openFsPicker(id, mode);
+    el.insertAdjacentElement("afterend", b);
+    el.parentElement.style.display = "flex";
+  }
+}
+async function fsGo(path) {
+  const j = await (await fetch("/api/fs?path=" + encodeURIComponent(path))).json();
+  if (j.error) { $("fs_err").textContent = j.error; return; }
+  $("fs_err").textContent = "";
+  $("fs_path").textContent = j.path; $("fs_path").dataset.path = j.path;
+  const rows = [];
+  if (j.parent) rows.push(`<div class="fsrow" onclick="fsGo('${j.parent.replace(/'/g,"\\'")}')">&#8617; ..</div>`);
+  for (const d of j.dirs) rows.push(`<div class="fsrow" onclick="fsGo('${(j.path+"/"+d).replace(/'/g,"\\'")}')">&#128193; ${d}</div>`);
+  if (FS_MODE === "file") for (const f of j.files)
+    rows.push(`<div class="fsrow fsfile" onclick="fsPick('${(j.path+"/"+f).replace(/'/g,"\\'")}')">&#128196; ${f}</div>`);
+  $("fs_list").innerHTML = rows.join("");
+}
+function openFsPicker(targetId, mode) {
+  FS_TARGET = targetId; FS_MODE = mode;
+  $("fs_use").style.display = mode === "dir" ? "inline-block" : "none";
+  $("fsmodal").style.display = "flex";
+  const cur = $(targetId).value;
+  fsGo(cur && cur.startsWith("/") ? cur.replace(/\/[^\/]*$/, "") || "/home/alex" : "/home/alex");
+}
+function fsPick(path) {
+  const el = $(FS_TARGET); el.value = path;
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  $("fsmodal").style.display = "none";
+}
+function fsUseDir() { fsPick($("fs_path").dataset.path); }
+
 /* ── OneTrainer-style named configs: Save writes every field + preset + run
    name to webui/saved_configs/<name>.json; Open applies preset then values. ── */
 function collectAllFields() {
