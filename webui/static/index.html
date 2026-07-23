@@ -379,27 +379,19 @@
         </div></div>
       </div>
 
-      <div class="panel"><h3>TEXT ENCODER</h3><div class="sub">TE training is not coded (encoders frozen in all trainers)</div>
+      
+      
+      <div class="panel"><h3>PER-MODULE (OneTrainer parity)</h3><div class="sub">Encoders are frozen and the transformer is the trained module in every Serenity trainer — these per-module knobs have no code</div>
         <div class="grid2"><div>
-          
-          <div class="row nw"><label>Stop after <span class="nwtag">not coded</span></label><input type="number" value="30"></div>
+          <div class="row nw"><label>TE learning rate <span class="nwtag">not coded</span></label><input type="number" step="0.00001" value="0.00001"></div>
+          <div class="row nw"><label>TE stop after <span class="nwtag">not coded</span></label><input type="number" value="30"></div>
+          <div class="row nw"><label>TE sequence length <span class="nwtag">not coded</span></label><input value="512"></div>
         </div><div>
-          <div class="row nw"><label>Learning rate <span class="nwtag">not coded</span></label><input type="number" step="0.00001" value="0.00001"></div>
-          <div class="row nw"><label>Sequence length <span class="nwtag">not coded</span></label><input value="512"></div>
-        </div></div>
-      </div>
-
-      <div class="panel"><h3>TRANSFORMER</h3><div class="sub">Transformer is the trained module; toggle on the Model tab</div>
-        <div class="grid2"><div>
-          
-          <div class="row nw"><label>Stop after <span class="nwtag">not coded</span></label><input type="number" value="0"></div>
+          <div class="row nw"><label>Transformer stop after <span class="nwtag">not coded</span></label><input type="number" value="0"></div>
           <div class="row nw"><label>Attention mask <span class="nwtag">not coded</span></label><input type="checkbox"></div>
-        </div><div>
-          <div class="row"><label>Learning rate <span class="nwtag">= Learning rate</span></label><input type="number" step="0.00001" value="0.0004" disabled></div>
           <div class="row nw"><label>Guidance scale <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="1.0"></div>
         </div></div>
       </div>
-
       <div class="panel"><h3>NOISE &amp; TIMESTEPS</h3><div class="sub">Flow-matching sigma-draw policy: distribution + offset/perturbation noise (config-reader consumed; timestep_shift + train shift are on Base Schedule)</div>
         <div class="grid2"><div>
           <div class="row"><label>Offset noise <span class="wtag">wired</span></label><input id="offset_noise_weight" type="number" step="0.01" value="0"></div>
