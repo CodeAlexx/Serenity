@@ -13,6 +13,7 @@
   #runname_top { background:var(--panel); border:1px solid var(--line); border-radius:6px; color:var(--fg); padding:5px 10px; width:200px; font:inherit; }
   #livetarget { color:var(--dim); font-size:12px; }
   #startbtn { background:var(--orange); color:#1a1206; border:0; border-radius:6px; padding:8px 20px; font-weight:700; cursor:pointer; margin-left:auto; }
+  #cfg_open, #cfg_save { background:var(--panel); color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:7px 12px; cursor:pointer; font-size:12px; }
   #stopbtn { background:var(--bad); color:#fff; border:0; border-radius:6px; padding:8px 16px; font-weight:700; cursor:pointer; display:none; }
   #valid { font-size:12px; color:var(--dim); }
   main { display:grid; grid-template-columns: 170px 1fr 250px; min-height:calc(100vh - 46px); }
@@ -30,7 +31,7 @@
   .panel .sub { color:var(--dim); font-size:11px; margin-bottom:12px; }
   .grid2 { display:grid; grid-template-columns:1fr 1fr; gap:0 24px; }
   .row { display:grid; grid-template-columns:150px 1fr; align-items:center; gap:10px; margin:5px 0; }
-  .row label { color:var(--dim); font-size:12px; }
+  .row label { color:var(--fg); opacity:.87; font-size:12px; }
   input, select { width:100%; background:#12171d; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font:inherit; font-size:13px; }
   input[type=checkbox] { width:auto; }
   /* sane field widths — numbers are short, enums medium; only paths/expressions go wide */
@@ -44,8 +45,9 @@
   .sec { display:none; }
   .sec.show { display:block; }
   /* ── not-coded fields: visible but dimmed, excluded from launch. ── */
-  .nw > label { opacity:.6; }
-  .nw > input, .nw > select { opacity:.55; }
+  .nw > label { opacity:.45; }
+  .nw > input, .nw > select { opacity:.4; }
+  .row input[type=checkbox] { justify-self:start; }
   .nwtag { display:inline-block; color:var(--orange); font-size:9px; letter-spacing:.04em; border:1px solid var(--orange); border-radius:3px; padding:0 4px; margin-left:6px; opacity:.75; vertical-align:middle; text-transform:uppercase; }
   .panel h3 .nwtag { font-size:9px; }
   .wtag { display:inline-block; color:var(--ok); font-size:9px; letter-spacing:.04em; border:1px solid var(--ok); border-radius:3px; padding:0 4px; margin-left:6px; opacity:.7; vertical-align:middle; text-transform:uppercase; }
@@ -116,6 +118,11 @@
 <header>
   <h1>SERENITY TRAINER</h1>
   <input id="runname_top" placeholder="run name">
+  <select id="preset" title="Architecture" style="max-width:220px"></select>
+  <select id="saved_configs" title="Saved configs" style="max-width:170px" onchange="$('cfg_name').value=this.value"><option value="">— configs —</option></select>
+  <input id="cfg_name" placeholder="config name" style="max-width:150px">
+  <button id="cfg_open" onclick="openConfig()">Open</button>
+  <button id="cfg_save" onclick="saveConfig()">Save config</button>
   <span id="livetarget">Live target — …</span>
   <span id="valid">VALIDATION — …</span>
   <button id="stopbtn">Stop</button>
@@ -164,7 +171,7 @@
           <div class="row"><label>Validation gates</label><input id="validation" type="checkbox"></div>
         </div></div>
       </div>
-      <div class="panel"><h3>DEVICE</h3><div class="sub">Placement and precision defaults — single RTX 3090 Ti; these are surface-only</div>
+      <div class="panel"><h3>DEVICE</h3><div class="sub">Single-GPU box — placement knobs are not coded; precision + offload live in Training &#8594; Precision &amp; Memory</div>
         <div class="grid2"><div>
           <div class="row nw"><label>Train device <span class="nwtag">not coded</span></label><select><option>cuda</option><option>cpu</option></select></div>
           <div class="row nw"><label>Temp device <span class="nwtag">not coded</span></label><select><option>cpu</option><option>cuda</option></select></div>
@@ -193,7 +200,6 @@
               <select id="training_method"><option>LoRA</option><option>Fine Tune</option><option>Embedding</option></select></div>
             <div class="row nw"><label>Model Type <span class="nwtag">preset-derived</span></label>
               <select id="model_type"><option>IDEOGRAM_4</option><option selected>FLUX_2</option><option>STABLE_DIFFUSION_XL_10_BASE</option><option>STABLE_DIFFUSION_35</option><option>CHROMA_1</option><option>ERNIE_IMAGE</option><option>ANIMA</option><option>Z_IMAGE</option><option>Z_IMAGE_L2P</option><option>LTX_2_VIDEO</option><option>WAN_22_VIDEO</option><option>HIDREAM_O1</option><option>KREA_2</option><option>WAN_21</option><option>MAGEFLOW</option><option>FLUX_1</option><option>KLEIN_4B</option></select></div>
-            <div class="row"><label>Architecture</label><select id="preset"></select></div>
             <div class="capnote info" id="cap_backend_note"></div>
             <div class="row"><label>Base Model</label><input id="checkpoint"></div>
             <div class="row"><label>VAE (override)</label><input id="vae_override" placeholder="preset default"></div>
@@ -320,11 +326,12 @@
 
     <!-- TRAINING -->
     <div class="sec" id="sec-training">
-      <div class="panel"><h3>BASE SCHEDULE</h3><div class="sub">Steps, epochs, batch, and LR cycle</div>
+      <div class="panel"><h3>BASE SCHEDULE</h3><div class="sub">Steps, epochs, LR, timestep shifts, batch</div>
         <div class="grid2"><div>
           <div class="row"><label>Max steps</label><input id="max_steps" type="number"></div>
           <div class="row"><label>Learning rate</label><input id="learning_rate" type="number" step="0.00001"></div>
           <div class="row"><label>Timestep shift</label><input id="timestep_shift" type="number" step="0.1"></div>
+          <div class="row"><label>Train timestep shift</label><input id="train_timestep_shift" type="number" step="0.1" placeholder="= timestep shift"></div>
           <div class="row"><label>Seed</label><input id="seed" type="number" placeholder="preset"></div>
           <div class="row"><label>Batch size</label><input id="batch_size" type="number" value="1" min="1" max="2"></div>
           <div class="row"><label>Grad accum steps</label><input id="gradient_accumulation_steps" type="number" value="1" min="1"></div>
@@ -371,17 +378,13 @@
         </div></div>
       </div>
 
-      <div class="panel"><h3>EMA &amp; TARGETS</h3><div class="sub">EMA is consumed by klein/zimage/hidream/ideogram4; the trainable-section toggles are surface-only</div>
+      <div class="panel"><h3>EMA</h3><div class="sub">Consumed by klein / zimage / hidream / ideogram4 (capability-gated per backend)</div>
         <div class="grid2"><div>
           <div class="row"><label>EMA</label><input id="ema_enabled" type="checkbox"></div>
           <div class="row"><label>EMA decay</label><input id="ema_decay" type="number" step="0.0001" value="0.999"></div>
           <div class="capnote" id="capnote_ema"></div>
           <div class="row"><label>EMA update interval</label><input id="ema_update_step_interval" type="number" value="5"></div>
         </div><div>
-          
-          
-          <div class="row nw"><label>TE stop after <span class="nwtag">not coded</span></label><input type="number" value="30"></div>
-          <div class="row nw"><label>Transformer stop after <span class="nwtag">not coded</span></label><input type="number" value="0"></div>
         </div></div>
       </div>
 
@@ -426,8 +429,8 @@
           <div class="row nw"><label>log-cosh strength <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="0"></div>
           <div class="row"><label>Huber strength</label><input id="huber_strength" type="number" step="0.1" value="0"></div>
           <div class="row nw"><label>VB strength <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="0"></div>
-          <div class="row"><label>Weight fn <span class="nwtag">min-SNR is the field above; rest not coded</span></label><select disabled><option>MIN_SNR_GAMMA</option></select></div>
-          <div class="row"><label>Weight gamma <span class="nwtag">= Min-SNR gamma above</span></label><input type="number" step="0.1" value="5" disabled></div>
+          <div class="row"><label>Weight fn <span class="nwtag">not coded</span></label><select disabled><option>MIN_SNR_GAMMA</option></select></div>
+          <div class="row"><label>Weight gamma <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="5" disabled></div>
           <div class="row nw"><label>Loss scaler <span class="nwtag">not coded</span></label><select><option>NONE</option><option>MIN_SNR_GAMMA</option><option>P2</option></select></div>
         </div></div>
       </div>
@@ -601,7 +604,7 @@ const EXTRA_FIELDS = ["network_algorithm","caption_dropout_prob","batch_size","g
                       "only_cache","continue_last_backup","dataloader_threads","tensorboard","tensorboard_always_on","validation",
                       "output_model_format","output_dtype","train_transformer","train_text_encoder","lora_weight_dtype",
                       "dataset_path","concept_file_name","latent_caching","clear_cache_before_training","cache_text_embeddings",
-                      "epochs","learning_rate_min_factor","learning_rate_cycles","lr_scheduler",
+                      "epochs","learning_rate_min_factor","learning_rate_cycles","lr_scheduler","train_timestep_shift",
                       "train_dtype","fallback_train_dtype","gradient_checkpointing","enable_activation_offloading","layer_offload_fraction",
                       "offset_noise_weight","perturbation_noise_weight","timestep_distribution","noising_weight","noising_bias",
                       "mse_strength","mae_strength","huber_strength",
@@ -622,6 +625,7 @@ document.querySelectorAll("nav a[data-sec]").forEach(a => a.onclick = () => {
 async function loadPresets() {
   const j = await (await fetch("/api/presets")).json();
   PRESETS = j.presets;
+  refreshConfigList();
   $("preset").innerHTML = PRESETS.map(p =>
     `<option value="${p.id}" ${p.wired?"":"disabled"}>${p.label}${p.wired?"":" (not coded)"}</option>`).join("");
   applyPreset();
@@ -1067,6 +1071,50 @@ function applyTheme(name) {
   r.setProperty("--orange", orange);
   const pick = $("theme_pick"); if (pick && pick.value !== name) pick.value = name;
   document.querySelectorAll(".swatch").forEach(sw => sw.classList.toggle("sel", sw.dataset.theme === name));
+}
+/* ── OneTrainer-style named configs: Save writes every field + preset + run
+   name to webui/saved_configs/<name>.json; Open applies preset then values. ── */
+function collectAllFields() {
+  const vals = {};
+  for (const f of RECIPE_FIELDS.concat(EXTRA_FIELDS)) {
+    const el = $(f); if (!el) continue;
+    vals[f] = el.type === "checkbox" ? el.checked : el.value;
+  }
+  for (const f of ["seed","ema_enabled","ema_decay","ema_update_step_interval","optimizer_name",
+                   "optimizer_weight_decay","resume_state","start_step","cache","checkpoint"]) {
+    const el = $(f); if (el) vals[f] = el.type === "checkbox" ? el.checked : el.value;
+  }
+  return vals;
+}
+async function refreshConfigList(selectName) {
+  const j = await (await fetch("/api/configs")).json();
+  $("saved_configs").innerHTML = '<option value="">— configs —</option>' +
+    j.configs.map(n => `<option${n === selectName ? " selected" : ""}>${n}</option>`).join("");
+}
+async function saveConfig() {
+  const name = ($("cfg_name").value || $("saved_configs").value || $("runname_top").value || "").trim();
+  if (!name) { $("msg").textContent = "type a config name first"; return; }
+  const body = { preset_id: $("preset").value, run_name: $("runname_top").value, fields: collectAllFields() };
+  const r = await fetch("/api/configs/" + encodeURIComponent(name), {
+    method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  $("msg").textContent = r.ok ? "✓ saved config '" + name + "'" : "✗ " + j.error;
+  if (r.ok) refreshConfigList(name);
+}
+async function openConfig() {
+  const name = $("saved_configs").value;
+  if (!name) { $("msg").textContent = "pick a config to open"; return; }
+  const r = await fetch("/api/configs/" + encodeURIComponent(name));
+  const j = await r.json();
+  if (!r.ok) { $("msg").textContent = "✗ " + j.error; return; }
+  if (j.preset_id) { $("preset").value = j.preset_id; applyPreset(); }
+  if (j.run_name) { $("runname_top").value = j.run_name; $("runname_top").dispatchEvent(new Event("input")); }
+  for (const [k, v] of Object.entries(j.fields || {})) {
+    const el = $(k); if (!el) continue;
+    if (el.type === "checkbox") el.checked = !!v; else el.value = v;
+  }
+  persistSave();
+  $("msg").textContent = "✓ opened config '" + name + "'";
 }
 function initThemes() {
   const pick = $("theme_pick"); if (!pick) return;

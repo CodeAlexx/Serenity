@@ -1154,6 +1154,50 @@ async fn ui_state_put(Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
     }
 }
 
+/// Named saved configs (OneTrainer-style Save/Load config) — one JSON per name
+/// under webui/saved_configs/. Body: {preset_id, run_name, fields:{id:value}}.
+fn saved_configs_dir() -> String {
+    format!("{REPO_ROOT}/webui/saved_configs")
+}
+
+fn config_name_ok(name: &str) -> bool {
+    !name.is_empty() && name.len() <= 80
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ' ' || c == '.')
+}
+
+async fn configs_list() -> Json<Value> {
+    let mut names: Vec<String> = std::fs::read_dir(saved_configs_dir()).map(|rd| rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().to_str().map(String::from))
+        .filter_map(|n| n.strip_suffix(".json").map(String::from))
+        .collect()).unwrap_or_default();
+    names.sort();
+    Json(json!({"configs": names}))
+}
+
+async fn config_get(axum::extract::Path(name): axum::extract::Path<String>) -> (StatusCode, Json<Value>) {
+    if !config_name_ok(&name) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad config name"})));
+    }
+    let p = format!("{}/{}.json", saved_configs_dir(), name);
+    match std::fs::read_to_string(&p).ok().and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+        Some(v) => (StatusCode::OK, Json(v)),
+        None => (StatusCode::NOT_FOUND, Json(json!({"error": format!("config '{name}' not found")}))),
+    }
+}
+
+async fn config_put(axum::extract::Path(name): axum::extract::Path<String>, Json(body): Json<Value>) -> (StatusCode, Json<Value>) {
+    if !config_name_ok(&name) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "bad config name"})));
+    }
+    let dir = saved_configs_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    match std::fs::write(format!("{dir}/{name}.json"), serde_json::to_string_pretty(&body).unwrap_or_default()) {
+        Ok(_) => (StatusCode::OK, Json(json!({"saved": name}))),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))),
+    }
+}
+
 async fn events(State(st): State<Arc<AppState>>) -> Sse<EvStream> {
     let rx = st.events.subscribe();
     Sse::new(EvStream::new(rx)).keep_alive(axum::response::sse::KeepAlive::new().interval(Duration::from_secs(15)))
@@ -1233,6 +1277,8 @@ async fn main() {
         .route("/api/validations", get(validations_get).put(validations_put))
         .route("/api/runs/history", get(runs_history))
         .route("/api/ui/state", get(ui_state_get).put(ui_state_put))
+        .route("/api/configs", get(configs_list))
+        .route("/api/configs/:name", get(config_get).put(config_put))
         .route("/files/*path", get(file_serve))
         .nest_service("/", tower_http::services::ServeDir::new(static_dir).append_index_html_on_directories(true))
         .with_state(st);
