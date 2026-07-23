@@ -55,3 +55,25 @@ covers 4/13 → extend or grey the tab per backend.
   audio_* (non-ltx2), controlnet_* (non-zimage), debiased/multires/offset-noise
   (0-levers backends).
 - Duplicate #sec-cloud DOM ids (index.html:488/519) — fix before per-id wiring.
+
+## CLOSED 2026-07-22 night — parameter-truth pass (commits 916f1ea..8abe27d)
+
+The "not wired" surface is resolved. Final contract on the page:
+- ~50 additional fields EMIT to their train_config_reader.mojo keys
+  (lr_scheduler family, epochs, precision/memory incl. resident_blocks,
+  timestep_distribution + noise knobs, loss strengths, masked_* family,
+  layer filter, backup/rolling, output format/dtype, dataset/caching keys).
+  Receipt: 20-step mageflow launch through the API with the new keys —
+  20/20 trained + saved.
+- Every keyless field is labeled "not coded" (54), none deleted, none faked.
+  Four pre-existing fake passthroughs caught and pruned (lora_dropout,
+  oft_block_size, oft_coft, text_encoder_sequence_length).
+- Census mirror panels removed after moving unique fields into main panels —
+  ONE control per parameter; no "wired" badges (working controls just work);
+  no reference-stack jargon in product copy.
+- OneTrainer-style top bar: preset dropdown + named configs
+  (GET/PUT /api/configs[/:name] -> webui/saved_configs/*.json).
+- Readability: label fg color, content-sized field widths, WCAG contrast
+  floor in applyTheme (dim >=4.5:1, badges >=3.5:1).
+- Verification standard going forward: rendered-page inspection, not grep —
+  grep-only checks missed stale copy twice in this campaign.
