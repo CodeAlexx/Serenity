@@ -1045,13 +1045,26 @@ const THEMES = {
   "Serenity Light": { bg:"#eeeef2", panel:"#e0e0e8", line:"#c8c8d2", fg:"#1e1e26", dim:"#6a6a78", acc:"#d27820", orange:"#d27820" },
 };
 let CUR_THEME = "Serenity Dark";
+// ── readability floor: no palette may render labels/badges below WCAG contrast ──
+function _chan(v){ v/=255; return v<=0.03928 ? v/12.92 : Math.pow((v+0.055)/1.055, 2.4); }
+function _lum(hex){ const n=parseInt(hex.slice(1),16); return 0.2126*_chan(n>>16&255)+0.7152*_chan(n>>8&255)+0.0722*_chan(n&255); }
+function _contrast(a,b){ const x=_lum(a),y=_lum(b); return (Math.max(x,y)+0.05)/(Math.min(x,y)+0.05); }
+function _mix(a,b,t){ const A=parseInt(a.slice(1),16),B=parseInt(b.slice(1),16);
+  const c=(sh)=>Math.round((A>>sh&255)+((B>>sh&255)-(A>>sh&255))*t);
+  return "#"+((c(16)<<16)|(c(8)<<8)|c(0)).toString(16).padStart(6,"0"); }
+function _readable(color, on, toward, min){
+  for (let t=0; t<=1.001; t+=0.05){ const c=_mix(color, toward, t); if (_contrast(c, on)>=min) return c; }
+  return toward;
+}
 function applyTheme(name) {
   const t = THEMES[name]; if (!t) return;
   CUR_THEME = name;
   const r = document.documentElement.style;
+  const dim = _readable(t.dim, t.panel, t.fg, 4.5);      // labels + sub text
+  const orange = _readable(t.orange, t.panel, t.fg, 3.5); // badges + accents
   r.setProperty("--bg", t.bg); r.setProperty("--panel", t.panel); r.setProperty("--line", t.line);
-  r.setProperty("--fg", t.fg); r.setProperty("--dim", t.dim); r.setProperty("--acc", t.acc);
-  r.setProperty("--orange", t.orange);
+  r.setProperty("--fg", t.fg); r.setProperty("--dim", dim); r.setProperty("--acc", t.acc);
+  r.setProperty("--orange", orange);
   const pick = $("theme_pick"); if (pick && pick.value !== name) pick.value = name;
   document.querySelectorAll(".swatch").forEach(sw => sw.classList.toggle("sel", sw.dataset.theme === name));
 }
