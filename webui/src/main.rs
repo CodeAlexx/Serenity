@@ -509,7 +509,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown preset {}", req.preset_id)})));
     };
     if !p.wired {
-        return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("backend {} launch is not available in the web supervisor", p.backend)})));
+        return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("backend {} not wired in the web supervisor yet", p.backend)})));
     }
     if st.child.lock().await.is_some() {
         return (StatusCode::CONFLICT, Json(json!({"error": "a run is already active (one at a time)"})));
@@ -679,7 +679,7 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             }
             v
         }
-        other => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("argv shape {other} is not supported")}))),
+        other => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("argv shape {other} not wired")}))),
     };
     // finding #1: resume argv order is PER-BACKEND, not per argv-shape. The
     // config_runner shape is shared by many backends whose trainers parse resume

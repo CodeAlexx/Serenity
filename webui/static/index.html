@@ -128,6 +128,7 @@
     <a data-sec="training">Training</a>
     <a data-sec="sampling">Sampling</a>
     <a data-sec="backup">Backup</a>
+    <a data-sec="cloud">Cloud</a>
     <a data-sec="resume">Resume</a>
     <a data-sec="runs">Runs</a>
     <a data-sec="logs">Logs</a>
@@ -140,14 +141,43 @@
   <div id="center">
     <!-- GENERAL -->
     <div class="sec" id="sec-general">
-      <div class="panel"><h3>WORKSPACE</h3><div class="sub">Run identity and locations</div>
+      <div class="panel"><h3>WORKSPACE</h3><div class="sub">Run identity and locations. Green = the server consumes it; the rest are present for parity but no runner reads them (Mojo snapshot-only, UI_MAP §8.5).</div>
         <div class="grid2"><div>
           <div class="row"><label>Run name <span class="wtag">wired</span></label><input id="g_runname" oninput="$('runname_top').value=this.value;$('runname_top').dispatchEvent(new Event('input'))"></div>
           <div class="row"><label>Output root</label><input value="/home/alex/mojodiffusion/output/<run name>" disabled></div>
-                                                </div><div>
-                                                                    </div></div>
+          <div class="row nw"><label>Only cache <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Prevent overwrites <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Continue last backup <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Dataloader threads <span class="nwtag">not wired</span></label><input type="number" value="8"></div>
+        </div><div>
+          <div class="row nw"><label>Debug mode <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Debug dir <span class="nwtag">not wired</span></label><input value="debug"></div>
+          <div class="row nw"><label>SerenityBoard <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Board always on <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Board port <span class="nwtag">not wired</span></label><input value="6006"></div>
+          <div class="row nw"><label>Validation gates <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+        </div></div>
       </div>
-          </div>
+      <div class="panel"><h3>DEVICE</h3><div class="sub">Placement and precision defaults — single RTX 3090 Ti; these are surface-only</div>
+        <div class="grid2"><div>
+          <div class="row nw"><label>Train device <span class="nwtag">not wired</span></label><select><option>cuda</option><option>cpu</option></select></div>
+          <div class="row nw"><label>Temp device <span class="nwtag">not wired</span></label><select><option>cpu</option><option>cuda</option></select></div>
+          <div class="row nw"><label>Train dtype <span class="nwtag">not wired</span></label><select><option>BFLOAT_16</option><option>FLOAT_16</option><option>FLOAT_32</option></select></div>
+          <div class="row nw"><label>Gradient checkpointing <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Activation offloading <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+        </div><div>
+          <div class="row nw"><label>Multi-GPU <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row"><label>Tensorboard port <span class="nwtag">[not wired]</span></label><input id="tensorboard_port" class="nw" value="6006"></div>
+          <div class="row"><label>Save prefix <span class="nwtag">[not wired — run name used]</span></label><input id="save_filename_prefix_edit" class="nw"></div>
+          <div class="row"><label>Sample output dir <span class="nwtag">[not wired — workspace/samples]</span></label><input id="sample_output_dir_edit" class="nw"></div>
+          <div class="row nw"><label>Device indexes <span class="nwtag">not wired</span></label><input value="0"></div>
+          <div class="row nw"><label>Fused grad reduce <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Async grad reduce <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Layer offload fraction <span class="nwtag">not wired</span></label><input type="number" step="0.05" value="0"></div>
+        </div></div>
+      </div>
+<div class="panel"><h3>EXECUTION <span class="nwtag">[all not wired — Mojo-UI census]</span></h3><div class="sub">Present in the native UI; no runner consumes these (UI_MAP §3 General)</div><div class="grid2"><div><div class="row"><label>Debug mode <span class="nwtag">[not wired]</span></label><input id="debug_mode" type="checkbox" class="nw"></div><div class="row"><label>Debug dir <span class="nwtag">[not wired]</span></label><input id="debug_dir" class="nw" value="debug"></div><div class="row"><label>Validation <span class="nwtag">[not wired]</span></label><input id="validation_toggle" type="checkbox" class="nw"></div><div class="row"><label>Prevent overwrites <span class="nwtag">[not wired]</span></label><input id="prevent_overwrites" type="checkbox" class="nw"></div><div class="row"><label>Only cache <span class="nwtag">[not wired]</span></label><input id="only_cache" type="checkbox" class="nw"></div><div class="row"><label>Dataloader threads <span class="nwtag">[not wired]</span></label><input id="dataloader_threads" type="number" class="nw" value="8"></div></div><div><div class="row"><label>Train device <span class="nwtag">[not wired]</span></label><select id="train_device" class="nw"><option>cuda</option><option>cpu</option></select></div><div class="row"><label>Temp device <span class="nwtag">[not wired]</span></label><select id="temp_device" class="nw"><option>cpu</option><option>cuda</option></select></div><div class="row"><label>Device indexes <span class="nwtag">[not wired]</span></label><input id="device_indexes" class="nw" value="0"></div><div class="row"><label>Fused grad reduce <span class="nwtag">[not wired]</span></label><input id="fused_gradient_reduce" type="checkbox" class="nw"></div><div class="row"><label>Async grad reduce <span class="nwtag">[not wired]</span></label><input id="async_gradient_reduce" type="checkbox" class="nw"></div></div></div></div>
+    </div>
 
     <!-- MODEL -->
     <div class="sec show" id="sec-model">
@@ -168,30 +198,43 @@
           </div>
           <div>
             <div class="row"><label>Destination</label><input id="workspace_dir" disabled></div>
-                                    <div class="row"><label>Backend</label><input id="backend_show" disabled></div>
+            <div class="row nw"><label>Output format <span class="nwtag">not wired</span></label><select><option>SAFETENSORS</option><option>CKPT</option><option>INTERNAL</option><option>DIFFUSERS</option></select></div>
+            <div class="row nw"><label>Output dtype <span class="nwtag">not wired</span></label><select><option>BFLOAT_16</option><option selected>FLOAT_16</option><option>FLOAT_32</option></select></div>
+            <div class="row"><label>Backend</label><input id="backend_show" disabled></div>
             <div class="row"><label>Checkpoint file</label><input id="checkpoint_show" disabled></div>
+            <div class="row nw"><label>Train transformer <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+            <div class="row nw"><label>Train text encoder <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+            <div class="row nw"><label>Bundle embeds <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
           </div>
         </div>
       </div>
+<div class="panel"><h3>MODEL OPTIONS <span class="nwtag">[not wired unless noted]</span></h3><div class="sub">Census from the Mojo Model tab (UI_MAP §3)</div><div class="grid2"><div><div class="row"><label>Output format <span class="nwtag">[not wired]</span></label><select id="output_model_format" class="nw"><option>SAFETENSORS</option><option>CKPT</option><option>INTERNAL</option><option>DIFFUSERS</option></select></div><div class="row"><label>Output dtype <span class="nwtag">[not wired]</span></label><select id="output_dtype" class="nw"><option>FLOAT_16</option><option>BFLOAT_16</option><option>FLOAT_32</option></select></div><div class="row"><label>Quantize model <span class="nwtag">[not wired]</span></label><input id="model_quantize" type="checkbox" class="nw"></div><div class="row"><label>Quantize TE <span class="nwtag">[not wired]</span></label><input id="model_quantize_text_encoder" type="checkbox" class="nw"></div><div class="row"><label>Low VRAM <span class="nwtag">[not wired]</span></label><input id="model_low_vram" type="checkbox" class="nw"></div></div><div><div class="row"><label>TE qtype <span class="nwtag">[not wired]</span></label><input id="model_qtype_text_encoder" class="nw" value="qfloat8"></div><div class="row"><label>Train transformer <span class="nwtag">[not wired]</span></label><input id="train_transformer" type="checkbox" class="nw"></div><div class="row"><label>Train text encoder <span class="nwtag">[not wired]</span></label><input id="train_text_encoder" type="checkbox" class="nw"></div><div class="row"><label>Gradient checkpointing <span class="nwtag">[not wired]</span></label><input id="gradient_checkpointing" type="checkbox" class="nw"></div><div class="row"><label>Activation offloading <span class="nwtag">[not wired]</span></label><input id="activation_offloading" type="checkbox" class="nw"></div><div class="row"><label>Layer offload fraction <span class="nwtag">[not wired]</span></label><input id="layer_offload_fraction" type="number" class="nw" step="0.05" value="0"></div></div></div></div>
     </div>
 
     <!-- LORA -->
     <div class="sec" id="sec-lora">
-      <div class="panel"><h3>ADAPTER PARAMETERS</h3><div class="sub">Network algorithm, rank, alpha</div>
+      <div class="panel"><h3>ADAPTER PARAMETERS</h3><div class="sub">Network algorithm, rank, alpha, dropout, weight dtype</div>
         <div class="grid2"><div>
           <div class="row"><label>Algorithm (network) <span class="wtag">wired</span></label>
             <select id="network_algorithm"><option>LORA</option><option>LOCON</option><option>LOKR</option><option>LOHA</option><option>DORA</option><option>OFT</option></select></div>
-                    <div class="row"><label>Rank <span class="wtag">wired</span></label><input id="lora_rank" type="number"></div>
+          <div class="row nw"><label>LoRA name <span class="nwtag">not wired</span></label><input placeholder="run name derived"></div>
+          <div class="row"><label>Rank <span class="wtag">wired</span></label><input id="lora_rank" type="number"></div>
           <div class="row"><label>Alpha <span class="wtag">wired</span></label><input id="lora_alpha" type="number"></div>
         </div><div>
-                            </div></div>
+          <div class="row nw"><label>Dropout <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="0"></div>
+          <div class="row nw"><label>Weight dtype <span class="nwtag">not wired</span></label><select><option>BFLOAT_16</option><option>FLOAT_16</option><option selected>FLOAT_32</option></select></div>
+        </div></div>
       </div>
-      <div class="panel"><h3>TARGETS</h3><div class="sub">Module targets are fixed per-model</div>
+      <div class="panel"><h3>TARGETS &amp; OFT</h3><div class="sub">Module targets are per-model (qkv, proj, mlp, modulation where wired); OFT controls</div>
         <div class="grid2"><div>
           <div class="row"><label>Transformer targets</label><input value="double/single projections — qkv, proj, mlp, modulation" disabled></div>
-                  </div><div>
-                            </div></div>
+          <div class="row nw"><label>OFT block size <span class="nwtag">not wired</span></label><input type="number" value="4"></div>
+        </div><div>
+          <div class="row nw"><label>COFT <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Bundle embeds <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+        </div></div>
       </div>
+<div class="panel"><h3>ADAPTER OPTIONS</h3><div class="sub">lora_dropout / OFT params pass through to the runner config (trainers that read them use them)</div><div class="grid2"><div><div class="row"><label>LoRA model name <span class="nwtag">[not wired]</span> <span class="nwtag">[not wired]</span></label><input id="lora_model_name" class="nw" placeholder="run name used"></div><div class="row"><label>LoRA dropout</label><input id="lora_dropout" type="number" step="0.01" value="0"></div><div class="row"><label>LoRA weight dtype <span class="nwtag">[not wired]</span></label><select id="lora_weight_dtype" class="nw"><option>FLOAT_32</option><option>BFLOAT_16</option><option>FLOAT_16</option></select></div></div><div><div class="row"><label>Bundle embeddings <span class="nwtag">[not wired]</span></label><input id="bundle_additional_embeddings" type="checkbox" class="nw"></div><div class="row"><label>OFT block size</label><input id="oft_block_size" type="number" value="4"></div><div class="row"><label>OFT: COFT</label><input id="oft_coft" type="checkbox"></div></div></div></div>
     </div>
 
     <!-- DATASET -->
@@ -204,13 +247,19 @@
           <div class="row"><label>Image folder</label><input id="ds_folder" placeholder="/home/alex/1_giger/gigerver3"></div>
           <div class="row"><label></label><button class="btnp" onclick="scanDataset()">Scan folder</button></div>
         </div><div>
-                              <div class="row"><label>Resolution <span class="wtag">wired</span></label><select id="resolution"><option>512</option><option>768</option><option>1024</option><option>1280</option></select></div>
+          <div class="row nw"><label>Dataset path <span class="nwtag">not wired</span></label><input placeholder="raw image dir (cache is the training input)"></div>
+          <div class="row nw"><label>Concept file <span class="nwtag">not wired</span></label><input value="concepts.json"></div>
+          <div class="row nw"><label>Resolution <span class="nwtag">not wired</span></label><select><option>512</option><option>768</option><option>1024</option><option>1280</option></select></div>
+          <div class="row nw"><label>Aspect buckets <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Latent caching <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Clear cache before <span class="nwtag">not wired</span></label><input type="checkbox"></div>
         </div></div>
       </div>
       <div class="panel"><h3>MEDIA <span id="ds_count" style="color:var(--dim);font-weight:400"></span></h3>
         <div id="ds_stats" class="dschips" style="display:none"></div>
         <div id="ds_grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px"></div>
       </div>
+<div class="panel"><h3>DATASET OPTIONS</h3><div class="sub">resolution + caption_dropout_prob are consumed; the rest are Mojo-UI census</div><div class="grid2"><div><div class="row"><label>Resolution</label><select id="resolution"><option>512</option><option>768</option><option>1024</option><option>1280</option></select></div><div class="row"><label>Caption extension <span class="nwtag">[not wired]</span> <span class="nwtag">[not wired]</span></label><input id="caption_extension" class="nw" value="txt"></div><div class="row"><label>Aspect buckets <span class="nwtag">[not wired]</span></label><input id="aspect_ratio_bucketing" type="checkbox" class="nw"></div><div class="row"><label>Latent caching <span class="nwtag">[not wired]</span></label><input id="latent_caching" type="checkbox" class="nw"></div></div><div><div class="row"><label>Cache text embeds <span class="nwtag">[not wired]</span></label><input id="cache_text_embeddings" type="checkbox" class="nw"></div><div class="row"><label>Clear cache first <span class="nwtag">[not wired]</span></label><input id="clear_cache_before_training" type="checkbox" class="nw"></div><div class="row"><label>Concept file <span class="nwtag">[not wired]</span></label><input id="concept_file_name" class="nw" value="concepts.json"></div></div></div></div>
       <div class="panel" id="ds_cap_panel" style="display:none"><h3>CAPTION</h3><div class="sub" id="ds_cap_path"></div>
         <img id="ds_cap_img" style="max-width:260px;max-height:200px;border-radius:6px;border:1px solid var(--line);margin-bottom:10px;display:block">
         <textarea id="ds_cap_text" style="width:100%;height:110px;background:#12171d;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:8px;font:13px/1.5 ui-monospace,monospace"></textarea>
@@ -264,7 +313,7 @@
 
     <!-- TRAINING -->
     <div class="sec" id="sec-training">
-      <div class="panel"><h3>BASE SCHEDULE</h3><div class="sub">Steps, LR, timestep shifts (train shift decouples the training σ-draw from inference — the disfigured-faces fix), batch</div>
+      <div class="panel"><h3>BASE SCHEDULE</h3><div class="sub">Steps, epochs, batch, and LR cycle</div>
         <div class="grid2"><div>
           <div class="row"><label>Max steps <span class="wtag">wired</span></label><input id="max_steps" type="number"></div>
           <div class="row"><label>Learning rate <span class="wtag">wired</span></label><input id="learning_rate" type="number" step="0.00001"></div>
@@ -273,9 +322,11 @@
           <div class="row"><label>Batch size <span class="wtag">wired</span></label><input id="batch_size" type="number" value="1" min="1" max="2"></div>
           <div class="row"><label>Grad accum steps <span class="wtag">wired</span></label><input id="gradient_accumulation_steps" type="number" value="1" min="1"></div>
         </div><div>
-          <div class="row"><label>Train timestep shift <span class="wtag">wired</span></label><input id="train_timestep_shift" type="number" step="0.1" placeholder="= timestep shift"></div>
-          <div class="row"><label>Frames (video) <span class="wtag">wired</span></label><input id="frames" value="1"></div>
-                    <div class="row"><label>Save every <span class="wtag">wired</span></label><input id="save_every" type="number"></div>
+          <div class="row nw"><label>Epochs <span class="nwtag">not wired</span></label><input type="number" value="1"></div>
+          <div class="row nw"><label>LR min factor <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="0"></div>
+          <div class="row nw"><label>LR cycles <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="1"></div>
+          <div class="row nw"><label>LR scaler <span class="nwtag">not wired</span></label><select><option>NONE</option><option>LINEAR</option><option>SQRT</option><option>COSINE</option></select></div>
+          <div class="row"><label>Save every <span class="wtag">wired</span></label><input id="save_every" type="number"></div>
         </div></div>
       </div>
 
@@ -290,37 +341,119 @@
           <div class="row"><label>Max grad norm <span class="wtag">wired</span></label><input id="max_grad_norm" type="number" step="0.1" placeholder="preset"></div>
           <div class="capnote" id="capnote_optimizer"></div>
         </div><div>
-          <div class="row"><label>Schedule</label><input value="constant + warmup (fixed)" disabled></div>
+          <div class="row nw"><label>Scheduler <span class="nwtag">not wired</span></label><select><option>COSINE</option><option>CONSTANT</option><option>LINEAR</option></select></div>
+          <div class="row nw"><label>Text encoder LR <span class="nwtag">not wired</span></label><input type="number" step="0.00001" value="0.00001"></div>
+          <div class="row nw"><label>Transformer LR <span class="nwtag">not wired</span></label><input type="number" step="0.00001" value="0.0004"></div>
         </div></div>
       </div>
 
-      
-      <div class="panel"><h3>EMA</h3><div class="sub">EMA is consumed by klein/zimage/hidream/ideogram4 (capability-gated)</div>
+      <div class="panel"><h3>PRECISION &amp; MEMORY</h3><div class="sub">Precision and VRAM switches — surface-only (the runner picks precision from the base config)</div>
+        <div class="grid2"><div>
+          <div class="row nw"><label>Train dtype <span class="nwtag">not wired</span></label><select><option>BFLOAT_16</option><option>FLOAT_16</option><option>FLOAT_32</option></select></div>
+          <div class="row nw"><label>Fallback dtype <span class="nwtag">not wired</span></label><select><option>BFLOAT_16</option><option>FLOAT_16</option><option>FLOAT_32</option></select></div>
+          <div class="row nw"><label>Gradient checkpointing <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Activation offloading <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Offload fraction <span class="nwtag">not wired</span></label><input type="number" step="0.05" value="0"></div>
+        </div><div>
+          <div class="row nw"><label>Autocast cache <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Resolution <span class="nwtag">not wired</span></label><select><option>512</option><option>768</option><option>1024</option><option>1280</option></select></div>
+          <div class="row nw"><label>Frames <span class="nwtag">not wired</span></label><input value="1"></div>
+          <div class="row nw"><label>Circular padding <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Train device <span class="nwtag">not wired</span></label><select><option>cuda</option><option>cpu</option></select></div>
+        </div></div>
+      </div>
+
+      <div class="panel"><h3>EMA &amp; TARGETS</h3><div class="sub">EMA is consumed by klein/zimage/hidream/ideogram4; the trainable-section toggles are surface-only</div>
         <div class="grid2"><div>
           <div class="row"><label>EMA <span class="wtag">wired</span></label><input id="ema_enabled" type="checkbox"></div>
           <div class="row"><label>EMA decay <span class="wtag">wired</span></label><input id="ema_decay" type="number" step="0.0001" value="0.999"></div>
           <div class="capnote" id="capnote_ema"></div>
-          </div><div>
-          <div class="row"><label>EMA update interval <span class="wtag">wired</span></label><input id="ema_update_step_interval" type="number" value="5"></div>
+          <div class="row nw"><label>EMA update interval <span class="nwtag">not wired</span></label><input type="number" value="5"></div>
+        </div><div>
+          <div class="row nw"><label>Train transformer <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Train text encoder <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>TE stop after <span class="nwtag">not wired</span></label><input type="number" value="30"></div>
+          <div class="row nw"><label>Transformer stop after <span class="nwtag">not wired</span></label><input type="number" value="0"></div>
         </div></div>
       </div>
 
-      
-      
-      
-      <div class="panel"><h3>LOSS</h3><div class="sub">loss_fn / huber_delta / smooth_l1_beta / min_snr_gamma_flow — consumed T1 levers</div>
+      <div class="panel"><h3>TEXT ENCODER</h3><div class="sub">Serenity text encoder controls — surface-only (Flux2 uses a fixed encoder path)</div>
+        <div class="grid2"><div>
+          <div class="row nw"><label>Train <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Stop after <span class="nwtag">not wired</span></label><input type="number" value="30"></div>
+        </div><div>
+          <div class="row nw"><label>Learning rate <span class="nwtag">not wired</span></label><input type="number" step="0.00001" value="0.00001"></div>
+          <div class="row nw"><label>Sequence length <span class="nwtag">not wired</span></label><input value="512"></div>
+        </div></div>
+      </div>
+
+      <div class="panel"><h3>TRANSFORMER</h3><div class="sub">Serenity transformer controls — surface-only</div>
+        <div class="grid2"><div>
+          <div class="row nw"><label>Train <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Stop after <span class="nwtag">not wired</span></label><input type="number" value="0"></div>
+          <div class="row nw"><label>Attention mask <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+        </div><div>
+          <div class="row nw"><label>Learning rate <span class="nwtag">not wired</span></label><input type="number" step="0.00001" value="0.0004"></div>
+          <div class="row nw"><label>Guidance scale <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="1.0"></div>
+        </div></div>
+      </div>
+
+      <div class="panel"><h3>NOISE &amp; TIMESTEPS</h3><div class="sub">Flow-matching noising and timestep distribution — surface-only (the runner uses the recipe timestep_shift, which IS wired above)</div>
+        <div class="grid2"><div>
+          <div class="row nw"><label>Offset noise <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="0"></div>
+          <div class="row nw"><label>Perturb noise <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="0"></div>
+          <div class="row nw"><label>Distribution <span class="nwtag">not wired</span></label><select><option>UNIFORM</option><option>LOGIT_NORMAL</option><option>MODE</option><option>COSINE</option><option>SIGMOID</option></select></div>
+          <div class="row nw"><label>Dynamic shift <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+        </div><div>
+          <div class="row nw"><label>Min strength <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="0"></div>
+          <div class="row nw"><label>Max strength <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="1"></div>
+          <div class="row nw"><label>Noising weight <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="1"></div>
+          <div class="row nw"><label>Noising bias <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="0"></div>
+        </div></div>
+      </div>
+
+      <div class="panel"><h3>LOSS</h3><div class="sub">loss_fn / huber_delta / smooth_l1_beta / min_snr_gamma_flow are consumed T1 levers; the strength mix + weight fn are surface-only</div>
         <div class="grid2"><div>
           <div class="row"><label>Loss fn <span class="wtag">wired</span></label><select id="loss_fn"><option value="">mse (default)</option><option>huber</option><option>smooth_l1</option></select></div>
           <div class="row"><label>Huber delta <span class="wtag">wired</span></label><input id="huber_delta" type="number" step="0.01" placeholder="—"></div>
           <div class="row"><label>SmoothL1 beta <span class="wtag">wired</span></label><input id="smooth_l1_beta" type="number" step="0.01" placeholder="—"></div>
           <div class="row"><label>Min-SNR gamma (flow) <span class="wtag">wired</span></label><input id="min_snr_gamma_flow" type="number" step="0.1" placeholder="off"></div>
           <div class="capnote" id="capnote_loss"></div>
-          </div><div>
+          <div class="row nw"><label>MSE strength <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="1"></div>
+          <div class="row nw"><label>MAE strength <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="0"></div>
+        </div><div>
+          <div class="row nw"><label>log-cosh strength <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="0"></div>
+          <div class="row nw"><label>Huber strength <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="0"></div>
+          <div class="row nw"><label>VB strength <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="0"></div>
+          <div class="row nw"><label>Weight fn <span class="nwtag">not wired</span></label><select><option>MIN_SNR_GAMMA</option><option>NONE</option><option>P2</option><option>DEBIASED_ESTIMATION</option></select></div>
+          <div class="row nw"><label>Weight gamma <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="5"></div>
+          <div class="row nw"><label>Loss scaler <span class="nwtag">not wired</span></label><select><option>NONE</option><option>MIN_SNR_GAMMA</option><option>P2</option></select></div>
         </div></div>
       </div>
 
-      
-          </div>
+      <div class="panel" id="panel-masked"><h3>MASKED TRAINING <span class="nwtag">not wired in any runner yet</span></h3><div class="sub">Masked loss is implemented+gated trainer-side but wired into NO runner — dead for every backend, excluded from every launch config (UI_MAP §8.5)</div>
+        <div class="capnote on" id="capnote_masked">masked loss: not wired in any runner yet — controls disabled for every backend</div>
+        <div class="grid2"><div>
+          <div class="row nw"><label>Masked <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Unmasked probability <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="0"></div>
+          <div class="row nw"><label>Unmasked weight <span class="nwtag">not wired</span></label><input type="number" step="0.01" value="0"></div>
+        </div><div>
+          <div class="row nw"><label>Normalize masked loss <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Prior preservation weight <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="1"></div>
+          <div class="row nw"><label>Custom conditioning image <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+        </div></div>
+      </div>
+
+      <div class="panel"><h3>LAYER FILTER</h3><div class="sub">Target layer preset and explicit filter — surface-only (targets are per-model fixed in the wired runners)</div>
+        <div class="grid2"><div>
+          <div class="row nw"><label>Preset <span class="nwtag">not wired</span></label><select><option>full</option><option>attention</option><option>mlp</option><option>double_blocks</option><option>single_blocks</option></select></div>
+          <div class="row nw"><label>Filter <span class="nwtag">not wired</span></label><input placeholder="explicit layer filter"></div>
+        </div><div>
+          <div class="row nw"><label>Regex <span class="nwtag">not wired</span></label><input type="checkbox"></div>
+        </div></div>
+      </div>
+<div class="panel"><h3>SCHEDULE / PRECISION <span class="nwtag">[census — not wired unless noted]</span></h3><div class="sub">Mojo Training tab schedule block (UI_MAP §3)</div><div class="grid2"><div><div class="row"><label>Epochs <span class="nwtag">[not wired]</span></label><input id="epochs" type="number" class="nw" value="1"></div><div class="row"><label>TE learning rate <span class="nwtag">[not wired]</span></label><input id="text_encoder_learning_rate" type="number" class="nw" step="0.000001"></div><div class="row"><label>Transformer LR <span class="nwtag">[not wired]</span></label><input id="transformer_learning_rate" type="number" class="nw" step="0.00001"></div><div class="row"><label>Scheduler <span class="nwtag">[not wired]</span></label><select id="scheduler" class="nw"><option>COSINE</option><option>CONSTANT</option><option>LINEAR</option></select></div><div class="row"><label>LR min factor <span class="nwtag">[not wired]</span></label><input id="learning_rate_min_factor" type="number" class="nw" step="0.01" value="0"></div><div class="row"><label>LR cycles <span class="nwtag">[not wired]</span></label><input id="learning_rate_cycles" type="number" class="nw" value="1"></div><div class="row"><label>LR scaler <span class="nwtag">[not wired]</span></label><select id="learning_rate_scaler" class="nw"><option>NONE</option><option>LINEAR</option><option>SQRT</option><option>COSINE</option></select></div><div class="row"><label>Train dtype <span class="nwtag">[not wired]</span></label><select id="train_dtype" class="nw"><option>BFLOAT_16</option><option>FLOAT_16</option><option>FLOAT_32</option></select></div><div class="row"><label>Fallback dtype <span class="nwtag">[not wired]</span></label><select id="fallback_train_dtype" class="nw"><option>BFLOAT_16</option><option>FLOAT_32</option></select></div></div><div><div class="row"><label>EMA interval <span class="wtag">wired</span></label><input id="ema_update_step_interval" type="number" value="5"></div><div class="row"><label>Autocast cache <span class="nwtag">[not wired]</span></label><input id="enable_autocast_cache" type="checkbox" class="nw"></div><div class="row"><label>Frames (video)</label><input id="frames" value="1"></div><div class="row"><label>Circular padding <span class="nwtag">[not wired]</span></label><input id="force_circular_padding" type="checkbox" class="nw"></div><div class="row"><label>TE seq length</label><input id="text_encoder_sequence_length" placeholder="preset"></div><div class="row"><label>TE stop after <span class="nwtag">[not wired]</span></label><input id="text_encoder_stop_after" type="number" class="nw" value="30"></div><div class="row"><label>Transformer stop after <span class="nwtag">[not wired]</span></label><input id="transformer_stop_after" type="number" class="nw" value="0"></div><div class="row"><label>Attention mask <span class="nwtag">[not wired]</span></label><input id="transformer_attention_mask" type="checkbox" class="nw"></div><div class="row"><label>Guidance scale <span class="nwtag">[not wired]</span></label><input id="transformer_guidance_scale" type="number" class="nw" step="0.1" value="1"></div></div></div></div><div class="panel"><h3>LOSS / NOISE <span class="nwtag">[census — not wired unless noted]</span></h3><div class="sub">Mojo Training tab loss+noise block; loss_fn/huber/smooth-l1/min-SNR above ARE wired</div><div class="grid2"><div><div class="row"><label>Loss weight fn <span class="nwtag">[not wired]</span></label><select id="loss_weight_fn" class="nw"><option>MIN_SNR_GAMMA</option><option>NONE</option><option>P2</option><option>DEBIASED_ESTIMATION</option></select></div><div class="row"><label>Weight strength <span class="nwtag">[not wired]</span></label><input id="loss_weight_strength" type="number" class="nw" step="0.1" value="5"></div><div class="row"><label>MSE strength <span class="nwtag">[not wired]</span></label><input id="mse_strength" type="number" class="nw" step="0.1" value="1"></div><div class="row"><label>MAE strength <span class="nwtag">[not wired]</span></label><input id="mae_strength" type="number" class="nw" step="0.1" value="0"></div><div class="row"><label>Log-cosh strength <span class="nwtag">[not wired]</span></label><input id="log_cosh_strength" type="number" class="nw" step="0.1" value="0"></div><div class="row"><label>VB loss <span class="nwtag">[not wired]</span></label><input id="vb_loss_strength" type="number" class="nw" step="0.1" value="0"></div><div class="row"><label>Loss scaler <span class="nwtag">[not wired]</span></label><select id="loss_scaler" class="nw"><option>NONE</option><option>MIN_SNR_GAMMA</option><option>P2</option></select></div><div class="row"><label>Offset noise <span class="nwtag">[not wired]</span></label><input id="offset_noise_weight" type="number" class="nw" step="0.01" value="0"></div><div class="row"><label>Perturbation noise <span class="nwtag">[not wired]</span></label><input id="perturbation_noise_weight" type="number" class="nw" step="0.01" value="0"></div><div class="row"><label>Timestep distribution <span class="nwtag">[not wired]</span></label><select id="timestep_distribution" class="nw"><option>UNIFORM</option><option>LOGIT_NORMAL</option><option>MODE</option><option>COSINE</option><option>SIGMOID</option></select></div><div class="row"><label>Timestep type <span class="nwtag">[not wired]</span></label><input id="timestep_type" class="nw" value="linear"></div><div class="row"><label>Noise scheduler <span class="nwtag">[not wired]</span></label><input id="noise_scheduler" class="nw" value="flowmatch"></div><div class="row"><label>Min noising <span class="nwtag">[not wired]</span></label><input id="min_noising_strength" type="number" class="nw" step="0.01" value="0"></div></div><div><div class="row"><label>Max noising <span class="nwtag">[not wired]</span></label><input id="max_noising_strength" type="number" class="nw" step="0.01" value="1"></div><div class="row"><label>Noising weight <span class="nwtag">[not wired]</span></label><input id="noising_weight" type="number" class="nw" step="0.1" value="1"></div><div class="row"><label>Noising bias <span class="nwtag">[not wired]</span></label><input id="noising_bias" type="number" class="nw" step="0.1" value="0"></div><div class="row"><label>Dynamic shift <span class="nwtag">[not wired]</span></label><input id="dynamic_timestep_shifting" type="checkbox" class="nw"></div><div class="row"><label>Masked training <span class="nwtag">[not wired]</span></label><input id="masked_training" type="checkbox" class="nw"></div><div class="row"><label>Unmasked prob <span class="nwtag">[not wired]</span></label><input id="unmasked_probability" type="number" class="nw" step="0.01" value="0"></div><div class="row"><label>Unmasked weight <span class="nwtag">[not wired]</span></label><input id="unmasked_weight" type="number" class="nw" step="0.01" value="0"></div><div class="row"><label>Normalize masked loss <span class="nwtag">[not wired]</span></label><input id="normalize_masked_area_loss" type="checkbox" class="nw"></div><div class="row"><label>Custom cond image <span class="nwtag">[not wired]</span></label><input id="custom_conditioning_image" type="checkbox" class="nw"></div><div class="row"><label>Layer filter preset <span class="nwtag">[not wired]</span></label><select id="layer_filter_preset" class="nw"><option>full</option><option>attention</option><option>mlp</option><option>double_blocks</option><option>single_blocks</option></select></div><div class="row"><label>Layer filter <span class="nwtag">[not wired]</span></label><input id="layer_filter" class="nw"></div><div class="row"><label>Filter is regex <span class="nwtag">[not wired]</span></label><input id="layer_filter_regex" type="checkbox" class="nw"></div></div></div></div>
+    </div>
 
     <!-- SAMPLING -->
     <div class="sec" id="sec-sampling">
@@ -331,8 +464,13 @@
           <div class="capnote" id="capnote_sampling"></div>
           <div class="row"><label></label><button class="vbtn ghost" onclick="editPromptsFromSampling()">Edit these prompts →</button></div>
         </div><div>
-          <div class="row"><label>Sample dir</label><input value="&lt;workspace&gt;/samples (fixed)" disabled></div>
-          <div class="row"><label>Steps / CFG / sampler</label><input value="per-prompt in the samples JSON (edit left)" disabled></div>
+          <div class="row nw"><label>Sample dir <span class="nwtag">not wired</span></label><input placeholder="&lt;workspace&gt;/samples"></div>
+          <div class="row nw"><label>Skip first <span class="nwtag">not wired</span></label><input type="number" value="0"></div>
+          <div class="row nw"><label>Steps <span class="nwtag">not wired</span></label><input type="number" value="20"></div>
+          <div class="row nw"><label>CFG <span class="nwtag">not wired</span></label><input type="number" step="0.1" value="7"></div>
+          <div class="row nw"><label>Sampler <span class="nwtag">not wired</span></label><select><option>Ideogram4 FlowMatch</option><option selected>FlowMatch Euler</option><option>Euler</option><option>DDIM</option><option>DPM++ 2M</option><option>UniPC</option></select></div>
+          <div class="row nw"><label>Send to SerenityBoard <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Non-EMA sampling <span class="nwtag">not wired</span></label><input type="checkbox"></div>
         </div></div>
         <div id="samp_preview" class="sub" style="margin-top:8px"></div>
       </div>
@@ -340,21 +478,49 @@
 
     <!-- BACKUP -->
     <div class="sec" id="sec-backup">
-      <div class="panel"><h3>SAVES</h3><div class="sub">Save cadence (Training → Save every) + retention. Every save writes a .state resume file.</div>
+      <div class="panel"><h3>SAVES</h3><div class="sub">Save cadence — Save every is wired (Training tab). The rolling-backup knobs are Mojo snapshot-only.</div>
         <div class="grid2"><div>
           <div class="row"><label>Save every <span class="wtag">wired</span></label><input value="see Training → Save every" disabled></div>
-          <div class="row"><label>Save prefix</label><input id="save_prefix_show" disabled></div>
+          <div class="row nw"><label>Save prefix <span class="nwtag">derived</span></label><input id="save_prefix_show" disabled></div>
+          <div class="row nw"><label>Backup after <span class="nwtag">not wired</span></label><input type="number" value="500"></div>
+          <div class="row nw"><label>Save skip first <span class="nwtag">not wired</span></label><input type="number" value="0"></div>
         </div><div>
-          <div class="row"><label>Save max keep <span class="wtag">wired</span></label><input id="save_max_keep" type="number" value="4"></div>
+          <div class="row nw"><label>Rolling backup <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Rolling count <span class="nwtag">not wired</span></label><input type="number" value="5"></div>
+          <div class="row nw"><label>Backup before save <span class="nwtag">not wired</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Save max keep <span class="nwtag">not wired</span></label><input type="number" value="4"></div>
         </div></div>
         <div class="sub" style="margin-top:6px">Resume states: every save writes <code>&lt;ckpt&gt;.state</code> — full resume via the Resume tab.</div>
       </div>
+<div class="panel"><h3>BACKUP CADENCE <span class="nwtag">[census — saves are Training→Save every]</span></h3><div class="sub">Mojo Backup tab fields (UI_MAP §3)</div><div class="grid2"><div><div class="row"><label>Backup after <span class="nwtag">[not wired]</span></label><input id="backup_after" type="number" class="nw" value="500"></div><div class="row"><label>Rolling backup <span class="nwtag">[not wired]</span></label><input id="rolling_backup" type="checkbox" class="nw"></div><div class="row"><label>Rolling count <span class="nwtag">[not wired]</span></label><input id="rolling_backup_count" type="number" class="nw" value="5"></div></div><div><div class="row"><label>Backup before save <span class="nwtag">[not wired]</span></label><input id="backup_before_save" type="checkbox" class="nw"></div><div class="row"><label>Save skip first <span class="nwtag">[not wired]</span></label><input id="save_skip_first" type="number" class="nw" value="0"></div><div class="row"><label>Save max keep <span class="wtag">wired</span></label><input id="save_max_keep" type="number" value="4"></div></div></div></div>
       <div class="panel"><h3>PRESET SNAPSHOT</h3><div class="sub">The EXACT config + argv the server will launch — a live dry-run, stronger than the Mojo static panel</div>
         <button class="btnp" onclick="dryRun()">Preview launch (dry run)</button>
         <pre id="dry_out" style="background:#0b0e12;border:1px solid var(--line);border-radius:8px;padding:10px;font:12px/1.5 ui-monospace,monospace;white-space:pre-wrap;word-break:break-all;margin-top:10px"></pre>
       </div>
     </div>
 
+    <!-- CLOUD (single section — the duplicate #sec-cloud block was merged here,
+         P5 DOM fix: two ids broke per-id logic + nav routing) -->
+    <div class="sec" id="sec-cloud">
+      <div class="panel"><h3>CLOUD <span class="nwtag">not wired</span></h3><div class="sub">Serenity cloud target (RunPod / Linux SSH). Surface-only in both the Mojo UI and here — cloud sync is not implemented (UI_MAP §7).</div>
+        <div class="grid2"><div>
+          <div class="row nw"><label>Cloud type <span class="nwtag">not wired</span></label><select id="cloud_type" class="nw"><option>NONE</option><option>RUNPOD</option><option>LINUX</option></select></div>
+          <div class="row nw"><label>Host <span class="nwtag">not wired</span></label><input id="cloud_host" class="nw" placeholder="ssh host"></div>
+          <div class="row nw"><label>Port <span class="nwtag">not wired</span></label><input id="cloud_port" class="nw" value="22"></div>
+        </div><div>
+          <div class="row nw"><label>User <span class="nwtag">not wired</span></label><input id="cloud_user" class="nw" value="root"></div>
+          <div class="row nw"><label>Remote dir <span class="nwtag">not wired</span></label><input id="cloud_workspace_dir" class="nw" value="/workspace/serenity"></div>
+          <div class="row nw"><label>Delete work dir after run <span class="nwtag">not wired</span></label><input id="cloud_delete_workspace" type="checkbox" class="nw"></div>
+        </div></div>
+      </div>
+      <div class="panel"><h3>SYNC <span class="nwtag">not wired</span></h3><div class="sub">File sync and post-run behavior — UI surface ready, no transport wired</div>
+        <div class="row nw"><label>Upload</label><input value="config, concepts, cache metadata" disabled></div>
+        <div class="row nw"><label>Download</label><input value="samples, checkpoints, logs" disabled></div>
+        <div class="row nw"><label>File sync</label><input value="Native SCP / Fabric SFTP" disabled></div>
+        <div class="row nw"><label>On finish</label><input value="None / Stop / Delete" disabled></div>
+      </div>
+<div class="panel"><h3>SAMPLER OPTIONS <span class="nwtag">[census]</span></h3><div class="sub">Per-model sampler presets are trainer-side; renders come from the samples JSON</div><div class="grid2"><div><div class="row"><label>Skip first <span class="nwtag">[not wired]</span></label><input id="sample_skip_first" type="number" class="nw" value="0"></div><div class="row"><label>Sampler <span class="nwtag">[not wired]</span></label><select id="sample_sampler" class="nw"><option>FlowMatch Euler</option><option>Ideogram4 FlowMatch</option><option>Euler</option><option>DDIM</option><option>DPM++ 2M</option><option>UniPC</option></select></div></div><div><div class="row"><label>Samples to board <span class="nwtag">[not wired]</span></label><input id="samples_to_tensorboard" type="checkbox" class="nw"></div><div class="row"><label>Non-EMA sampling <span class="nwtag">[not wired]</span></label><input id="non_ema_sampling" type="checkbox" class="nw"></div></div></div></div>
+    </div>
 
     <!-- RESUME -->
     <div class="sec" id="sec-resume">
@@ -426,14 +592,15 @@ window.addEventListener("unhandledrejection", e => {
 let PRESETS = [], RUN = null;
 const $ = id => document.getElementById(id);
 // ── the ONLY fields sent to the launcher. Everything else in the form is
-//    excluded fields either have no Mojo backend or are fixed by design. ──
+//    present for parameter parity but visibly marked [not wired] and excluded. ──
 const RECIPE_FIELDS = ["learning_rate","lora_rank","lora_alpha","max_steps","save_every","sample_every",
                        "timestep_shift","quantized_resident"];
 const EXTRA_FIELDS = ["network_algorithm","caption_dropout_prob","batch_size","gradient_accumulation_steps",
                       "loss_fn","huber_delta","smooth_l1_beta","min_snr_gamma_flow","max_grad_norm",
                       "optimizer_warmup_steps","validation_prompts_file","vae_override",
                       // config-passthrough additions (trainers that read these keys use them)
-                      "resolution","frames","train_timestep_shift","save_max_keep"];
+                      "lora_dropout","oft_block_size","oft_coft","resolution","frames",
+                      "text_encoder_sequence_length","save_max_keep"];
 
 // nav
 document.querySelectorAll("nav a[data-sec]").forEach(a => a.onclick = () => {
@@ -448,7 +615,7 @@ async function loadPresets() {
   const j = await (await fetch("/api/presets")).json();
   PRESETS = j.presets;
   $("preset").innerHTML = PRESETS.map(p =>
-    `<option value="${p.id}" ${p.wired?"":"disabled"}>${p.label}${p.wired?"":" (unavailable)"}</option>`).join("");
+    `<option value="${p.id}" ${p.wired?"":"disabled"}>${p.label}${p.wired?"":" (not wired)"}</option>`).join("");
   applyPreset();
 }
 function applyPreset() {
@@ -461,7 +628,7 @@ function applyPreset() {
   $("projname").textContent = p.run_name; $("s_backend").textContent = p.label;
   for (const f of RECIPE_FIELDS) if (p.recipe[f] !== undefined) $(f).value = p.recipe[f];
   applyCapabilities(p);
-  $("valid").textContent = p.wired ? "VALIDATION — Ready" : "VALIDATION — backend unavailable";
+  $("valid").textContent = p.wired ? "VALIDATION — Ready" : "VALIDATION — backend not wired";
 }
 
 /* ── P5 per-model capability layer: presets.json rows carry a `capabilities`
@@ -473,11 +640,11 @@ const CAP_GROUPS = [
   { key: "optimizer_levers",
     ids: ["optimizer_name", "optimizer_weight_decay", "optimizer_warmup_steps", "max_grad_norm"],
     note: "capnote_optimizer",
-    msg: "this backend uses its built-in AdamW defaults" },
+    msg: "optimizer levers not wired for this backend — launch uses the trainer's built-in AdamW defaults" },
   { key: "loss_levers",
     ids: ["loss_fn", "huber_delta", "smooth_l1_beta", "min_snr_gamma_flow"],
     note: "capnote_loss",
-    msg: "this backend uses fixed MSE loss" },
+    msg: "loss levers not wired for this backend (fixed MSE)" },
   { key: "ema",
     ids: ["ema_enabled", "ema_decay", "ema_update_step_interval"],
     note: "capnote_ema",
@@ -507,6 +674,8 @@ function applyCapabilities(p) {
     const n = $(g.note);
     if (n) { n.textContent = off ? g.msg : ""; n.classList.toggle("on", off); }
   }
+  // masked loss: dead in EVERY runner — panel inputs always disabled + badged
+  document.querySelectorAll("#panel-masked input").forEach(el => el.disabled = true);
   // per-backend user-facing note (e.g. sd35 FROZEN, flux1dev smoke-blocked)
   const bn = $("cap_backend_note");
   if (bn) { bn.textContent = caps.notes || ""; bn.classList.toggle("on", !!caps.notes); }
