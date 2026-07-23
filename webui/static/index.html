@@ -141,19 +141,19 @@
     <div class="sec" id="sec-general">
       <div class="panel"><h3>WORKSPACE</h3><div class="sub">Run identity, locations, and run-control keys (config-reader consumed)</div>
         <div class="grid2"><div>
-          <div class="row"><label>Run name <span class="wtag">wired</span></label><input id="g_runname" oninput="$('runname_top').value=this.value;$('runname_top').dispatchEvent(new Event('input'))"></div>
+          <div class="row"><label>Run name</label><input id="g_runname" oninput="$('runname_top').value=this.value;$('runname_top').dispatchEvent(new Event('input'))"></div>
           <div class="row"><label>Output root</label><input value="/home/alex/mojodiffusion/output/<run name>" disabled></div>
-          <div class="row"><label>Only cache <span class="wtag">wired</span></label><input id="only_cache" type="checkbox"></div>
+          <div class="row"><label>Only cache</label><input id="only_cache" type="checkbox"></div>
           <div class="row nw"><label>Prevent overwrites <span class="nwtag">not coded</span></label><input type="checkbox" checked></div>
-          <div class="row"><label>Continue last backup <span class="wtag">wired</span></label><input id="continue_last_backup" type="checkbox"></div>
-          <div class="row"><label>Dataloader threads <span class="wtag">wired</span></label><input id="dataloader_threads" type="number" value="8"></div>
+          <div class="row"><label>Continue last backup</label><input id="continue_last_backup" type="checkbox"></div>
+          <div class="row"><label>Dataloader threads</label><input id="dataloader_threads" type="number" value="8"></div>
         </div><div>
           <div class="row nw"><label>Debug mode <span class="nwtag">not coded</span></label><input type="checkbox"></div>
           <div class="row nw"><label>Debug dir <span class="nwtag">not coded</span></label><input value="debug"></div>
-          <div class="row"><label>SerenityBoard <span class="wtag">wired</span></label><input id="tensorboard" type="checkbox" checked></div>
-          <div class="row"><label>Board always on <span class="wtag">wired</span></label><input id="tensorboard_always_on" type="checkbox"></div>
+          <div class="row"><label>SerenityBoard</label><input id="tensorboard" type="checkbox" checked></div>
+          <div class="row"><label>Board always on</label><input id="tensorboard_always_on" type="checkbox"></div>
           <div class="row nw"><label>Board port <span class="nwtag">not coded</span></label><input value="6006"></div>
-          <div class="row"><label>Validation gates <span class="wtag">wired</span></label><input id="validation" type="checkbox"></div>
+          <div class="row"><label>Validation gates</label><input id="validation" type="checkbox"></div>
         </div></div>
       </div>
       <div class="panel"><h3>DEVICE</h3><div class="sub">Placement and precision defaults — single RTX 3090 Ti; these are surface-only</div>
@@ -185,22 +185,22 @@
               <select id="training_method"><option>LoRA</option><option>Fine Tune</option><option>Embedding</option></select></div>
             <div class="row nw"><label>Model Type <span class="nwtag">preset-derived</span></label>
               <select id="model_type"><option>IDEOGRAM_4</option><option selected>FLUX_2</option><option>STABLE_DIFFUSION_XL_10_BASE</option><option>STABLE_DIFFUSION_35</option><option>CHROMA_1</option><option>ERNIE_IMAGE</option><option>ANIMA</option><option>Z_IMAGE</option><option>Z_IMAGE_L2P</option><option>LTX_2_VIDEO</option><option>WAN_22_VIDEO</option><option>HIDREAM_O1</option><option>KREA_2</option><option>WAN_21</option><option>MAGEFLOW</option><option>FLUX_1</option><option>KLEIN_4B</option></select></div>
-            <div class="row"><label>Architecture <span class="wtag">wired</span></label><select id="preset"></select></div>
+            <div class="row"><label>Architecture</label><select id="preset"></select></div>
             <div class="capnote info" id="cap_backend_note"></div>
             <div class="row"><label>Base Model</label><input id="checkpoint"></div>
-            <div class="row"><label>VAE (override) <span class="wtag">wired</span></label><input id="vae_override" placeholder="preset default"></div>
-            <div class="row"><label>Quantized base <span class="wtag">wired</span></label>
+            <div class="row"><label>VAE (override)</label><input id="vae_override" placeholder="preset default"></div>
+            <div class="row"><label>Quantized base</label>
               <select id="quantized_resident"><option value="OFF">off (bf16)</option><option value="fp8_e4m3">fp8_e4m3 (device)</option><option value="fp8_e4m3_host">fp8_e4m3_host</option><option value="streamed_base_opt_in">streamed_base_opt_in</option></select></div>
             <div class="capnote" id="capnote_quant"></div>
           </div>
           <div>
             <div class="row"><label>Destination</label><input id="workspace_dir" disabled></div>
-            <div class="row"><label>Output format <span class="wtag">wired</span></label><select id="output_model_format"><option>SAFETENSORS</option></select></div>
-            <div class="row"><label>Output dtype <span class="wtag">wired</span></label><select id="output_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option selected>FLOAT_32</option></select></div>
+            <div class="row"><label>Output format</label><select id="output_model_format"><option>SAFETENSORS</option></select></div>
+            <div class="row"><label>Output dtype</label><select id="output_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option selected>FLOAT_32</option></select></div>
             <div class="row"><label>Backend</label><input id="backend_show" disabled></div>
             <div class="row"><label>Checkpoint file</label><input id="checkpoint_show" disabled></div>
-            <div class="row"><label>Train transformer <span class="wtag">wired</span></label><input id="train_transformer" type="checkbox" checked></div>
-            <div class="row"><label>Train text encoder <span class="wtag">wired</span></label><input id="train_text_encoder" type="checkbox"></div>
+            <div class="row"><label>Train transformer</label><input id="train_transformer" type="checkbox" checked></div>
+            <div class="row"><label>Train text encoder</label><input id="train_text_encoder" type="checkbox"></div>
             <div class="row"><label>Quantize TE <span class="nwtag">not coded</span></label><input type="checkbox" disabled></div>
             <div class="row"><label>TE qtype <span class="nwtag">not coded</span></label><input value="qfloat8" disabled></div>
             <div class="row"><label>Low VRAM <span class="nwtag">not coded</span></label><input type="checkbox" disabled></div>
@@ -214,14 +214,14 @@
     <div class="sec" id="sec-lora">
       <div class="panel"><h3>ADAPTER PARAMETERS</h3><div class="sub">Network algorithm, rank, alpha, dropout, weight dtype</div>
         <div class="grid2"><div>
-          <div class="row"><label>Algorithm (network) <span class="wtag">wired</span></label>
+          <div class="row"><label>Algorithm (network)</label>
             <select id="network_algorithm"><option>LORA</option><option>LOCON</option><option>LOKR</option><option>LOHA</option><option>DORA</option><option>OFT</option></select></div>
           <div class="row nw"><label>LoRA name <span class="nwtag">not coded</span></label><input placeholder="run name derived"></div>
-          <div class="row"><label>Rank <span class="wtag">wired</span></label><input id="lora_rank" type="number"></div>
-          <div class="row"><label>Alpha <span class="wtag">wired</span></label><input id="lora_alpha" type="number"></div>
+          <div class="row"><label>Rank</label><input id="lora_rank" type="number"></div>
+          <div class="row"><label>Alpha</label><input id="lora_alpha" type="number"></div>
         </div><div>
           <div class="row nw"><label>Dropout <span class="nwtag">not coded</span></label><input type="number" step="0.01" value="0"></div>
-          <div class="row"><label>Weight dtype <span class="wtag">wired</span></label><select id="lora_weight_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option selected>FLOAT_32</option></select></div>
+          <div class="row"><label>Weight dtype</label><select id="lora_weight_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option selected>FLOAT_32</option></select></div>
         </div></div>
       </div>
       <div class="panel"><h3>TARGETS &amp; OFT</h3><div class="sub">Module targets are per-model (qkv, proj, mlp, modulation where wired); OFT controls</div>
@@ -239,19 +239,19 @@
     <div class="sec" id="sec-dataset">
       <div class="panel"><h3>DATASET</h3><div class="sub">Training reads the pre-staged CACHE (latents + text conditioning). The image folder below drives the browser + captioner (raw images).</div>
         <div class="grid2"><div>
-          <div class="row"><label>Cache path <span class="wtag">wired</span></label><input id="cache"></div>
-          <div class="row"><label>Caption dropout <span class="wtag">wired</span></label><input id="caption_dropout_prob" type="number" step="0.01" value="0"></div>
+          <div class="row"><label>Cache path</label><input id="cache"></div>
+          <div class="row"><label>Caption dropout</label><input id="caption_dropout_prob" type="number" step="0.01" value="0"></div>
           <div class="capnote" id="capnote_caption"></div>
           <div class="row"><label>Image folder</label><input id="ds_folder" placeholder="/home/alex/1_giger/gigerver3"></div>
           <div class="row"><label></label><button class="btnp" onclick="scanDataset()">Scan folder</button></div>
         </div><div>
-          <div class="row"><label>Dataset path <span class="wtag">wired</span></label><input id="dataset_path" placeholder="raw image dir (cache is the training input)"></div>
-          <div class="row"><label>Concept file <span class="wtag">wired</span></label><input id="concept_file_name" value="concepts.json"></div>
-          <div class="row"><label>Resolution <span class="wtag">wired</span></label><select id="resolution"><option>512</option><option>768</option><option>1024</option><option>1280</option></select></div>
+          <div class="row"><label>Dataset path</label><input id="dataset_path" placeholder="raw image dir (cache is the training input)"></div>
+          <div class="row"><label>Concept file</label><input id="concept_file_name" value="concepts.json"></div>
+          <div class="row"><label>Resolution</label><select id="resolution"><option>512</option><option>768</option><option>1024</option><option>1280</option></select></div>
           <div class="row"><label>Aspect buckets <span class="nwtag">coded (stager t2d CLI) — config knob pending</span></label><input type="checkbox" checked disabled></div>
-          <div class="row"><label>Latent caching <span class="wtag">wired</span></label><input id="latent_caching" type="checkbox" checked></div>
-          <div class="row"><label>Clear cache before <span class="wtag">wired</span></label><input id="clear_cache_before_training" type="checkbox"></div>
-          <div class="row"><label>Cache text embeds <span class="wtag">wired</span></label><input id="cache_text_embeddings" type="checkbox"></div>
+          <div class="row"><label>Latent caching</label><input id="latent_caching" type="checkbox" checked></div>
+          <div class="row"><label>Clear cache before</label><input id="clear_cache_before_training" type="checkbox"></div>
+          <div class="row"><label>Cache text embeds</label><input id="cache_text_embeddings" type="checkbox"></div>
           <div class="row"><label>Caption extension <span class="nwtag">not coded</span></label><input value="txt" disabled></div>
         </div></div>
       </div>
@@ -314,33 +314,33 @@
     <div class="sec" id="sec-training">
       <div class="panel"><h3>BASE SCHEDULE</h3><div class="sub">Steps, epochs, batch, and LR cycle</div>
         <div class="grid2"><div>
-          <div class="row"><label>Max steps <span class="wtag">wired</span></label><input id="max_steps" type="number"></div>
-          <div class="row"><label>Learning rate <span class="wtag">wired</span></label><input id="learning_rate" type="number" step="0.00001"></div>
-          <div class="row"><label>Timestep shift <span class="wtag">wired</span></label><input id="timestep_shift" type="number" step="0.1"></div>
-          <div class="row"><label>Seed <span class="wtag">wired</span></label><input id="seed" type="number" placeholder="preset"></div>
-          <div class="row"><label>Batch size <span class="wtag">wired</span></label><input id="batch_size" type="number" value="1" min="1" max="2"></div>
-          <div class="row"><label>Grad accum steps <span class="wtag">wired</span></label><input id="gradient_accumulation_steps" type="number" value="1" min="1"></div>
+          <div class="row"><label>Max steps</label><input id="max_steps" type="number"></div>
+          <div class="row"><label>Learning rate</label><input id="learning_rate" type="number" step="0.00001"></div>
+          <div class="row"><label>Timestep shift</label><input id="timestep_shift" type="number" step="0.1"></div>
+          <div class="row"><label>Seed</label><input id="seed" type="number" placeholder="preset"></div>
+          <div class="row"><label>Batch size</label><input id="batch_size" type="number" value="1" min="1" max="2"></div>
+          <div class="row"><label>Grad accum steps</label><input id="gradient_accumulation_steps" type="number" value="1" min="1"></div>
         </div><div>
-          <div class="row"><label>Epochs <span class="wtag">wired</span></label><input id="epochs" type="number" value="1"></div>
-          <div class="row"><label>LR min factor <span class="wtag">wired</span></label><input id="learning_rate_min_factor" type="number" step="0.01" value="0"></div>
-          <div class="row"><label>LR cycles <span class="wtag">wired</span></label><input id="learning_rate_cycles" type="number" step="0.1" value="1"></div>
+          <div class="row"><label>Epochs</label><input id="epochs" type="number" value="1"></div>
+          <div class="row"><label>LR min factor</label><input id="learning_rate_min_factor" type="number" step="0.01" value="0"></div>
+          <div class="row"><label>LR cycles</label><input id="learning_rate_cycles" type="number" step="0.1" value="1"></div>
           <div class="row nw"><label>LR scaler <span class="nwtag">not coded</span></label><select><option>NONE</option><option>LINEAR</option><option>SQRT</option><option>COSINE</option></select></div>
-          <div class="row"><label>Save every <span class="wtag">wired</span></label><input id="save_every" type="number"></div>
+          <div class="row"><label>Save every</label><input id="save_every" type="number"></div>
         </div></div>
       </div>
 
       <div class="panel"><h3>OPTIMIZER</h3><div class="sub">Optimizer family + learning rates (per-backend capability gated)</div>
         <div class="grid2"><div>
-          <div class="row"><label>Optimizer <span class="wtag">wired</span></label>
+          <div class="row"><label>Optimizer</label>
             <!-- values = train_config_reader.mojo::_optimizer_int whitelist (fail-loud);
                  CAME/MUON removed (reader rejects), ADAMW8BIT -> ADAMW_8BIT -->
             <select id="optimizer_name"><option selected>ADAMW</option><option>ADAMW_8BIT</option><option>ADAFACTOR</option><option>SCHEDULE_FREE_ADAMW</option><option>AUTOMAGIC3</option></select></div>
-          <div class="row"><label>Weight decay <span class="wtag">wired</span></label><input id="optimizer_weight_decay" type="number" step="0.00001" value="0.01"></div>
-          <div class="row"><label>Warmup steps <span class="wtag">wired</span></label><input id="optimizer_warmup_steps" type="number" value="0"></div>
-          <div class="row"><label>Max grad norm <span class="wtag">wired</span></label><input id="max_grad_norm" type="number" step="0.1" placeholder="preset"></div>
+          <div class="row"><label>Weight decay</label><input id="optimizer_weight_decay" type="number" step="0.00001" value="0.01"></div>
+          <div class="row"><label>Warmup steps</label><input id="optimizer_warmup_steps" type="number" value="0"></div>
+          <div class="row"><label>Max grad norm</label><input id="max_grad_norm" type="number" step="0.1" placeholder="preset"></div>
           <div class="capnote" id="capnote_optimizer"></div>
         </div><div>
-          <div class="row"><label>Scheduler <span class="wtag">wired</span></label><select id="lr_scheduler"><option selected>CONSTANT</option><option>LINEAR</option><option>COSINE</option><option>COSINE_RESTARTS</option><option>POLYNOMIAL</option><option>REX</option></select></div>
+          <div class="row"><label>Scheduler</label><select id="lr_scheduler"><option selected>CONSTANT</option><option>LINEAR</option><option>COSINE</option><option>COSINE_RESTARTS</option><option>POLYNOMIAL</option><option>REX</option></select></div>
           <div class="row nw"><label>Text encoder LR <span class="nwtag">not coded</span></label><input type="number" step="0.00001" value="0.00001"></div>
           
         </div></div>
@@ -348,16 +348,16 @@
 
       <div class="panel"><h3>PRECISION &amp; MEMORY</h3><div class="sub">Precision + VRAM keys (train/fallback dtype, recompute, offload) — config-reader consumed</div>
         <div class="grid2"><div>
-          <div class="row"><label>Train dtype <span class="wtag">wired</span></label><select id="train_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option>FLOAT_32</option></select></div>
-          <div class="row"><label>Fallback dtype <span class="wtag">wired</span></label><select id="fallback_train_dtype"><option>BFLOAT_16</option><option>FLOAT_32</option></select></div>
-          <div class="row"><label>Gradient checkpointing <span class="wtag">wired</span></label><input id="gradient_checkpointing" type="checkbox" checked></div>
-          <div class="row"><label>Activation offloading <span class="wtag">wired</span></label><input id="enable_activation_offloading" type="checkbox"></div>
-          <div class="row"><label>Offload fraction <span class="wtag">wired</span></label><input id="layer_offload_fraction" type="number" step="0.05" value="0"></div>
-          <div class="row"><label>Resident blocks <span class="wtag">wired</span></label><input id="resident_blocks" type="number" placeholder="backend default"></div>
+          <div class="row"><label>Train dtype</label><select id="train_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option>FLOAT_32</option></select></div>
+          <div class="row"><label>Fallback dtype</label><select id="fallback_train_dtype"><option>BFLOAT_16</option><option>FLOAT_32</option></select></div>
+          <div class="row"><label>Gradient checkpointing</label><input id="gradient_checkpointing" type="checkbox" checked></div>
+          <div class="row"><label>Activation offloading</label><input id="enable_activation_offloading" type="checkbox"></div>
+          <div class="row"><label>Offload fraction</label><input id="layer_offload_fraction" type="number" step="0.05" value="0"></div>
+          <div class="row"><label>Resident blocks</label><input id="resident_blocks" type="number" placeholder="backend default"></div>
         </div><div>
           <div class="row nw"><label>Autocast cache <span class="nwtag">not coded</span></label><input type="checkbox" checked></div>
           
-          <div class="row"><label>Frames <span class="wtag">wired</span></label><input id="frames" value="1"></div>
+          <div class="row"><label>Frames</label><input id="frames" value="1"></div>
           <div class="row nw"><label>Circular padding <span class="nwtag">not coded</span></label><input type="checkbox"></div>
           <div class="row nw"><label>Train device <span class="nwtag">not coded</span></label><select><option>cuda</option><option>cpu</option></select></div>
         </div></div>
@@ -365,10 +365,10 @@
 
       <div class="panel"><h3>EMA &amp; TARGETS</h3><div class="sub">EMA is consumed by klein/zimage/hidream/ideogram4; the trainable-section toggles are surface-only</div>
         <div class="grid2"><div>
-          <div class="row"><label>EMA <span class="wtag">wired</span></label><input id="ema_enabled" type="checkbox"></div>
-          <div class="row"><label>EMA decay <span class="wtag">wired</span></label><input id="ema_decay" type="number" step="0.0001" value="0.999"></div>
+          <div class="row"><label>EMA</label><input id="ema_enabled" type="checkbox"></div>
+          <div class="row"><label>EMA decay</label><input id="ema_decay" type="number" step="0.0001" value="0.999"></div>
           <div class="capnote" id="capnote_ema"></div>
-          <div class="row"><label>EMA update interval <span class="wtag">wired</span></label><input id="ema_update_step_interval" type="number" value="5"></div>
+          <div class="row"><label>EMA update interval</label><input id="ema_update_step_interval" type="number" value="5"></div>
         </div><div>
           
           
@@ -392,30 +392,30 @@
       </div>
       <div class="panel"><h3>NOISE &amp; TIMESTEPS</h3><div class="sub">Flow-matching sigma-draw policy: distribution + offset/perturbation noise (config-reader consumed; timestep_shift + train shift are on Base Schedule)</div>
         <div class="grid2"><div>
-          <div class="row"><label>Offset noise <span class="wtag">wired</span></label><input id="offset_noise_weight" type="number" step="0.01" value="0"></div>
-          <div class="row"><label>Perturb noise <span class="wtag">wired</span></label><input id="perturbation_noise_weight" type="number" step="0.01" value="0"></div>
-          <div class="row"><label>Distribution <span class="wtag">wired</span></label><select id="timestep_distribution"><option selected>LOGIT_NORMAL</option><option>UNIFORM</option><option>SIGMOID</option><option>HEAVY_TAIL</option><option>COS_MAP</option><option>INVERTED_PARABOLA</option></select></div>
+          <div class="row"><label>Offset noise</label><input id="offset_noise_weight" type="number" step="0.01" value="0"></div>
+          <div class="row"><label>Perturb noise</label><input id="perturbation_noise_weight" type="number" step="0.01" value="0"></div>
+          <div class="row"><label>Distribution</label><select id="timestep_distribution"><option selected>LOGIT_NORMAL</option><option>UNIFORM</option><option>SIGMOID</option><option>HEAVY_TAIL</option><option>COS_MAP</option><option>INVERTED_PARABOLA</option></select></div>
           <div class="row nw"><label>Dynamic shift <span class="nwtag">not coded</span></label><input type="checkbox"></div>
         </div><div>
           <div class="row nw"><label>Min strength <span class="nwtag">not coded</span></label><input type="number" step="0.01" value="0"></div>
           <div class="row nw"><label>Max strength <span class="nwtag">not coded</span></label><input type="number" step="0.01" value="1"></div>
-          <div class="row"><label>Noising weight <span class="wtag">wired</span></label><input id="noising_weight" type="number" step="0.1" value="1"></div>
-          <div class="row"><label>Noising bias <span class="wtag">wired</span></label><input id="noising_bias" type="number" step="0.1" value="0"></div>
+          <div class="row"><label>Noising weight</label><input id="noising_weight" type="number" step="0.1" value="1"></div>
+          <div class="row"><label>Noising bias</label><input id="noising_bias" type="number" step="0.1" value="0"></div>
         </div></div>
       </div>
 
       <div class="panel"><h3>LOSS</h3><div class="sub">loss_fn / huber_delta / smooth_l1_beta / min_snr_gamma_flow are consumed T1 levers; the strength mix + weight fn are surface-only</div>
         <div class="grid2"><div>
-          <div class="row"><label>Loss fn <span class="wtag">wired</span></label><select id="loss_fn"><option value="">mse (default)</option><option>huber</option><option>smooth_l1</option></select></div>
-          <div class="row"><label>Huber delta <span class="wtag">wired</span></label><input id="huber_delta" type="number" step="0.01" placeholder="—"></div>
-          <div class="row"><label>SmoothL1 beta <span class="wtag">wired</span></label><input id="smooth_l1_beta" type="number" step="0.01" placeholder="—"></div>
-          <div class="row"><label>Min-SNR gamma (flow) <span class="wtag">wired</span></label><input id="min_snr_gamma_flow" type="number" step="0.1" placeholder="off"></div>
+          <div class="row"><label>Loss fn</label><select id="loss_fn"><option value="">mse (default)</option><option>huber</option><option>smooth_l1</option></select></div>
+          <div class="row"><label>Huber delta</label><input id="huber_delta" type="number" step="0.01" placeholder="—"></div>
+          <div class="row"><label>SmoothL1 beta</label><input id="smooth_l1_beta" type="number" step="0.01" placeholder="—"></div>
+          <div class="row"><label>Min-SNR gamma (flow)</label><input id="min_snr_gamma_flow" type="number" step="0.1" placeholder="off"></div>
           <div class="capnote" id="capnote_loss"></div>
-          <div class="row"><label>MSE strength <span class="wtag">wired</span></label><input id="mse_strength" type="number" step="0.1" value="1"></div>
-          <div class="row"><label>MAE strength <span class="wtag">wired</span></label><input id="mae_strength" type="number" step="0.1" value="0"></div>
+          <div class="row"><label>MSE strength</label><input id="mse_strength" type="number" step="0.1" value="1"></div>
+          <div class="row"><label>MAE strength</label><input id="mae_strength" type="number" step="0.1" value="0"></div>
         </div><div>
           <div class="row nw"><label>log-cosh strength <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="0"></div>
-          <div class="row"><label>Huber strength <span class="wtag">wired</span></label><input id="huber_strength" type="number" step="0.1" value="0"></div>
+          <div class="row"><label>Huber strength</label><input id="huber_strength" type="number" step="0.1" value="0"></div>
           <div class="row nw"><label>VB strength <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="0"></div>
           <div class="row"><label>Weight fn <span class="nwtag">min-SNR wired above; rest not coded</span></label><select disabled><option>MIN_SNR_GAMMA</option></select></div>
           <div class="row"><label>Weight gamma <span class="nwtag">= Min-SNR gamma above</span></label><input type="number" step="0.1" value="5" disabled></div>
@@ -425,22 +425,22 @@
 
       <div class="panel" id="panel-masked"><h3>MASKED TRAINING</h3><div class="sub">levers_masked_* + mask_cache_dir (config-reader consumed; backends without the lever ignore it)</div>
         <div class="grid2"><div>
-          <div class="row"><label>Masked <span class="wtag">wired</span></label><input id="masked_training" type="checkbox"></div>
-          <div class="row"><label>Unmasked probability <span class="wtag">wired</span></label><input id="unmasked_probability" type="number" step="0.01" value="0"></div>
-          <div class="row"><label>Unmasked weight <span class="wtag">wired</span></label><input id="unmasked_weight" type="number" step="0.01" value="0"></div>
+          <div class="row"><label>Masked</label><input id="masked_training" type="checkbox"></div>
+          <div class="row"><label>Unmasked probability</label><input id="unmasked_probability" type="number" step="0.01" value="0"></div>
+          <div class="row"><label>Unmasked weight</label><input id="unmasked_weight" type="number" step="0.01" value="0"></div>
         </div><div>
-          <div class="row"><label>Normalize masked loss <span class="wtag">wired</span></label><input id="normalize_masked_area_loss" type="checkbox"></div>
-          <div class="row"><label>Prior preservation weight <span class="wtag">wired</span></label><input id="masked_prior_preservation_weight" type="number" step="0.1" value="1"></div>
-          <div class="row"><label>Custom conditioning image <span class="wtag">wired</span></label><input id="custom_conditioning_image" type="checkbox"></div>
+          <div class="row"><label>Normalize masked loss</label><input id="normalize_masked_area_loss" type="checkbox"></div>
+          <div class="row"><label>Prior preservation weight</label><input id="masked_prior_preservation_weight" type="number" step="0.1" value="1"></div>
+          <div class="row"><label>Custom conditioning image</label><input id="custom_conditioning_image" type="checkbox"></div>
         </div></div>
       </div>
 
       <div class="panel"><h3>LAYER FILTER</h3><div class="sub">Target layer preset + explicit filter (config-reader consumed; lora_target_preset family)</div>
         <div class="grid2"><div>
-          <div class="row"><label>Preset <span class="wtag">wired</span></label><select id="layer_filter_preset"><option>full</option><option>attention</option><option>mlp</option><option>double_blocks</option><option>single_blocks</option></select></div>
-          <div class="row"><label>Filter <span class="wtag">wired</span></label><input id="layer_filter" placeholder="explicit layer filter"></div>
+          <div class="row"><label>Preset</label><select id="layer_filter_preset"><option>full</option><option>attention</option><option>mlp</option><option>double_blocks</option><option>single_blocks</option></select></div>
+          <div class="row"><label>Filter</label><input id="layer_filter" placeholder="explicit layer filter"></div>
         </div><div>
-          <div class="row"><label>Regex <span class="wtag">wired</span></label><input id="layer_filter_regex" type="checkbox"></div>
+          <div class="row"><label>Regex</label><input id="layer_filter_regex" type="checkbox"></div>
         </div></div>
       </div>
     </div>
@@ -449,18 +449,18 @@
     <div class="sec" id="sec-sampling">
       <div class="panel"><h3>SAMPLING</h3><div class="sub">Inline validation renders (1024×1024 minimum, from the samples JSON). Cadence + prompts file are wired; the per-render knobs come from the samples JSON / sampler preset.</div>
         <div class="grid2"><div>
-          <div class="row"><label>Sample every <span class="wtag">wired</span></label><input id="sample_every" type="number"></div>
-          <div class="row"><label>Prompts file <span class="wtag">wired</span></label><input id="validation_prompts_file" placeholder="preset / config default"></div>
+          <div class="row"><label>Sample every</label><input id="sample_every" type="number"></div>
+          <div class="row"><label>Prompts file</label><input id="validation_prompts_file" placeholder="preset / config default"></div>
           <div class="capnote" id="capnote_sampling"></div>
           <div class="row"><label></label><button class="vbtn ghost" onclick="editPromptsFromSampling()">Edit these prompts →</button></div>
         </div><div>
           <div class="row"><label>Sample dir <span class="nwtag">fixed: workspace/samples</span></label><input placeholder="&lt;workspace&gt;/samples" disabled></div>
-          <div class="row"><label>Skip first <span class="wtag">wired</span></label><input id="sample_skip_first" type="number" value="0"></div>
+          <div class="row"><label>Skip first</label><input id="sample_skip_first" type="number" value="0"></div>
           <div class="row"><label>Steps <span class="nwtag">per-prompt in samples JSON</span></label><input type="number" value="20"></div>
           <div class="row"><label>CFG <span class="nwtag">per-prompt in samples JSON</span></label><input type="number" step="0.1" value="7"></div>
           <div class="row"><label>Sampler <span class="nwtag">per-prompt in samples JSON</span></label><select><option>Ideogram4 FlowMatch</option><option selected>FlowMatch Euler</option><option>Euler</option><option>DDIM</option><option>DPM++ 2M</option><option>UniPC</option></select></div>
-          <div class="row"><label>Send to SerenityBoard <span class="wtag">wired</span></label><input id="samples_to_tensorboard" type="checkbox" checked></div>
-          <div class="row"><label>Non-EMA sampling <span class="wtag">wired</span></label><input id="non_ema_sampling" type="checkbox"></div>
+          <div class="row"><label>Send to SerenityBoard</label><input id="samples_to_tensorboard" type="checkbox" checked></div>
+          <div class="row"><label>Non-EMA sampling</label><input id="non_ema_sampling" type="checkbox"></div>
         </div></div>
         <div id="samp_preview" class="sub" style="margin-top:8px"></div>
       </div>
@@ -470,15 +470,15 @@
     <div class="sec" id="sec-backup">
       <div class="panel"><h3>SAVES</h3><div class="sub">Save cadence (Training tab) + rolling backup/retention keys — config-reader consumed</div>
         <div class="grid2"><div>
-          <div class="row"><label>Save every <span class="wtag">wired</span></label><input value="see Training → Save every" disabled></div>
+          <div class="row"><label>Save every</label><input value="see Training → Save every" disabled></div>
           <div class="row nw"><label>Save prefix <span class="nwtag">derived</span></label><input id="save_prefix_show" disabled></div>
-          <div class="row"><label>Backup after <span class="wtag">wired</span></label><input id="backup_after" type="number" value="500"></div>
-          <div class="row"><label>Save skip first <span class="wtag">wired</span></label><input id="save_skip_first" type="number" value="0"></div>
+          <div class="row"><label>Backup after</label><input id="backup_after" type="number" value="500"></div>
+          <div class="row"><label>Save skip first</label><input id="save_skip_first" type="number" value="0"></div>
         </div><div>
-          <div class="row"><label>Rolling backup <span class="wtag">wired</span></label><input id="rolling_backup" type="checkbox" checked></div>
-          <div class="row"><label>Rolling count <span class="wtag">wired</span></label><input id="rolling_backup_count" type="number" value="5"></div>
-          <div class="row"><label>Backup before save <span class="wtag">wired</span></label><input id="backup_before_save" type="checkbox" checked></div>
-          <div class="row"><label>Save max keep <span class="wtag">wired</span></label><input id="save_max_keep" type="number" value="4"></div>
+          <div class="row"><label>Rolling backup</label><input id="rolling_backup" type="checkbox" checked></div>
+          <div class="row"><label>Rolling count</label><input id="rolling_backup_count" type="number" value="5"></div>
+          <div class="row"><label>Backup before save</label><input id="backup_before_save" type="checkbox" checked></div>
+          <div class="row"><label>Save max keep</label><input id="save_max_keep" type="number" value="4"></div>
         </div></div>
         <div class="sub" style="margin-top:6px">Resume states: every save writes <code>&lt;ckpt&gt;.state</code> — full resume via the Resume tab.</div>
       </div>
@@ -513,8 +513,8 @@
     <!-- RESUME -->
     <div class="sec" id="sec-resume">
       <div class="panel"><h3>RESUME</h3><div class="sub">FULL resume needs the .state file path — the PEFT path silently warm-resumes. Wired for krea2, klein, zimage, sd35 only; other backends refuse resume with a 400. (sd35 has no start-step slot — its start step is auto-probed from the checkpoint.)</div>
-        <div class="row"><label>.state file <span class="wtag">wired</span></label><input id="resume_state" placeholder="/path/to/ckpt.safetensors.state"></div>
-        <div class="row"><label>Start step <span class="wtag">wired</span></label><input id="start_step" type="number" placeholder="0"></div>
+        <div class="row"><label>.state file</label><input id="resume_state" placeholder="/path/to/ckpt.safetensors.state"></div>
+        <div class="row"><label>Start step</label><input id="start_step" type="number" placeholder="0"></div>
         <div class="capnote" id="capnote_resume"></div>
       </div>
     </div>
