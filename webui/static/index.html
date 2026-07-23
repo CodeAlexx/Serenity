@@ -147,7 +147,7 @@
   <div id="center">
     <!-- GENERAL -->
     <div class="sec" id="sec-general">
-      <div class="panel"><h3>WORKSPACE</h3><div class="sub">Run identity, locations, and run-control keys (config-reader consumed)</div>
+      <div class="panel"><h3>WORKSPACE</h3><div class="sub">Run identity, locations, and run-control keys</div>
         <div class="grid2"><div>
           <div class="row"><label>Run name</label><input id="g_runname" oninput="$('runname_top').value=this.value;$('runname_top').dispatchEvent(new Event('input'))"></div>
           <div class="row"><label>Output root</label><input value="/home/alex/mojodiffusion/output/<run name>" disabled></div>
@@ -354,7 +354,7 @@
         </div></div>
       </div>
 
-      <div class="panel"><h3>PRECISION &amp; MEMORY</h3><div class="sub">Precision + VRAM keys (train/fallback dtype, recompute, offload) — config-reader consumed</div>
+      <div class="panel"><h3>PRECISION &amp; MEMORY</h3><div class="sub">Precision + VRAM keys (train/fallback dtype, recompute, offload) </div>
         <div class="grid2"><div>
           <div class="row"><label>Train dtype</label><select id="train_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option>FLOAT_32</option></select></div>
           <div class="row"><label>Fallback dtype</label><select id="fallback_train_dtype"><option>BFLOAT_16</option><option>FLOAT_32</option></select></div>
@@ -398,7 +398,7 @@
           <div class="row nw"><label>Guidance scale <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="1.0"></div>
         </div></div>
       </div>
-      <div class="panel"><h3>NOISE &amp; TIMESTEPS</h3><div class="sub">Flow-matching sigma-draw policy: distribution + offset/perturbation noise (config-reader consumed; timestep_shift + train shift are on Base Schedule)</div>
+      <div class="panel"><h3>NOISE &amp; TIMESTEPS</h3><div class="sub">Flow-matching sigma-draw policy: distribution + offset/perturbation noise; shift fields are on Base Schedule</div>
         <div class="grid2"><div>
           <div class="row"><label>Distribution</label><select id="timestep_distribution"><option selected>LOGIT_NORMAL</option><option>UNIFORM</option><option>SIGMOID</option><option>HEAVY_TAIL</option><option>COS_MAP</option><option>INVERTED_PARABOLA</option></select></div>
           <div class="row"><label>Distribution weight</label><input id="noising_weight" type="number" step="0.1" value="1"></div>
@@ -413,7 +413,7 @@
         </div></div>
       </div>
 
-      <div class="panel"><h3>LOSS</h3><div class="sub">loss_fn / huber_delta / smooth_l1_beta / min_snr_gamma_flow are consumed T1 levers; the strength mix + weight fn are surface-only</div>
+      <div class="panel"><h3>LOSS</h3><div class="sub">Loss function, Huber/SmoothL1 shape, min-SNR weighting, and the MSE/MAE/Huber strength mix</div>
         <div class="grid2"><div>
           <div class="row"><label>Loss fn</label><select id="loss_fn"><option value="">mse (default)</option><option>huber</option><option>smooth_l1</option></select></div>
           <div class="row"><label>Huber delta</label><input id="huber_delta" type="number" step="0.01" placeholder="—"></div>
@@ -432,7 +432,7 @@
         </div></div>
       </div>
 
-      <div class="panel" id="panel-masked"><h3>MASKED TRAINING</h3><div class="sub">levers_masked_* + mask_cache_dir (config-reader consumed; backends without the lever ignore it)</div>
+      <div class="panel" id="panel-masked"><h3>MASKED TRAINING</h3><div class="sub">Masked-loss controls; backends without masked support ignore them</div>
         <div class="grid2"><div>
           <div class="row"><label>Masked</label><input id="masked_training" type="checkbox"></div>
           <div class="row"><label>Unmasked probability</label><input id="unmasked_probability" type="number" step="0.01" value="0"></div>
@@ -444,7 +444,7 @@
         </div></div>
       </div>
 
-      <div class="panel"><h3>LAYER FILTER</h3><div class="sub">Target layer preset + explicit filter (config-reader consumed; lora_target_preset family)</div>
+      <div class="panel"><h3>LAYER FILTER</h3><div class="sub">Target layer preset + explicit filter</div>
         <div class="grid2"><div>
           <div class="row"><label>Preset</label><select id="layer_filter_preset"><option>full</option><option>attention</option><option>mlp</option><option>double_blocks</option><option>single_blocks</option></select></div>
         </div><div>
@@ -477,7 +477,7 @@
 
     <!-- BACKUP -->
     <div class="sec" id="sec-backup">
-      <div class="panel"><h3>SAVES</h3><div class="sub">Save cadence (Training tab) + rolling backup/retention keys — config-reader consumed</div>
+      <div class="panel"><h3>SAVES</h3><div class="sub">Save cadence (Training tab) + rolling backup/retention keys </div>
         <div class="grid2"><div>
           <div class="row"><label>Save every</label><input value="see Training → Save every" disabled></div>
           <div class="row nw"><label>Save prefix <span class="nwtag">derived</span></label><input id="save_prefix_show" disabled></div>
