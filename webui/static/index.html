@@ -392,15 +392,16 @@
       </div>
       <div class="panel"><h3>NOISE &amp; TIMESTEPS</h3><div class="sub">Flow-matching sigma-draw policy: distribution + offset/perturbation noise (config-reader consumed; timestep_shift + train shift are on Base Schedule)</div>
         <div class="grid2"><div>
+          <div class="row"><label>Distribution</label><select id="timestep_distribution"><option selected>LOGIT_NORMAL</option><option>UNIFORM</option><option>SIGMOID</option><option>HEAVY_TAIL</option><option>COS_MAP</option><option>INVERTED_PARABOLA</option></select></div>
+          <div class="row"><label>Distribution weight</label><input id="noising_weight" type="number" step="0.1" value="1"></div>
+          <div class="row"><label>Distribution bias</label><input id="noising_bias" type="number" step="0.1" value="0"></div>
+          <div class="capnote info on">LOGIT_NORMAL amount = Timestep shift / Train timestep shift (Base Schedule). Weight + bias shape the SIGMOID and weighted draws.</div>
+        </div><div>
           <div class="row"><label>Offset noise</label><input id="offset_noise_weight" type="number" step="0.01" value="0"></div>
           <div class="row"><label>Perturb noise</label><input id="perturbation_noise_weight" type="number" step="0.01" value="0"></div>
-          <div class="row"><label>Distribution</label><select id="timestep_distribution"><option selected>LOGIT_NORMAL</option><option>UNIFORM</option><option>SIGMOID</option><option>HEAVY_TAIL</option><option>COS_MAP</option><option>INVERTED_PARABOLA</option></select></div>
           <div class="row nw"><label>Dynamic shift <span class="nwtag">not coded</span></label><input type="checkbox"></div>
-        </div><div>
           <div class="row nw"><label>Min strength <span class="nwtag">not coded</span></label><input type="number" step="0.01" value="0"></div>
           <div class="row nw"><label>Max strength <span class="nwtag">not coded</span></label><input type="number" step="0.01" value="1"></div>
-          <div class="row"><label>Noising weight</label><input id="noising_weight" type="number" step="0.1" value="1"></div>
-          <div class="row"><label>Noising bias</label><input id="noising_bias" type="number" step="0.1" value="0"></div>
         </div></div>
       </div>
 
