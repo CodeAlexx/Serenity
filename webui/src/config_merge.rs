@@ -74,7 +74,7 @@ pub fn build_merged_config(
             if m.get("sample_every").and_then(|v| v.as_u64()).unwrap_or(0) > 0 {
                 m.insert("sample_every".into(), json!(0));
                 notes.push(format!(
-                    "sampling disabled: inline sampler not wired for backend {backend} — sample_every forced to 0"
+                    "sampling disabled: inline sampler not available for backend {backend} — sample_every forced to 0"
                 ));
             }
             for k in ["validation_prompts_file", "sample_definition_file_name"] {
