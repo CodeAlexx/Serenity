@@ -33,6 +33,14 @@
   .row label { color:var(--dim); font-size:12px; }
   input, select { width:100%; background:#12171d; color:var(--fg); border:1px solid var(--line); border-radius:6px; padding:6px 9px; font:inherit; font-size:13px; }
   input[type=checkbox] { width:auto; }
+  /* sane field widths — numbers are short, enums medium; only paths/expressions go wide */
+  .row input[type=number] { max-width:130px; }
+  .row select { max-width:280px; }
+  .row input:not([type=number]):not([type=checkbox]) { max-width:420px; }
+  .row input[id*="path"], .row input[id*="dir"], .row input[id*="file"], .row input[id*="folder"],
+  .row input[id="checkpoint"], .row input[id="cache"], .row input[id="resume_state"],
+  .row input[id="vae_override"], .row input[id="layer_filter"], .row input[id="g_runname"],
+  .row input[id="cap_custom"], .row input[id="cap_prompt"], .row input[disabled][value*="/"] { max-width:100%; }
   .sec { display:none; }
   .sec.show { display:block; }
   /* ── not-coded fields: visible but dimmed, excluded from launch. ── */
