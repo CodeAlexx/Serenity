@@ -224,7 +224,7 @@
           <div class="row"><label>Weight dtype</label><select id="lora_weight_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option selected>FLOAT_32</option></select></div>
         </div></div>
       </div>
-      <div class="panel"><h3>TARGETS &amp; OFT</h3><div class="sub">Module targets are per-model (qkv, proj, mlp, modulation where wired); OFT controls</div>
+      <div class="panel"><h3>TARGETS &amp; OFT</h3><div class="sub">Module targets are fixed per-model (qkv, proj, mlp, modulation)</div>
         <div class="grid2"><div>
           <div class="row"><label>Transformer targets</label><input value="double/single projections — qkv, proj, mlp, modulation" disabled></div>
           <div class="row nw"><label>OFT block size <span class="nwtag">not coded</span></label><input type="number" value="4"></div>
@@ -447,7 +447,7 @@
 
     <!-- SAMPLING -->
     <div class="sec" id="sec-sampling">
-      <div class="panel"><h3>SAMPLING</h3><div class="sub">Inline validation renders (1024×1024 minimum, from the samples JSON). Cadence + prompts file are wired; the per-render knobs come from the samples JSON / sampler preset.</div>
+      <div class="panel"><h3>SAMPLING</h3><div class="sub">Inline validation renders (1024×1024 minimum, from the samples JSON). Cadence + prompts file here; per-render knobs come from the samples JSON.</div>
         <div class="grid2"><div>
           <div class="row"><label>Sample every</label><input id="sample_every" type="number"></div>
           <div class="row"><label>Prompts file</label><input id="validation_prompts_file" placeholder="preset / config default"></div>
