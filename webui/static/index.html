@@ -438,10 +438,10 @@
       <div class="panel"><h3>LAYER FILTER</h3><div class="sub">Target layer preset + explicit filter (config-reader consumed; lora_target_preset family)</div>
         <div class="grid2"><div>
           <div class="row"><label>Preset</label><select id="layer_filter_preset"><option>full</option><option>attention</option><option>mlp</option><option>double_blocks</option><option>single_blocks</option></select></div>
-          <div class="row"><label>Filter</label><input id="layer_filter" placeholder="explicit layer filter"></div>
         </div><div>
           <div class="row"><label>Regex</label><input id="layer_filter_regex" type="checkbox"></div>
         </div></div>
+        <div class="row" style="margin-top:6px"><label>Filter expression</label><input id="layer_filter" style="width:100%" placeholder="comma list or regex, e.g. double_blocks.0,double_blocks.1  |  blocks\.(0|1|2)\."></div>
       </div>
     </div>
 
