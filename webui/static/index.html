@@ -35,9 +35,7 @@
   input[type=checkbox] { width:auto; }
   .sec { display:none; }
   .sec.show { display:block; }
-  /* ── the honesty convention: a field present in the Mojo UI that NO runner
-       consumes. Rendered so the parameter is VISIBLE (full parity) but visibly
-       marked and dimmed, and EXCLUDED from the launch overrides (UI_MAP §8.5). ── */
+  /* ── not-coded fields: visible but dimmed, excluded from launch. ── */
   .nw > label { opacity:.6; }
   .nw > input, .nw > select { opacity:.55; }
   .nwtag { display:inline-block; color:var(--orange); font-size:9px; letter-spacing:.04em; border:1px solid var(--orange); border-radius:3px; padding:0 4px; margin-left:6px; opacity:.75; vertical-align:middle; text-transform:uppercase; }
@@ -331,7 +329,7 @@
         </div></div>
       </div>
 
-      <div class="panel"><h3>OPTIMIZER</h3><div class="sub">Optimizer family + learning rates. Consumed per backend capability table (UI_MAP §8.5).</div>
+      <div class="panel"><h3>OPTIMIZER</h3><div class="sub">Optimizer family + learning rates (per-backend capability gated)</div>
         <div class="grid2"><div>
           <div class="row"><label>Optimizer <span class="wtag">wired</span></label>
             <!-- values = train_config_reader.mojo::_optimizer_int whitelist (fail-loud);
@@ -381,7 +379,7 @@
 
       
       
-      <div class="panel"><h3>PER-MODULE (OneTrainer parity)</h3><div class="sub">Encoders are frozen and the transformer is the trained module in every Serenity trainer — these per-module knobs have no code</div>
+      <div class="panel"><h3>PER-MODULE</h3><div class="sub">Encoders are frozen and the transformer is the trained module in every Serenity trainer — these per-module knobs have no code</div>
         <div class="grid2"><div>
           <div class="row nw"><label>TE learning rate <span class="nwtag">not coded</span></label><input type="number" step="0.00001" value="0.00001"></div>
           <div class="row nw"><label>TE stop after <span class="nwtag">not coded</span></label><input type="number" value="30"></div>
@@ -493,7 +491,7 @@
     <!-- CLOUD (single section — the duplicate #sec-cloud block was merged here,
          P5 DOM fix: two ids broke per-id logic + nav routing) -->
     <div class="sec" id="sec-cloud">
-      <div class="panel"><h3>CLOUD <span class="nwtag">not coded</span></h3><div class="sub">Serenity cloud target (RunPod / Linux SSH). Surface-only in both the Mojo UI and here — cloud sync is not implemented (UI_MAP §7).</div>
+      <div class="panel"><h3>CLOUD <span class="nwtag">not coded</span></h3><div class="sub">Serenity cloud target (RunPod / Linux SSH). Cloud sync is not coded.</div>
         <div class="grid2"><div>
           <div class="row nw"><label>Cloud type <span class="nwtag">not coded</span></label><select id="cloud_type" class="nw"><option>NONE</option><option>RUNPOD</option><option>LINUX</option></select></div>
           <div class="row nw"><label>Host <span class="nwtag">not coded</span></label><input id="cloud_host" class="nw" placeholder="ssh host"></div>
@@ -514,7 +512,7 @@
 
     <!-- RESUME -->
     <div class="sec" id="sec-resume">
-      <div class="panel"><h3>RESUME</h3><div class="sub">FULL resume needs the .state file path — the PEFT path silently warm-resumes (MJ-1077). Wired for krea2, klein, zimage, sd35 only; other backends refuse resume with a 400. (sd35 has no start-step slot — its start step is auto-probed from the checkpoint.)</div>
+      <div class="panel"><h3>RESUME</h3><div class="sub">FULL resume needs the .state file path — the PEFT path silently warm-resumes. Wired for krea2, klein, zimage, sd35 only; other backends refuse resume with a 400. (sd35 has no start-step slot — its start step is auto-probed from the checkpoint.)</div>
         <div class="row"><label>.state file <span class="wtag">wired</span></label><input id="resume_state" placeholder="/path/to/ckpt.safetensors.state"></div>
         <div class="row"><label>Start step <span class="wtag">wired</span></label><input id="start_step" type="number" placeholder="0"></div>
         <div class="capnote" id="capnote_resume"></div>
