@@ -679,6 +679,23 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
             }
             v
         }
+        // shape 6 (2026-07-23 audit): ACE-Step-1.5 xl-base positional argv
+        // (train_acestep.mojo:389-404): checkpoint_dir cache_dir output_dir
+        // run_name steps grad_accum lr rank alpha save_every. NOT config_runner
+        // (its arg1 IS the checkpoint dir, not a config path). Needs an audio
+        // cache built first (scripts/acestep_pt_to_cache.py) for a real run.
+        "acestep" => vec![
+            p.checkpoint.clone(),
+            cache.clone(),
+            workspace.clone(),
+            run_name.clone(),
+            steps.to_string(),
+            format!("{}", getu("grad_accum", 4)),
+            format!("{}", getf("learning_rate", 1e-4)),
+            format!("{}", getu("lora_rank", 16)),
+            format!("{}", getf("lora_alpha", 16.0)),
+            format!("{}", getu("save_every", 0)),
+        ],
         other => return (StatusCode::NOT_IMPLEMENTED, Json(json!({"error": format!("argv shape {other} not wired")}))),
     };
     // finding #1: resume argv order is PER-BACKEND, not per argv-shape. The

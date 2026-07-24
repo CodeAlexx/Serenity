@@ -799,6 +799,44 @@
    },
    "_wired_note": "wave 3 cont. (2026-07-22): FLUX.2-klein-base-4B via train_klein4b_real (THIN VARIANT of the 9B driver: comptime H 24, klein4b.json dims 3072/5dbl/20sgl/jad7680, post-scrub serenitymojo module names \u2014 see driver header). checkpoint = the BFL-format single file flux-2-klein-base-4b.safetensors (dl'd from the HF repo root; the diffusers transformer/ download is split-q/k/v + transformer_blocks.* naming and NOT loadable by models/klein/weights.mojo \u2014 header-verified). CACHE: the 9B caches are INCOMPATIBLE (text_embedding [1,512,12288] = Qwen3-8B x layers[8,17,26] vs 4B's 7680 = Qwen3-4B x same layers \u2014 header-verified vs klein9b caches); eri2_klein4b_512 is built by pipeline/klein4b_prepare.mojo (Qwen3-4B encoder from the repo's own text_encoder/) over the surviving anchor8 stage. recipe overrides make the merged config path-resolvable from the supervisor cwd (klein4b.json's relative models/* paths do not resolve from serenity-trainer). sample_every 0: no validation_prompts_file staged for 4B; legacy cached-caption sampling stays off.",
    "_samples_note": "validation_prompts_file: validate_klein_train_config REQUIRES the key (fail-loud, measured). Reuses the klein9b alina samples JSON (prompt text is model-agnostic). Inline caps sampling additionally needs per-prompt cap-cache precache before enabling sample_every>0 on this row."
+  },
+  {
+   "id": "acestep",
+   "label": "ACE-Step-1.5 xl-base (music LoRA)",
+   "backend": "acestep",
+   "wired": true,
+   "argv_shape": "acestep",
+   "binary": "/home/alex/mojodiffusion/output/bin/train_acestep",
+   "checkpoint": "/home/alex/ACE-Step-1.5/checkpoints/acestep-v15-xl-base",
+   "cache": "/home/alex/.serenity/acestep_cache",
+   "env": {
+    "LD_LIBRARY_PATH": "/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib:/home/alex/mojodiffusion/.pixi/envs/default/lib"
+   },
+   "run_name": "acestep_lora",
+   "workspace_dir": "/home/alex/mojodiffusion/output/acestep_lora",
+   "save_filename_prefix": "acestep",
+   "capabilities": {
+    "optimizer_levers": false,
+    "loss_levers": false,
+    "ema": false,
+    "caption_dropout": false,
+    "masked_loss": false,
+    "sampling": false,
+    "resume": false,
+    "quantized_resident": false,
+    "adapter_algos": [
+     "lora"
+    ],
+    "notes": "ACE-Step-1.5 xl-base AUDIO (text-to-music) LoRA. Positional-argv trainer (acestep shape): checkpoint/cache/output/run_name/steps/grad_accum/lr/rank/alpha/save_every. NEEDS an audio cache built first (scripts/acestep_pt_to_cache.py) \u2014 the /home/alex/.serenity/acestep_cache path is a placeholder. LoRA-only (no algo arg). Binary built 2026-07-23; xl-base weights downloaded (20GB)."
+   },
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "grad_accum": 4,
+    "max_steps": 1000,
+    "save_every": 250
+   }
   }
  ]
 }
