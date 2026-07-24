@@ -704,6 +704,26 @@ function applyCapabilities(p) {
     const n = $(g.note);
     if (n) { n.textContent = off ? g.msg : ""; n.classList.toggle("on", off); }
   }
+  // adapter-algorithm gating: only unlock the network algorithms this backend
+  // actually DISPATCHES (presets.json capabilities.adapter_algos). Video models
+  // carry ["lora","locon"]; Lycoris image models carry their exact set. Absent
+  // key = permissive/legacy (all options stay enabled — e.g. FROZEN sdxl/sd35).
+  // Disabled <option>s cannot be selected (native selects skip them), and if the
+  // current selection just became disabled we reset to LORA — so buildLaunchBody
+  // can never emit an algo the backend rejects.
+  const sel = $("network_algorithm");
+  if (sel) {
+    const allowed = Array.isArray(caps.adapter_algos)
+      ? caps.adapter_algos.map(a => String(a).toLowerCase()) : null;
+    for (const opt of sel.options) {
+      opt.disabled = allowed ? !allowed.includes(opt.value.toLowerCase()) : false;
+    }
+    if (sel.selectedOptions[0] && sel.selectedOptions[0].disabled) {
+      for (const opt of sel.options) {
+        if (opt.value.toLowerCase() === "lora") { sel.value = opt.value; break; }
+      }
+    }
+  }
   // per-backend user-facing note (e.g. sd35 FROZEN, flux1dev smoke-blocked)
   const bn = $("cap_backend_note");
   if (bn) { bn.textContent = caps.notes || ""; bn.classList.toggle("on", !!caps.notes); }

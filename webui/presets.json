@@ -23,6 +23,14 @@
     "sampling": true,
     "resume": true,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon",
+     "lokr",
+     "loha",
+     "dora",
+     "oft"
+    ],
     "notes": "Full optimizer/loss levers; the krea2 driver has no EMA or caption-dropout hooks."
    },
    "recipe": {
@@ -59,6 +67,12 @@
     "sampling": true,
     "resume": true,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon",
+     "dora",
+     "oft"
+    ],
     "notes": "Full levers incl. EMA. 16GB refit (2026-07-22): resident_blocks 0 = zero-pin streamed arm (the anchor-exact arm; the old 9GiB comptime pin OOMs the 5080). Measured 2-step smoke: peak 14.6GB nvidia-smi / 10.3GB driver, ~1.3s/step warm."
    },
    "recipe": {
@@ -96,6 +110,12 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon",
+     "dora",
+     "oft"
+    ],
     "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands."
    },
    "recipe": {
@@ -131,6 +151,12 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon",
+     "dora",
+     "oft"
+    ],
     "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands."
    },
    "recipe": {
@@ -166,6 +192,10 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands."
    },
    "recipe": {
@@ -202,6 +232,14 @@
     "sampling": true,
     "resume": true,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon",
+     "lokr",
+     "loha",
+     "dora",
+     "oft"
+    ],
     "notes": "Full levers incl. EMA; full resume supported."
    },
    "recipe": {
@@ -238,6 +276,10 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands."
    },
    "recipe": {
@@ -273,6 +315,10 @@
     "sampling": false,
     "resume": false,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "Full levers incl. EMA; inline sampling stripped at launch (no sampler wired for hidream)."
    },
    "recipe": {
@@ -309,6 +355,12 @@
     "sampling": false,
     "resume": false,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon",
+     "lokr",
+     "loha"
+    ],
     "notes": "Full levers via the argv-11 levers JSON; inline sampling stripped at launch."
    },
    "recipe": {
@@ -416,6 +468,10 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": false,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "Full optimizer/loss/caption levers (flag CLI); EMA unverified in the AV driver \u2014 off. Residency rides --resident_blocks, not quantized_resident."
    },
    "recipe": {
@@ -456,6 +512,10 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": false,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "No levers wired yet (legacy-block driver, P4 backlog) \u2014 fixed AdamW + MSE; data cache via env."
    },
    "recipe": {
@@ -495,6 +555,10 @@
     "sampling": false,
     "resume": false,
     "quantized_resident": false,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "Bernini-R 12-task renderer (t2v/i2v/v2v/editing via BERNINI_TASK env). Reuses the wan22-A14B chassis; EMA 0.9999 + caption dropout WIRED; velocity-MSE + inline AdamW (no levers). Device-native path via WAN_DEVNATIVE=1 env. Real dataset via scripts/bernini_r_build_cache.py."
    },
    "recipe": {
@@ -536,6 +600,10 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": false,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "No levers wired yet (legacy-block driver, P4 backlog) \u2014 fixed AdamW + MSE; variant/data selection via env."
    },
    "recipe": {
@@ -575,6 +643,10 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": false,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "Loss lever only; optimizer fixed AdamW; data cache via env."
    },
    "recipe": {
@@ -610,6 +682,12 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon",
+     "dora",
+     "oft"
+    ],
     "notes": "16GB refit VERIFIED (2026-07-22): streamed_base_opt_in arm fits \u2014 2-step smoke green at peak 12.8GB nvidia-smi (bf16 stack base resident + per-block disk stream; host-OOM fixed earlier via fill_block_store=False). fp8_e4m3 remains VRAM-infeasible on 16GB (~12GiB fp8 blocks + ~6.4GiB stack base) \u2014 keep quantized_resident=streamed_base_opt_in."
    },
    "recipe": {
@@ -651,6 +729,10 @@
     "sampling": true,
     "resume": false,
     "quantized_resident": true,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
     "notes": "Full levers incl. EMA; resume argv slot not wired in the supervisor for klein4b."
    },
    "recipe": {
