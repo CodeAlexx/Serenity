@@ -731,7 +731,9 @@
     "quantized_resident": true,
     "adapter_algos": [
      "lora",
-     "locon"
+     "locon",
+     "dora",
+     "oft"
     ],
     "notes": "Full levers incl. EMA; resume argv slot not wired in the supervisor for klein4b."
    },
