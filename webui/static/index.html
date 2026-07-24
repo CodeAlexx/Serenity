@@ -1136,18 +1136,36 @@ function fillLayerFilter(p) {
 /* ── server-side path picker: browse button next to every path field ── */
 const BROWSE_FIELDS = [["ds_folder","dir"],["cap_folder","dir"],["cache","dir"],
   ["checkpoint","file"],["resume_state","file"],["validation_prompts_file","file"],
-  ["val_file","file"],["dataset_path","dir"],["vae_override","file"]];
+  ["val_file","file"],["dataset_path","dir"],["vae_override","file"],
+  ["concept_file_name","file"]];
 let FS_TARGET = null, FS_MODE = "dir";
+function _attachBrowse(el, id, mode) {
+  if (!el || el.dataset.browse || el.disabled) return;
+  el.dataset.browse = "1";
+  const b = document.createElement("button");
+  b.textContent = "\uD83D\uDCC1"; b.title = "Browse server files"; b.type = "button";
+  b.style.cssText = "margin-left:6px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;cursor:pointer";
+  b.onclick = () => openFsPicker(id, mode);
+  el.insertAdjacentElement("afterend", b);
+  if (el.parentElement && el.parentElement.classList.contains("row")) el.parentElement.style.display = "flex";
+}
 function attachBrowsers() {
-  for (const [id, mode] of BROWSE_FIELDS) {
-    const el = $(id); if (!el || el.dataset.browse) continue;
-    el.dataset.browse = "1";
-    const b = document.createElement("button");
-    b.textContent = "\uD83D\uDCC1"; b.title = "Browse server files"; b.type = "button";
-    b.style.cssText = "margin-left:6px;background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 8px;cursor:pointer";
-    b.onclick = () => openFsPicker(id, mode);
-    el.insertAdjacentElement("afterend", b);
-    el.parentElement.style.display = "flex";
+  // 1) explicit known path fields, with their intended dir/file mode.
+  for (const [id, mode] of BROWSE_FIELDS) _attachBrowse($(id), id, mode);
+  // 2) SAFETY NET \u2014 no path field without a file manager: any editable, non-fixed
+  //    text input whose placeholder OR value looks like a path (starts with "/")
+  //    also gets a browse button, so new/renamed path fields are never missed.
+  //    Free-text editing is preserved (the input stays fully editable).
+  for (const el of document.querySelectorAll('input')) {
+    if (el.disabled || el.dataset.browse || el.classList.contains("nw")) continue; // skip fixed/not-coded
+    const t = (el.type || "text").toLowerCase();
+    if (t !== "text" && t !== "") continue;
+    const hint = ((el.placeholder || "") + " " + (el.value || ""));
+    if (!/(^|\s)\//.test(hint)) continue;                       // path-like only
+    if (!el.id) el.id = "pathfld_" + Math.random().toString(36).slice(2,8);
+    const mode = /(file|state|prompts|ckpt|checkpoint|\.(json|safetensors|pt|txt|yaml|state))/i
+      .test(el.id + " " + hint) ? "file" : "dir";
+    _attachBrowse(el, el.id, mode);
   }
 }
 async function fsGo(path) {
