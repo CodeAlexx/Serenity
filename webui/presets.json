@@ -471,6 +471,45 @@
    "_wired_note": "wave 3 (2026-07-22): mojodiffusion training/train_wan22_real (the serenity-trainer copy was a STALE 892-line pre-wan21 snapshot; pixi task repointed). Trainer reads the data cache from env WAN22_DATA_CACHE (measured: the config cache_dir key is parsed but NOT read by any wan arm) \u2014 hence the per-preset env map. recipe.cache_dir mirrors the real dir so the merged config stays truthful (the base config's /home/alex/datasets/wan22_cache does not exist). Dual-expert auto-enables via the high-noise ckpt convention (present on disk) \u2014 intended."
   },
   {
+   "id": "bernini_r",
+   "label": "Bernini-R Renderer 14B (12 tasks)",
+   "backend": "bernini_r",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "/home/alex/mojodiffusion/output/bin/train_bernini_r_cond",
+   "base_config": "/home/alex/mojodiffusion/serenitymojo/configs/bernini_r_t2v_cond_smoke.json",
+   "checkpoint": "/home/alex/.serenity/models/checkpoints/Bernini-R-Diffusers/serenity_fp8_e4m3_de8c462/low",
+   "cache": "/home/alex/.serenity/wan22_cache/40_woman_1sample",
+   "env": {
+    "BERNINI_TASK": "t2v"
+   },
+   "run_name": "bernini_r_lora",
+   "workspace_dir": "/home/alex/mojodiffusion/output/bernini_r_lora",
+   "save_filename_prefix": "bernini_r",
+   "capabilities": {
+    "optimizer_levers": false,
+    "loss_levers": false,
+    "ema": true,
+    "caption_dropout": true,
+    "masked_loss": false,
+    "sampling": false,
+    "resume": false,
+    "quantized_resident": false,
+    "notes": "Bernini-R 12-task renderer (t2v/i2v/v2v/editing via BERNINI_TASK env). Reuses the wan22-A14B chassis; EMA 0.9999 + caption dropout WIRED; velocity-MSE + inline AdamW (no levers). Device-native path via WAN_DEVNATIVE=1 env. Real dataset via scripts/bernini_r_build_cache.py."
+   },
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 3.0,
+    "max_steps": 2000,
+    "save_every": 500,
+    "sample_every": 0,
+    "cache_dir": "/home/alex/.serenity/wan22_cache/40_woman_1sample"
+   },
+   "_wired_note": "2026-07-23 audit: mojodiffusion train_bernini_r_cond (12-task renderer LoRA, all torch-gated). config_runner shape; binary reads argv[1]=config, BERNINI_TASK from env. Built this session (commits f3a6808..dd4881b)."
+  },
+  {
    "id": "wan21",
    "label": "Wan2.1 T2V 1.3B",
    "backend": "wan21",
