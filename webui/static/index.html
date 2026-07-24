@@ -416,7 +416,7 @@
         </div><div>
           <div class="row"><label>Offset noise</label><input id="offset_noise_weight" type="number" step="0.01" value="0"></div>
           <div class="row"><label>Perturb noise</label><input id="perturbation_noise_weight" type="number" step="0.01" value="0"></div>
-          <div class="row nw"><label>Dynamic shift <span class="nwtag">not coded</span></label><input type="checkbox"></div>
+          <div class="row"><label>Dynamic shift <span class="nwtag">resolution-adaptive</span></label><input id="dynamic_timestep_shifting" type="checkbox"></div>
           <div class="row"><label>Min strength</label><input id="min_noising_strength" type="number" step="0.001" placeholder="default 0.001"></div>
           <div class="row"><label>Max strength</label><input id="max_noising_strength" type="number" step="0.001" placeholder="default 1"></div>
         </div></div>
@@ -627,7 +627,7 @@ const EXTRA_FIELDS = ["network_algorithm","caption_dropout_prob","batch_size","g
                       "dataset_path","concept_file_name","latent_caching","clear_cache_before_training","cache_text_embeddings",
                       "epochs","learning_rate_min_factor","learning_rate_cycles","lr_scheduler","learning_rate_scaler","train_timestep_shift",
                       "train_dtype","fallback_train_dtype","gradient_checkpointing","enable_activation_offloading","layer_offload_fraction",
-                      "offset_noise_weight","perturbation_noise_weight","timestep_distribution","noising_weight","noising_bias","min_noising_strength","max_noising_strength",
+                      "offset_noise_weight","perturbation_noise_weight","timestep_distribution","noising_weight","noising_bias","min_noising_strength","max_noising_strength","dynamic_timestep_shifting",
                       "mse_strength","mae_strength","huber_strength",
                       "masked_training","unmasked_probability","unmasked_weight","normalize_masked_area_loss","masked_prior_preservation_weight","custom_conditioning_image",
                       "layer_filter_preset","layer_filter","layer_filter_regex",
