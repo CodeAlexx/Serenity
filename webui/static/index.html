@@ -345,7 +345,7 @@
           <div class="row"><label>Epochs</label><input id="epochs" type="number" value="1"></div>
           <div class="row"><label>LR min factor</label><input id="learning_rate_min_factor" type="number" step="0.01" value="0"></div>
           <div class="row"><label>LR cycles</label><input id="learning_rate_cycles" type="number" step="0.1" value="1"></div>
-          <div class="row nw"><label>LR scaler <span class="nwtag">not coded</span></label><select><option>NONE</option><option>LINEAR</option><option>SQRT</option><option>COSINE</option></select></div>
+          <div class="row"><label>LR scaler</label><select id="learning_rate_scaler"><option>NONE</option><option>LINEAR</option><option>SQRT</option></select></div>
           <div class="row"><label>Save every</label><input id="save_every" type="number"></div>
         </div></div>
       </div>
@@ -625,7 +625,7 @@ const EXTRA_FIELDS = ["network_algorithm","caption_dropout_prob","batch_size","g
                       "only_cache","continue_last_backup","dataloader_threads","tensorboard","tensorboard_always_on","validation",
                       "output_model_format","output_dtype","train_transformer","train_text_encoder","lora_weight_dtype",
                       "dataset_path","concept_file_name","latent_caching","clear_cache_before_training","cache_text_embeddings",
-                      "epochs","learning_rate_min_factor","learning_rate_cycles","lr_scheduler","train_timestep_shift",
+                      "epochs","learning_rate_min_factor","learning_rate_cycles","lr_scheduler","learning_rate_scaler","train_timestep_shift",
                       "train_dtype","fallback_train_dtype","gradient_checkpointing","enable_activation_offloading","layer_offload_fraction",
                       "offset_noise_weight","perturbation_noise_weight","timestep_distribution","noising_weight","noising_bias","min_noising_strength","max_noising_strength",
                       "mse_strength","mae_strength","huber_strength",

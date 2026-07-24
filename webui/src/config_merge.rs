@@ -125,6 +125,8 @@ const LR_SCHEDULERS: &[&str] = &[
     "cosine_with_restarts", "COSINE_WITH_RESTARTS", "polynomial", "POLYNOMIAL",
     "rex", "REX",
 ];
+// _lr_scaler_int (reader)
+const LR_SCALERS: &[&str] = &["none", "NONE", "linear", "LINEAR", "sqrt", "SQRT"];
 // _loss_fn_int (l.545)
 const LOSS_FNS: &[&str] = &["mse", "MSE", "huber", "HUBER", "smooth_l1", "SMOOTH_L1"];
 // _timestep_bias_int (l.560)
@@ -195,6 +197,9 @@ pub fn validate_config_enums(cfg: &Value) -> Vec<String> {
     }
     for k in ["lr_scheduler", "learning_rate_scheduler"] {
         check_str_enum(cfg, k, LR_SCHEDULERS, &mut out);
+    }
+    for k in ["learning_rate_scaler", "lr_scaler"] {
+        check_str_enum(cfg, k, LR_SCALERS, &mut out);
     }
     check_str_enum(cfg, "loss_fn", LOSS_FNS, &mut out);
     check_str_enum(cfg, "timestep_bias_strategy", TS_BIAS, &mut out);
