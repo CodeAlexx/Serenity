@@ -267,7 +267,8 @@
           <div class="row"><label>Dataset path</label><input id="dataset_path" placeholder="raw image dir (cache is the training input)"></div>
           <div class="row"><label>Concept file</label><input id="concept_file_name" value="concepts.json"></div>
           <div class="row"><label>Resolution</label><select id="resolution"><option>512</option><option>768</option><option>1024</option><option>1280</option></select></div>
-          <div class="row"><label>Aspect buckets <span class="nwtag">coded (stager t2d CLI) — config knob pending</span></label><input type="checkbox" checked disabled></div>
+          <div class="row"><label>Aspect buckets <span class="nwtag">krea2 / zimage stager</span></label><input id="aspect_ratio_bucketing" type="checkbox" checked></div>
+          <div class="capnote" id="capnote_aspect"></div>
           <div class="row"><label>Latent caching</label><input id="latent_caching" type="checkbox" checked></div>
           <div class="row"><label>Clear cache before</label><input id="clear_cache_before_training" type="checkbox"></div>
           <div class="row"><label>Cache text embeds</label><input id="cache_text_embeddings" type="checkbox"></div>
@@ -617,6 +618,9 @@ const EXTRA_FIELDS = ["network_algorithm","caption_dropout_prob","batch_size","g
                       "optimizer_warmup_steps","validation_prompts_file","vae_override",
                       // config-passthrough additions (trainers that read these keys use them)
                       "resolution","frames","save_max_keep",
+                      // aspect-ratio bucketing: emitted only when enabled (krea2/zimage,
+                      // gated by capabilities.aspect_buckets); consumed by the precache stager
+                      "aspect_ratio_bucketing",
                       // 2026-07-22 wiring wave: config-reader-parsed keys (train_config_reader.mojo)
                       "only_cache","continue_last_backup","dataloader_threads","tensorboard","tensorboard_always_on","validation",
                       "output_model_format","output_dtype","train_transformer","train_text_encoder","lora_weight_dtype",
@@ -695,11 +699,22 @@ const CAP_GROUPS = [
     ids: ["quantized_resident"],
     note: "capnote_quant",
     msg: "quantized residency is not read by this backend" },
+  // OPT-IN capability (default OFF): aspect-ratio bucketing is consumed only by
+  // the backends whose precache stager builds the bucket ladder (krea2/zimage).
+  // Unlike the opt-out rows above, this control is DISABLED unless the preset
+  // explicitly sets capabilities.aspect_buckets:true, so it never emits its
+  // config key (aspect_ratio_bucketing) for a backend that ignores it.
+  { key: "aspect_buckets", optIn: true,
+    ids: ["aspect_ratio_bucketing"],
+    note: "capnote_aspect",
+    msg: "aspect bucketing is consumed only by the krea2 / zimage precache stager — not wired for this backend" },
 ];
 function applyCapabilities(p) {
   const caps = (p && p.capabilities) || {};
   for (const g of CAP_GROUPS) {
-    const off = caps[g.key] === false;
+    // opt-out rows: disabled only when the preset says false. opt-in rows
+    // (g.optIn): disabled unless the preset explicitly says true.
+    const off = g.optIn ? (caps[g.key] !== true) : (caps[g.key] === false);
     for (const id of g.ids) { const el = $(id); if (el) el.disabled = off; }
     const n = $(g.note);
     if (n) { n.textContent = off ? g.msg : ""; n.classList.toggle("on", off); }

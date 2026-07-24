@@ -20,6 +20,7 @@
     "ema": false,
     "caption_dropout": false,
     "masked_loss": false,
+    "aspect_buckets": true,
     "sampling": true,
     "resume": true,
     "quantized_resident": true,
@@ -150,14 +151,14 @@
     "masked_loss": false,
     "sampling": true,
     "resume": false,
-    "quantized_resident": true,
+    "quantized_resident": false,
     "adapter_algos": [
      "lora",
      "locon",
      "dora",
      "oft"
     ],
-    "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands."
+    "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands. quantized_resident=false: the ernie (train_ernie_real) trainer does not read the quantized_resident config key \u2014 no fp8/streamed base path."
    },
    "recipe": {
     "learning_rate": 0.0001,
@@ -191,12 +192,12 @@
     "masked_loss": false,
     "sampling": true,
     "resume": false,
-    "quantized_resident": true,
+    "quantized_resident": false,
     "adapter_algos": [
      "lora",
      "locon"
     ],
-    "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands."
+    "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands. quantized_resident=false: the anima (train_anima_real) trainer does not read the quantized_resident config key \u2014 no fp8/streamed base path."
    },
    "recipe": {
     "learning_rate": 0.0001,
@@ -229,9 +230,10 @@
     "ema": true,
     "caption_dropout": true,
     "masked_loss": false,
+    "aspect_buckets": true,
     "sampling": true,
     "resume": true,
-    "quantized_resident": true,
+    "quantized_resident": false,
     "adapter_algos": [
      "lora",
      "locon",
@@ -240,7 +242,7 @@
      "dora",
      "oft"
     ],
-    "notes": "Full levers incl. EMA; full resume supported."
+    "notes": "Full levers incl. EMA; full resume supported. quantized_resident=false: the zimage (train_zimage_real) trainer does not read the quantized_resident config key \u2014 no fp8/streamed base path."
    },
    "recipe": {
     "learning_rate": 0.0001,
@@ -275,12 +277,12 @@
     "masked_loss": false,
     "sampling": true,
     "resume": false,
-    "quantized_resident": true,
+    "quantized_resident": false,
     "adapter_algos": [
      "lora",
      "locon"
     ],
-    "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands."
+    "notes": "P4-landed: optimizer/loss/caption levers being wired now (row encodes the post-P4 truth); EMA not wired \u2014 flip if P4 partially lands. quantized_resident=false: the l2p (train_l2p_real) trainer does not read the quantized_resident config key \u2014 no fp8/streamed base path."
    },
    "recipe": {
     "learning_rate": 0.0001,
@@ -354,14 +356,14 @@
     "masked_loss": false,
     "sampling": false,
     "resume": false,
-    "quantized_resident": true,
+    "quantized_resident": false,
     "adapter_algos": [
      "lora",
      "locon",
      "lokr",
      "loha"
     ],
-    "notes": "Full levers via the argv-11 levers JSON; inline sampling stripped at launch."
+    "notes": "Full levers via the argv-11 levers JSON; inline sampling stripped at launch. quantized_resident=false: the fp8 base is loaded from a hardcoded ideogram-4-fp8 checkpoint (Ideogram4TrainCore load_fp8_dequant), NOT via the config key."
    },
    "recipe": {
     "learning_rate": 0.0001,
@@ -398,8 +400,8 @@
     "masked_loss": false,
     "sampling": true,
     "resume": false,
-    "quantized_resident": true,
-    "notes": "FROZEN (user mandate 2026-07-04). P4-landed levers; inline sampler is a 128x128 comptime binary \u2014 keep sample_every 0. lora_alpha pinned 1.0 (compiled-constant guard; 16.0 could never launch). On-box cache materialized P6-wave1 2026-07-22."
+    "quantized_resident": false,
+    "notes": "FROZEN (user mandate 2026-07-04). P4-landed levers; inline sampler is a 128x128 comptime binary \u2014 keep sample_every 0. lora_alpha pinned 1.0 (compiled-constant guard; 16.0 could never launch). On-box cache materialized P6-wave1 2026-07-22. quantized_resident=false: the sdxl (train_sdxl_real) trainer does not read the quantized_resident config key \u2014 no fp8/streamed base path."
    },
    "recipe": {
     "learning_rate": 0.0001,
@@ -541,7 +543,8 @@
    "checkpoint": "/home/alex/.serenity/models/checkpoints/Bernini-R-Diffusers/serenity_fp8_e4m3_de8c462/low",
    "cache": "/home/alex/.serenity/wan22_cache/40_woman_1sample",
    "env": {
-    "BERNINI_TASK": "t2v"
+    "BERNINI_TASK": "t2v",
+    "LD_LIBRARY_PATH": "/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib:/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/.pixi/envs/default/lib"
    },
    "run_name": "bernini_r_lora",
    "workspace_dir": "/home/alex/mojodiffusion/output/bernini_r_lora",
@@ -572,6 +575,49 @@
     "cache_dir": "/home/alex/.serenity/wan22_cache/40_woman_1sample"
    },
    "_wired_note": "2026-07-23 audit: mojodiffusion train_bernini_r_cond (12-task renderer LoRA, all torch-gated). config_runner shape; binary reads argv[1]=config, BERNINI_TASK from env. Built this session (commits f3a6808..dd4881b)."
+  },
+  {
+   "id": "scail2",
+   "label": "SCAIL-2 Char-Animation 14B",
+   "backend": "scail2",
+   "wired": true,
+   "argv_shape": "config_runner",
+   "binary": "/home/alex/mojodiffusion/output/bin/train_scail2_real",
+   "base_config": "/home/alex/mojodiffusion/serenitymojo/configs/scail2_t2v_lora_smoke.json",
+   "checkpoint": "/home/alex/.serenity/models/checkpoints/SCAIL-2-Mojo/transformer_fp8",
+   "cache": "/home/alex/.serenity/runs/scail2-gates/replacement",
+   "env": {
+    "LD_LIBRARY_PATH": "/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib:/home/alex/mojodiffusion/.pixi/envs/default/lib:/home/alex/mojodiffusion/.pixi/envs/default/lib"
+   },
+   "run_name": "scail2_lora",
+   "workspace_dir": "/home/alex/mojodiffusion/output/scail2_lora",
+   "save_filename_prefix": "scail2",
+   "capabilities": {
+    "optimizer_levers": false,
+    "loss_levers": false,
+    "ema": false,
+    "caption_dropout": false,
+    "masked_loss": false,
+    "sampling": false,
+    "resume": false,
+    "quantized_resident": false,
+    "adapter_algos": [
+     "lora",
+     "locon"
+    ],
+    "notes": "SCAIL-2 Wan2.1 character animation (i2v, streamed fp8 14B). VIDEO model = LoRA/LoCon only (Lycoris fail-loud). config-first via scail2_t2v_lora_smoke.json. Real S capped ~16384/block (flash). Committed 608860f."
+   },
+   "recipe": {
+    "learning_rate": 0.0001,
+    "lora_rank": 16,
+    "lora_alpha": 16.0,
+    "timestep_shift": 3.0,
+    "max_steps": 1000,
+    "save_every": 250,
+    "sample_every": 0,
+    "cache_dir": "/home/alex/.serenity/runs/scail2-gates/replacement"
+   },
+   "_wired_note": "2026-07-23 audit: train_scail2_real config-read added (608860f); config_runner; video-model lycoris guard."
   },
   {
    "id": "wan21",
