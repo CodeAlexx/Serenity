@@ -178,7 +178,7 @@
       </div>
       <div class="panel"><h3>DEVICE</h3><div class="sub">Single-GPU box — placement knobs are not coded; precision + offload live in Training &#8594; Precision &amp; Memory</div>
         <div class="grid2"><div>
-          <div class="row nw"><label>Train device <span class="nwtag">not coded</span></label><select><option>cuda</option><option>cpu</option></select></div>
+          <div class="row nw"><label>Train device <span class="nwtag">single-GPU box</span></label><select><option>cuda</option><option>cpu</option></select></div>
           <div class="row nw"><label>Temp device <span class="nwtag">not coded</span></label><select><option>cpu</option><option>cuda</option></select></div>
           
           
@@ -220,10 +220,10 @@
             <div class="row"><label>Checkpoint file</label><input id="checkpoint_show" disabled></div>
             <div class="row"><label>Train transformer</label><input id="train_transformer" type="checkbox" checked></div>
             <div class="row"><label>Train text encoder</label><input id="train_text_encoder" type="checkbox"></div>
-            <div class="row"><label>Quantize TE <span class="nwtag">not coded</span></label><input type="checkbox" disabled></div>
-            <div class="row"><label>TE qtype <span class="nwtag">not coded</span></label><input value="qfloat8" disabled></div>
-            <div class="row"><label>Low VRAM <span class="nwtag">not coded</span></label><input type="checkbox" disabled></div>
-            <div class="row nw"><label>Bundle embeds <span class="nwtag">not coded</span></label><input type="checkbox" checked></div>
+            <div class="row"><label>Quantize TE <span class="nwtag">N/A: encoders frozen</span></label><input type="checkbox" disabled></div>
+            <div class="row"><label>TE qtype <span class="nwtag">N/A: encoders frozen</span></label><input value="qfloat8" disabled></div>
+            <div class="row"><label>Low VRAM <span class="nwtag">&#8594; Training: Activation offloading</span></label><input type="checkbox" disabled></div>
+            <div class="row nw"><label>Bundle embeds <span class="nwtag">N/A: no textual inversion</span></label><input type="checkbox" checked></div>
           </div>
         </div>
       </div>
@@ -235,7 +235,7 @@
         <div class="grid2"><div>
           <div class="row"><label>Algorithm (network)</label>
             <select id="network_algorithm"><option>LORA</option><option>LOCON</option><option>LOKR</option><option>LOHA</option><option>DORA</option><option>OFT</option></select></div>
-          <div class="row nw"><label>LoRA name <span class="nwtag">not coded</span></label><input placeholder="run name derived"></div>
+          <div class="row nw"><label>LoRA name <span class="nwtag">derived from run name</span></label><input placeholder="run name derived"></div>
           <div class="row"><label>Rank</label><input id="lora_rank" type="number"></div>
           <div class="row"><label>Alpha</label><input id="lora_alpha" type="number"></div>
         </div><div>
@@ -246,10 +246,10 @@
       <div class="panel"><h3>TARGETS &amp; OFT</h3><div class="sub">Module targets are fixed per-model (qkv, proj, mlp, modulation)</div>
         <div class="grid2"><div>
           <div class="row"><label>Transformer targets</label><input value="double/single projections — qkv, proj, mlp, modulation" disabled></div>
-          <div class="row nw"><label>OFT block size <span class="nwtag">not coded</span></label><input type="number" value="4"></div>
+          <div class="row nw"><label>OFT block size <span class="nwtag">N/A: no OFT block-size knob</span></label><input type="number" value="4"></div>
         </div><div>
-          <div class="row nw"><label>COFT <span class="nwtag">not coded</span></label><input type="checkbox"></div>
-          <div class="row nw"><label>Bundle embeds <span class="nwtag">not coded</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>COFT <span class="nwtag">N/A: no OFT hyperparams</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Bundle embeds <span class="nwtag">N/A: no textual inversion</span></label><input type="checkbox" checked></div>
         </div></div>
       </div>
     </div>
@@ -272,7 +272,7 @@
           <div class="row"><label>Latent caching</label><input id="latent_caching" type="checkbox" checked></div>
           <div class="row"><label>Clear cache before</label><input id="clear_cache_before_training" type="checkbox"></div>
           <div class="row"><label>Cache text embeds</label><input id="cache_text_embeddings" type="checkbox"></div>
-          <div class="row"><label>Caption extension <span class="nwtag">not coded</span></label><input value="txt" disabled></div>
+          <div class="row"><label>Caption extension <span class="nwtag">N/A: captions are .txt</span></label><input value="txt" disabled></div>
         </div></div>
       </div>
       <div class="panel"><h3>MEDIA <span id="ds_count" style="color:var(--dim);font-weight:400"></span></h3>
@@ -376,11 +376,11 @@
           <div class="row"><label>Offload fraction</label><input id="layer_offload_fraction" type="number" step="0.05" value="0"></div>
           <div class="row"><label>Resident blocks</label><input id="resident_blocks" type="number" placeholder="backend default"></div>
         </div><div>
-          <div class="row nw"><label>Autocast cache <span class="nwtag">not coded</span></label><input type="checkbox" checked></div>
+          <div class="row nw"><label>Autocast cache <span class="nwtag">N/A: Mojo dtypes explicit</span></label><input type="checkbox" checked></div>
           
           <div class="row"><label>Frames</label><input id="frames" value="1"></div>
-          <div class="row nw"><label>Circular padding <span class="nwtag">not coded</span></label><input type="checkbox"></div>
-          <div class="row nw"><label>Train device <span class="nwtag">not coded</span></label><select><option>cuda</option><option>cpu</option></select></div>
+          <div class="row nw"><label>Circular padding <span class="nwtag">N/A: DiT (no conv U-Net)</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Train device <span class="nwtag">single-GPU box</span></label><select><option>cuda</option><option>cpu</option></select></div>
         </div></div>
       </div>
 
@@ -403,7 +403,7 @@
           <div class="row nw"><label>TE sequence length <span class="nwtag">not coded</span></label><input value="512"></div>
         </div><div>
           <div class="row nw"><label>Transformer stop after <span class="nwtag">not coded</span></label><input type="number" value="0"></div>
-          <div class="row nw"><label>Attention mask <span class="nwtag">not coded</span></label><input type="checkbox"></div>
+          <div class="row nw"><label>Attention mask <span class="nwtag">N/A: flash SDPA (full attn)</span></label><input type="checkbox"></div>
           <div class="row nw"><label>Guidance scale <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="1.0"></div>
         </div></div>
       </div>
@@ -434,10 +434,10 @@
         </div><div>
           <div class="row nw"><label>log-cosh strength <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="0"></div>
           <div class="row"><label>Huber strength</label><input id="huber_strength" type="number" step="0.1" value="0"></div>
-          <div class="row nw"><label>VB strength <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="0"></div>
-          <div class="row"><label>Weight fn <span class="nwtag">not coded</span></label><select disabled><option>MIN_SNR_GAMMA</option></select></div>
-          <div class="row"><label>Weight gamma <span class="nwtag">not coded</span></label><input type="number" step="0.1" value="5" disabled></div>
-          <div class="row nw"><label>Loss scaler <span class="nwtag">not coded</span></label><select><option>NONE</option><option>MIN_SNR_GAMMA</option><option>P2</option></select></div>
+          <div class="row nw"><label>VB strength <span class="nwtag">N/A: PixArt-only</span></label><input type="number" step="0.1" value="0"></div>
+          <div class="row"><label>Weight fn <span class="nwtag">&#8594; use Min-SNR gamma (flow)</span></label><select disabled><option>MIN_SNR_GAMMA</option></select></div>
+          <div class="row"><label>Weight gamma <span class="nwtag">&#8594; use Min-SNR gamma (flow)</span></label><input type="number" step="0.1" value="5" disabled></div>
+          <div class="row nw"><label>Loss scaler <span class="nwtag">&#8594; use Min-SNR gamma (flow)</span></label><select><option>NONE</option><option>MIN_SNR_GAMMA</option><option>P2</option></select></div>
         </div></div>
       </div>
 
