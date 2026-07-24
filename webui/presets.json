@@ -836,7 +836,8 @@
     "grad_accum": 4,
     "max_steps": 1000,
     "save_every": 250
-   }
+   },
+   "base_config": ""
   }
  ]
 }

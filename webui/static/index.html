@@ -213,7 +213,7 @@
             <div class="capnote" id="capnote_quant"></div>
           </div>
           <div>
-            <div class="row"><label>Destination</label><input id="workspace_dir" disabled></div>
+            <div class="row"><label>Output dir</label><input id="workspace_dir"></div>
             <div class="row"><label>Output format</label><select id="output_model_format"><option>SAFETENSORS</option></select></div>
             <div class="row"><label>Output dtype</label><select id="output_dtype"><option>BFLOAT_16</option><option>FLOAT_16</option><option selected>FLOAT_32</option></select></div>
             <div class="row"><label>Backend</label><input id="backend_show" disabled></div>
@@ -652,9 +652,11 @@ async function loadPresets() {
     `<option value="${p.id}" ${p.wired?"":"disabled"}>${p.label}${p.wired?"":" (not coded)"}</option>`).join("");
   applyPreset();
 }
+let WS_EDITED = false;  // output-dir stickiness flag (declared before applyPreset use)
 function applyPreset() {
   const p = PRESETS.find(x => x.id === $("preset").value); if (!p) return;
   $("runname_top").value = p.run_name; $("cache").value = p.cache; $("checkpoint").value = p.checkpoint;
+  WS_EDITED = false;  // new preset → output dir tracks run name again until re-edited
   $("workspace_dir").value = "/home/alex/mojodiffusion/output/" + p.run_name;
   if ($("save_prefix_show")) $("save_prefix_show").value = p.run_name;
   $("backend_show").value = p.backend; $("checkpoint_show").value = p.checkpoint;
@@ -744,8 +746,10 @@ function applyCapabilities(p) {
   if (bn) { bn.textContent = caps.notes || ""; bn.classList.toggle("on", !!caps.notes); }
 }
 $("preset").onchange = applyPreset;
+// output dir auto-derives from run name UNTIL the user edits it (then it sticks)
+$("workspace_dir").oninput = () => { WS_EDITED = true; };
 $("runname_top").oninput = () => { $("projname").textContent = $("runname_top").value;
-  $("workspace_dir").value = "/home/alex/mojodiffusion/output/" + $("runname_top").value;
+  if (!WS_EDITED) $("workspace_dir").value = "/home/alex/mojodiffusion/output/" + $("runname_top").value;
   if ($("save_prefix_show")) $("save_prefix_show").value = $("runname_top").value; };
 
 function buildLaunchBody() {
@@ -770,6 +774,9 @@ function buildLaunchBody() {
   if (!$("optimizer_name").disabled) {
     overrides.optimizer = { optimizer: $("optimizer_name").value, weight_decay: parseFloat($("optimizer_weight_decay").value) };
   }
+  // output dir: send it as a config override so the server uses it instead of
+  // the derived output/<run_name> (config_merge honors it; blank => derived).
+  if ($("workspace_dir").value) overrides.workspace_dir = $("workspace_dir").value;
   const body = { preset_id: $("preset").value, overrides,
                  cache: $("cache").value || null, run_name: $("runname_top").value || null };
   if ($("resume_state").value && !$("resume_state").disabled) {
@@ -1137,7 +1144,7 @@ function fillLayerFilter(p) {
 const BROWSE_FIELDS = [["ds_folder","dir"],["cap_folder","dir"],["cache","dir"],
   ["checkpoint","file"],["resume_state","file"],["validation_prompts_file","file"],
   ["val_file","file"],["dataset_path","dir"],["vae_override","file"],
-  ["concept_file_name","file"]];
+  ["concept_file_name","file"],["workspace_dir","dir"]];
 let FS_TARGET = null, FS_MODE = "dir";
 function _attachBrowse(el, id, mode) {
   if (!el || el.dataset.browse || el.disabled) return;

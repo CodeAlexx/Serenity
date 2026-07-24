@@ -523,7 +523,6 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
     // named but missing/unreadable -> 422 (unchanged behavior). The sampling
     // strip for sd35|hidream|ideogram4 (finding #8) lives inside the shared fn.
     let run_name = req.run_name.clone().unwrap_or_else(|| p.run_name.clone());
-    let workspace = format!("/home/alex/mojodiffusion/output/{run_name}");
     let (cfg, notes) = match config_merge::build_merged_config(
         REPO_ROOT, &p.base_config, &p.recipe, &p.backend, &run_name, &req.overrides,
     ) {
@@ -538,6 +537,11 @@ async fn launch(State(st): State<Arc<AppState>>, Json(req): Json<LaunchReq>) -> 
         return (StatusCode::UNPROCESSABLE_ENTITY,
                 Json(json!({"error": format!("config rejected by trainer enum validation: {}", enum_errs.join("; "))})));
     }
+    // output/workspace dir: config_merge has already resolved it (UI override or
+    // derived output/<run_name>) — read it back so argv shapes + samples dir agree.
+    let workspace = cfg.get("workspace_dir").and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("/home/alex/mojodiffusion/output/{run_name}"));
     let cache = req.cache.clone().unwrap_or_else(|| p.cache.clone());
     if p.argv_shape == "krea2" && !Path::new(&cache).exists() {
         return (StatusCode::UNPROCESSABLE_ENTITY, Json(json!({"error": format!("cache not found: {cache}")})));

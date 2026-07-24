@@ -62,7 +62,8 @@ pub fn build_merged_config(
                 m.insert(k.clone(), v.clone());
             }
         }
-        m.insert("workspace_dir".into(), json!(workspace));
+        // honor a UI-supplied output dir (recipe/override); else derive from run_name
+        m.entry("workspace_dir".to_string()).or_insert(json!(workspace));
         m.insert("save_filename_prefix".into(), json!(run_name));
     }
     // inline sampling during training is not wired for these backends — their
