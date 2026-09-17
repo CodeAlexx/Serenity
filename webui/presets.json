@@ -10,7 +10,7 @@
    "binary": "target/serenity_krea2_live_trainer",
    "base_config": "target/serenity_krea2_train_config.json",
    "checkpoint": "/home/alex/.cache/huggingface/hub/models--krea--Krea-2-Raw/snapshots/4ad9f4b627a647fad78b3dfeebb09f2654aeb494/raw.safetensors",
-   "cache": "/home/alex/eri2_stage_512/cache.safetensors",
+   "cache": "/home/alex/trainings/krea2_eri2_cache_1024/cache.safetensors",
    "run_name": "krea2_lora",
    "workspace_dir": "/home/alex/mojodiffusion/output/krea2_lora",
    "save_filename_prefix": "krea2",
@@ -39,11 +39,14 @@
     "lora_rank": 64,
     "lora_alpha": 64.0,
     "timestep_shift": 1.0,
-    "max_steps": 2000,
+    "max_steps": 3000,
     "save_every": 500,
     "sample_every": 500,
     "quantized_resident": "fp8_e4m3"
-   }
+   },
+   "_res_note": "TRAIN RES 1024 (2026-07-26). krea2 resolution is a BUILD-TIME comptime arm, not a config key — cfg.resolution is parsed but never read by train_krea2.mojo (documented follow-up at its LTMAX block), and the krea2 argv shape passes only [cache, steps, config]. So 1024 lives in two places that must agree: the binary is built with -D KREA2_RES_512=0 (LH=LW=128, IMGLEN=4096) -D KREA2_LTMAX=384, and the cache holds 128x128 latents. Pointing this preset at a 512 cache, or rebuilding the binary without those flags, fails loud in the cache reader on the latent-shape mismatch.",
+   "_sample_note": "Samples used to decode PURE WHITE (mean 255, std 0) at BOTH 512 and 1024, from sampled AND known-good cache latents — FIXED 2026-07-26 in conv3d_fcqrs_cudnn (serenitymojo/models/vae/conv3d.mojo), not worked around. Cause: its BF16 branch was gated on `low_startup`, so an ungated bf16 caller fell through to a branch that bitcasts the buffer to Float16 — bf16/fp16 share a width but not an exponent field, so every weight and activation became garbage. The Qwen-Image VAE checkpoint is BF16, so the whole decoder was affected; LingBot's VAE was not, because it casts to F32 first. Fixed cuDNN decode now matches a diffusers AutoencoderKLQwenImage oracle (mean 118.04/std 57.78 vs 117.68/57.80, max abs diff 3/255 = bf16 rounding) at 3.8s per 1024 decode vs 29.5s for the naive-conv fallback. QWENVAE_NAIVE_CONV=1 remains available as a fallback but is NOT needed.",
+   "_cache_note": "Rebuilt 2026-07-26: the wired cache and base_config both lived under /home/alex/eri2_stage_512, which no longer exists (empty dir) — every launch 422'd before this. New cache = 117 eri2_with_trigger samples staged square at 1024 (krea2_stage_images.py -> krea2_prepare_cache SIZE=1024, --uncond so cfg!=1.0 sampling has a real empty-prompt uncond). 117 not 118: one caption (L1013847 (2).txt, 8733 chars) tokenizes to 3112 > the encoder's 2048 SDPA cap; the stager now skips and reports such captions instead of killing the prepare mid-run."
   },
   {
    "id": "klein9b",
