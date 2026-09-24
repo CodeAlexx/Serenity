@@ -92,7 +92,14 @@ zimage-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/
 # Krea-2 Raw lives in mojodiffusion as the shared model/runtime vertical. Serenity
 # builds it into a live trainer binary and launches argv:
 #   <cache.safetensors> <steps> <train_config.json>
-krea2-live-trainer-build = "mkdir -p target && mojo build -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib /home/alex/mojodiffusion/serenitymojo/models/krea2/train_krea2.mojo -o target/serenity_krea2_live_trainer"
+# krea2 resolution + caption bucket are BUILD-TIME (train_krea2.mojo comptime arms;
+# cfg.resolution is parsed but never read). These -D flags ARE the preset's 1024px
+# arm — drop them and the binary silently reverts to 512 and fails loud in the cache
+# reader against the 1024 cache. LTMAX 768 >= the eri2 cache's max caption LT 588.
+# RESIDENT_BLOCKS 8 is the measured 5080/16GB fit: 7.8GB peak with training AND the
+# 1024 inline sampler co-resident (16 OOM'd once a sample ran; residency is not the
+# step-time lever here — 4 and 8 both give ~7.7-8.2 s/step).
+krea2-live-trainer-build = "mkdir -p target && mojo build --optimization-level 2 -D KREA2_RES_512=0 -D KREA2_LTMAX=768 -D KREA2_RESIDENT_BLOCKS=8 -I . -I src -I /home/alex/mojodiffusion -Xlinker -lm -Xlinker -lcuda -Xlinker -L/home/alex/mojodiffusion/.pixi/envs/default/lib -Xlinker -L/home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -lserenity_cudnn_sdpa -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/serenitymojo/ops/cshim/lib -Xlinker -rpath -Xlinker /home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib -Xlinker -rpath -Xlinker /home/alex/mojodiffusion/.pixi/envs/default/lib /home/alex/mojodiffusion/serenitymojo/models/krea2/train_krea2.mojo -o target/serenity_krea2_live_trainer"
 # Pulled into serenity-trainer (2026-06-23): the l2p trainer DRIVER now lives
 # here (src/serenity_trainer/trainer/train_l2p_real.mojo) and uses serenitymojo
 # ONLY as the shared numeric/model lib via -I /home/alex/mojodiffusion. Full link
